@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//**/.env)",
+      "Read(//**/.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(~/.claude/.credentials.json)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.codex/auth.json)",
+      "Read(~/.config/gh/hosts.yml)",
+      "Read(~/.docker/config.json)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Monitor|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@REPO@/.venv/bin/python -m claude_tg_bot.hook_approve",
+            "timeout": 960,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

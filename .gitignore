@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# secrets and runtime state
+.env
+.env.*
+!.env.example
+state/
+*.log
+
+# rendered by install.sh from claude-hook-settings.example.json
+claude-hook-settings.json
+# local project map; template: projects.example.json
+projects.json
