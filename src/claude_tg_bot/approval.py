@@ -2845,7 +2845,8 @@ async def handle_task(request: web.Request) -> web.Response:
     Codex 15.10); context: пояснение Домового, справка; key: id запроса,
     повтор с тем же key второй темы не заведёт; chat_key и ask_id: тема рана,
     позвавшего task_new, и сообщение Ивана, на которое ответит строка итога
-    после закрытия (19.10.2026). Ответ {"text": "Задача «N имя»: ссылка"} или причина
+    после закрытия (19.10.2026); to: id открытой задачи, тогда слова не
+    заводят новую, а добавляются в её тему (решение Ивана 19.10.2026). Ответ {"text": "Задача «N имя»: ссылка"} или причина
     отказа. Auth как у /event: X-Approve-Token при заданном секрете, loopback."""
     cfg: Config = request.app["cfg"]
     if not _check_shared_secret(request, cfg):
@@ -2864,13 +2865,16 @@ async def handle_task(request: web.Request) -> web.Response:
         chat_key = ""
     ask = payload.get("ask_id")
     ask_id = ask if isinstance(ask, int) and not isinstance(ask, bool) and 0 < ask < 2**53 else None
+    to = str(payload.get("to") or "")
+    if to and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", to):
+        return web.json_response({"error": "bad task id"}, status=400)
     if not words:
         return web.json_response({"error": "words required"}, status=400)
     application: Application = request.app["application"]
     factory = application.bot_data.get("task_new")
     if factory is None:
         return web.json_response({"error": "tasks unavailable"}, status=503)
-    text = await factory(words, context, key, chat_key=chat_key, ask_id=ask_id)
+    text = await factory(words, context, key, chat_key=chat_key, ask_id=ask_id, to=to)
     return web.json_response({"text": text})
 
 

@@ -501,6 +501,19 @@ class HookSettingsDenyEnvTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as cm:
                     config._validate_hook_settings(bad)
                 self.assertIn("onFailure", str(cm.exception))
+        # Проверяется каждый хук подтверждений, а не первый: вторая запись
+        # без block тоже отказ (ревью Codex 19.10.2026).
+        data = json.loads(path.read_text())
+        second = json.loads(json.dumps(data["hooks"]["PreToolUse"][0]))
+        second["matcher"] = "Bash"
+        del second["hooks"][0]["onFailure"]
+        data["hooks"]["PreToolUse"].append(second)
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "s.json"
+            bad.write_text(json.dumps(data))
+            with self.assertRaises(RuntimeError) as cm:
+                config._validate_hook_settings(bad)
+            self.assertIn("onFailure", str(cm.exception))
 
 
 if __name__ == "__main__":

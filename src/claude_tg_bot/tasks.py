@@ -504,6 +504,21 @@ def command_intro_prompt(words: str, context: str = "") -> str:
     ).format(words=close_fence(words), extra=extra, rules=think_rules())
 
 
+def addition_prompt(words: str, context: str = "") -> str:
+    """Слова Ивана, переданные в тему задачи через Домового (решение Ивана
+    19.10.2026): ход обдумывания, как его сообщение в теме. Слова первыми и
+    без ограждения, пояснение Домового справкой в ограждении."""
+    extra = (_("\n\nПояснение Домового (справка, просьба в словах выше):\n{context}")
+             .format(context=fence(context.strip())) if context.strip() else "")
+    return _("Владелец пишет в эту задачу через Домового. Его слова:\n{words}{extra}").format(
+        words=close_fence(words), extra=extra)
+
+
+def addition_echo(words: str) -> str:
+    """Слова Ивана в теме, чтобы в ней было видно всё (решение Ивана 19.10.2026)."""
+    return _("📨 Через Домового: {words}").format(words=_cut(words.strip(), COMMAND_TEXT_MAX))
+
+
 # Дописка к каждому сообщению: до 19.10.2026 она без условия велела кончать
 # маркером, и «Делай» вставал под 13 ответами из 16, в том числе под
 # объяснениями (разбор задач 19.10.2026).
@@ -941,14 +956,16 @@ def close_note(task: dict) -> str:
     return _cut(f"{head}: {rest}", NOTE_MAX)
 
 
-def open_list(opened: list[dict]) -> str:
-    """Открытые задачи строками: заголовок, этап, ссылка на тему."""
+def open_list(opened: list[dict], with_id: bool = False) -> str:
+    """Открытые задачи строками: заголовок, этап, ссылка на тему. with_id:
+    впереди id задачи, по нему Домовой добавляет в неё (task_new --to)."""
     lines = []
     for t in opened:
         status = t.get("status", "")
         stage = _(STAGE_NAMES[status]) if status in STAGE_NAMES else status
         link = f": {topic_link(t['chat_id'], t['thread_id'])}" if t.get("thread_id") else ""
-        lines.append(f"• {t['item']['title']} ({stage}){link}")
+        head = f"{t['id']} «{short_name(t)}» " if with_id else ""
+        lines.append(f"• {head}{t['item']['title']} ({stage}){link}")
     return "\n".join(lines)
 
 

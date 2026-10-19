@@ -993,6 +993,7 @@ class TaskNewOpenTests(unittest.TestCase):
                 self.assertEqual(task_new.main(["--open"]), 0)
             text = out.getvalue()
             self.assertIn("задача A (выполнено, ждёт закрытия): https://t.me/c/", text)
+            self.assertIn("• A «задача A» ", text)  # id для task_new --to
             self.assertIn("задача B (ждёт «Делай»)", text)
             self.assertNotIn("задача C", text)
             with tasks.locked(base) as data:
@@ -1002,6 +1003,25 @@ class TaskNewOpenTests(unittest.TestCase):
                     contextlib.redirect_stdout(out):
                 task_new.main(["--open"])
             self.assertEqual(out.getvalue().strip(), "открытых задач нет")
+
+
+    def test_to_and_run_env_go_to_bot(self):
+        from claude_tg_bot.skills.task_new import __main__ as task_new
+        sent: list = []
+
+        def post(url, json, headers, timeout):
+            sent.append((url, json))
+            return SimpleNamespace(status_code=200, json=lambda: {"text": "Добавил"}, text="")
+
+        cfg = SimpleNamespace(approve_http_host="127.0.0.1", approve_http_port=8787, approve_shared_secret="")
+        env = {"CLAUDE_TG_CHAT_KEY": "7", "CLAUDE_TG_ASK_ID": "41"}
+        with patch.object(task_new, "load_config", lambda **kw: cfg), patch.object(task_new.httpx, "post", post), \
+                patch.dict("os.environ", env):
+            self.assertEqual(task_new.main(["и CHANGELOG", "--to", "t7-5"]), 0)
+        body = sent[0][1]
+        self.assertTrue(sent[0][0].endswith("/task"))
+        self.assertEqual((body["words"], body["to"], body["chat_key"], body["ask_id"]),
+                         ("и CHANGELOG", "t7-5", "7", 41))
 
 
 class CloseNoteTests(unittest.TestCase):
