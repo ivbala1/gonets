@@ -100,6 +100,27 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.auth_error)
         self.assertFalse(_is_claude_unavailable(result))
 
+    async def test_oauth_warmup_runs_without_tools(self):
+        # Прогрев входа идёт без хука бота: ни инструментов, ни MCP, режим
+        # dontAsk, без сессии на диске (ревью Codex 19.10.2026).
+        from claude_tg_bot import claude_runner
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"{}", b""))
+        expiring = MagicMock(side_effect=[0.0, 0.0, 0.0])
+        with (
+            patch.object(claude_runner, "_oauth_expires_at", expiring),
+            patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn,
+        ):
+            await claude_runner.ensure_oauth_fresh("claude")
+        args = list(spawn.call_args.args)
+        tools = args.index("--tools")
+        self.assertEqual(args[tools + 1], "")
+        self.assertTrue(args[tools + 2].startswith("--"))
+        for flag in ("--strict-mcp-config", "--no-session-persistence"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
+        self.assertEqual(args[-1], "ok")
+
     async def codex_result(self, events, *, rc=1, stderr=b""):
         raw = "\n".join(json.dumps(e) for e in events).encode()
         proc = MagicMock(returncode=rc)

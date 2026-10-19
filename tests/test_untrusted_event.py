@@ -515,6 +515,50 @@ class HookSettingsDenyEnvTests(unittest.TestCase):
                 config._validate_hook_settings(bad)
             self.assertIn("onFailure", str(cm.exception))
 
+    def _validate_changed(self, change) -> None:
+        """Проверить настройки репозитория, изменённые change(entry, hook)."""
+        data = json.loads(_hook_settings_path().read_text())
+        entry = data["hooks"]["PreToolUse"][0]
+        change(entry, entry["hooks"][0])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            path.write_text(json.dumps(data))
+            config._validate_hook_settings(path)
+
+    def test_approve_hook_must_be_strict(self) -> None:
+        """Имя модуля в команде не значит, что хук решает: `|| true` делает
+        сбой разрешением, async, once и if выключают его для части вызовов
+        (ревью Codex 19.10.2026)."""
+        module = config.HOOK_APPROVE_MODULE
+        commands = (f"/v/bin/python -m {module} || true", f"/v/bin/python -m {module}; exit 0",
+                    f"echo {module}", f'bash -c "python -m {module}"',
+                    f"/v/bin/python -m {module} --x", f"/v/bin/node -m {module}")
+        for command in commands:
+            with self.subTest(command=command), self.assertRaises(RuntimeError) as cm:
+                self._validate_changed(lambda e, h: h.update(command=command))
+            self.assertIn("строгой форме", str(cm.exception))
+        extras = {"async": True, "asyncRewake": True, "once": True, "if": "Bash(git *)",
+                  "args": [], "shell": "bash", "type": "prompt"}
+        for key, value in extras.items():
+            with self.subTest(key=key), self.assertRaises(RuntimeError) as cm:
+                self._validate_changed(lambda e, h: h.update({key: value}))
+            self.assertIn("строгой форме", str(cm.exception))
+        for command in (f"python3 -m {module}", f"'/a b/.venv/bin/python3.14' -m {module}"):
+            with self.subTest(command=command):
+                self._validate_changed(lambda e, h: h.update(command=command, statusMessage="ok"))
+
+    def test_match_all_matcher_accepted(self) -> None:
+        """Пустой, отсутствующий и "*" matcher CLI понимает как все
+        инструменты (код 2.1.303): это не повод отказать в старте."""
+        for value in ("*", "", ".*", None):
+            def change(entry, _hook, value=value):
+                if value is None:
+                    del entry["matcher"]
+                else:
+                    entry["matcher"] = value
+            with self.subTest(matcher=value):
+                self._validate_changed(change)
+
 
 if __name__ == "__main__":
     unittest.main()

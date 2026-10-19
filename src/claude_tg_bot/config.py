@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,15 @@ REQUIRED_APPROVE_TOOLS = (
     "mcp__example-server__example_tool",
 )
 HOOK_APPROVE_MODULE = "claude_tg_bot.hook_approve"
+# Ключи хука подтверждений. Прочие меняют его работу (Claude Code 2.1.303):
+# async не ждёт ответа, once снимает хук после первого вызова, if зовёт его
+# не для всех вызовов, args и shell иначе запускают команду.
+APPROVE_HOOK_KEYS = frozenset({"type", "command", "timeout", "onFailure", "statusMessage"})
+_PYTHON_NAME_RE = re.compile(r"python[0-9.]*")
+# С этой версии Claude Code понимает onFailure у хука; старый ключ, видимо,
+# молча пропускает, и сбой хука снова пропускал бы действие.
+MIN_CLAUDE_VERSION = (2, 1, 295)
+_CLAUDE_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 TZ_ENV = "CLAUDE_TG_BOT_TZ"
 
 
@@ -113,6 +124,16 @@ def _validate_hook_settings(path: Path) -> None:
     if not isinstance(pre_tool, list) or not pre_tool:
         raise RuntimeError(f"{path}: hooks.PreToolUse is empty or not a list")
 
+    # Имя модуля в команде ещё не значит, что хук решает: `... || true`
+    # превращает сбой хука в разрешение, а async, once и if выключают его
+    # для части вызовов (ревью Codex 19.10.2026).
+    problems = [p for p in map(_approve_hook_problem, _approve_hooks(pre_tool)) if p]
+    if problems:
+        raise RuntimeError(
+            f"{path}: хук {HOOK_APPROVE_MODULE} не в строгой форме: {problems[0]}. "
+            "Отказ стартовать."
+        )
+
     # Считаем покрытие ТОЛЬКО по entries, которые реально вызывают наш hook_approve.
     # Иначе конфиг с "Bash|Write|…" в одном entry и hook_approve в другом (на других
     # tools) ложно пройдёт проверку, а approve на Bash/Write не сработает.
@@ -130,6 +151,9 @@ def _validate_hook_settings(path: Path) -> None:
         if not isinstance(entry, dict):
             continue
         m = entry.get("matcher")
+        if m is None or m in ("", "*"):
+            # Так CLI понимает «все инструменты» (код 2.1.303).
+            m = ".*"
         if _entry_calls_approve(entry) and isinstance(m, str):
             matchers_with_approve.append(m)
 
@@ -182,6 +206,31 @@ def _validate_hook_settings(path: Path) -> None:
         )
 
 
+def _validate_claude_version(claude_bin: str) -> None:
+    """Fail-closed: CLAUDE_BIN не старше MIN_CLAUDE_VERSION. Проверка
+    настроек хука не видит, какой CLI их прочтёт (ревью Codex 19.10.2026)."""
+    need = ".".join(map(str, MIN_CLAUDE_VERSION))
+    try:
+        out = subprocess.run([claude_bin, "--version"], capture_output=True, text=True,
+                             timeout=30, env=agent_env()).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(
+            f"CLAUDE_BIN={claude_bin!r}: версия не узнана ({e}), нужен Claude Code {need} "
+            "и новее. Отказ стартовать."
+        ) from e
+    m = _CLAUDE_VERSION_RE.match(out)
+    if not m:
+        raise RuntimeError(
+            f"CLAUDE_BIN={claude_bin!r}: версия не узнана (ответ {out[:80]!r}), нужен "
+            f"Claude Code {need} и новее. Отказ стартовать."
+        )
+    if tuple(map(int, m.groups())) < MIN_CLAUDE_VERSION:
+        raise RuntimeError(
+            f"Claude Code {m.group(0)} старше {need}: onFailure у хука подтверждений он "
+            "не понимает, и сбой хука пропустил бы действие. Обнови CLI. Отказ стартовать."
+        )
+
+
 def _approve_hooks(pre_tool: object) -> list[dict]:
     """Хуки PreToolUse, которые зовут hook_approve."""
     hooks: list[dict] = []
@@ -190,6 +239,25 @@ def _approve_hooks(pre_tool: object) -> list[dict]:
             if isinstance(h, dict) and HOOK_APPROVE_MODULE in str(h.get("command", "")):
                 hooks.append(h)
     return hooks
+
+
+def _approve_hook_problem(hook: dict) -> str:
+    """Чем хук, который зовёт hook_approve, не годится; пусто, если он ровно
+    `<python> -m claude_tg_bot.hook_approve` без лишних ключей."""
+    extra = sorted(set(hook) - APPROVE_HOOK_KEYS)
+    if extra:
+        return f"лишние ключи {extra}, допустимы {sorted(APPROVE_HOOK_KEYS)}"
+    if hook.get("type") != "command":
+        return f"type {hook.get('type')!r}, нужно 'command'"
+    command = str(hook.get("command", ""))
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        return f"команда {command!r} не разбирается: {e}"
+    if (len(argv) != 3 or argv[1:] != ["-m", HOOK_APPROVE_MODULE]
+            or not _PYTHON_NAME_RE.fullmatch(os.path.basename(argv[0]))):
+        return f"команда {command!r}, нужно ровно '<python> -m {HOOK_APPROVE_MODULE}'"
+    return ""
 
 
 def _approve_hook_timeouts(pre_tool: object) -> list[float]:
@@ -622,6 +690,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     # лучше RuntimeError при старте, чем тихий bypass в работе.
     if not skip_hook_validation:
         _validate_hook_settings(hook_settings)
+        _validate_claude_version(claude_bin)
     approve_timeout = _cap_approve_timeout(hook_settings, approve_timeout,
                                            warn=not skip_hook_validation)
 

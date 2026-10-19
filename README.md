@@ -57,8 +57,11 @@ has to ask before it deletes, pushes or sends anything.
 - **Fail-closed startup.** The bot refuses to start if the hook settings do
   not cover all dangerous tools, if the approval hook lacks
   `"onFailure": "block"` (without it Claude Code lets the call through when
-  the hook crashes, cannot start or times out), or if the approval server is
-  bound to a non-loopback address without a shared secret.
+  the hook crashes, cannot start or times out), if the approval hook is not
+  exactly `<python> -m claude_tg_bot.hook_approve` or carries keys such as
+  `async`, `once` or `if`, if `claude --version` is older than 2.1.295, or if
+  the approval server is bound to a non-loopback address without a shared
+  secret.
 - **Secrets stay away from the agent.** The agent's environment is stripped of
   the bot's tokens and keys; the hook settings deny `Read` of `.env` files,
   `~/.ssh`, cloud credentials and CLI auth files.
