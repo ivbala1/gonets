@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import io
 import json
 import logging
@@ -60,7 +61,7 @@ from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_
 from .overrides import PersistentDict
 from .codex_runner import run_codex
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, otklik, restart, tasks, transcripts
+from . import bigfile, otklik, restart, tasks, transcripts, warm
 from .skills.news_digest import backlog as news_backlog
 from .skills.news_digest import core as news
 from .replies import (
@@ -4302,6 +4303,7 @@ def _autocompact_for(cfg: Config, chat_key: str) -> str:
     return value if value and (not chats or chat_key in chats) else ""
 
 
+
 async def _dispatch_to_claude(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt_text: str, **kwargs: Any,
 ) -> bool | None:
@@ -4591,6 +4593,15 @@ async def _dispatch_to_claude_impl(
                 _note_session_scope(ctx, sid, memory_scope_hint)
 
             _activate_pending_model(ctx, chat_key)
+            # Параметры этого рана для прогрева: пинг идёт, только пока они те
+            # же (смена модели, effort или скоупа переписала бы кэш).
+            warm_sig = (_warm_signature(ctx, cfg, chat_key)
+                        if chat_key in getattr(cfg, "warm_chats", frozenset()) else ())
+            if permission_mode == "plan":
+                # Ран plan идёт с другим набором инструментов, но продолжает
+                # сессию: прежняя отметка устарела. Снять до рана, чтобы и
+                # исключение посреди него её не оставило (ревью Codex 19.10).
+                _warm_forget(ctx.application, chat_key)
             model_note = _model_footer_note(ctx, cfg, chat_key)
             # getattr: в тестах cfg без этих полей, сторож там выключен.
             status = _RunStatus(
@@ -4666,6 +4677,8 @@ async def _dispatch_to_claude_impl(
                 if untrusted:
                     # Чужой текст теперь в истории этой сессии.
                     _mark_untrusted_session(ctx, chat_key, store.get(chat_key))
+            if permission_mode != "plan":
+                _warm_after_run(ctx, cfg, chat_key, result, warm_sig)
             # Расход задачи сразу после рана, до запасного пути через GPT: его
             # ответ заменит результат, и сумма Claude пропала бы (проект шага 3, 1.6).
             task_cost = _task_add_cost(cfg, task, result)
@@ -4854,6 +4867,173 @@ async def _dispatch_to_claude_impl(
             )
         else:
             await _send_plan_card(ctx, update, chat_key, plan_snapshot)
+
+
+# Прогрев кэша разговора (warm.py). Потолок пинга: обычно он идёт 5-15 с.
+WARM_RUNTIME_SEC = 180
+# Насколько раньше срока задание job_queue может сработать без отказа.
+WARM_EARLY_SEC = 30
+
+
+def _warm_prompt() -> str:
+    return _("Служебный ход бота для прогрева кэша, не сообщение человека. "
+             "Ответь одним словом «ок», не вызывая инструментов.")
+
+
+def _warm_signature(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str) -> tuple:
+    """Всё, что входит в начало запроса рана темы: модель, effort, окно
+    сжатия, персона и подсказка памяти. Другое значение у следующего рана
+    значит другой кэш, и пинг старого был бы впустую (ревью Codex 19.10:
+    /model default и /model pin меняют модель без ожидающего выбора)."""
+    persona = _persona_for(ctx, cfg, chat_key)
+    return (_model_for(ctx, cfg, chat_key), _effort_for(ctx, cfg, chat_key),
+            _autocompact_for(cfg, chat_key), hashlib.sha256(persona.encode()).hexdigest(),
+            _memory_scope_hint(ctx, cfg, chat_key))
+
+
+def _warm_after_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
+                    result: ClaudeResult, sig: tuple) -> None:
+    """Отметка прогрева после рана темы: сессия, начало последнего запроса
+    к модели, размер разговора и параметры рана; пинг через IDLE минут.
+    Ран без обращения к Claude (отказ до API, не та сессия) отметку не
+    двигает: кэш он не обновил (ревью Codex 19.10)."""
+    if chat_key not in getattr(cfg, "warm_chats", frozenset()):
+        return
+    store: SessionStore = ctx.application.bot_data["sessions"]
+    sid = store.get(chat_key)
+    if not result.last_request_at or not sid or result.session_id != sid:
+        return
+    marks: dict = ctx.application.bot_data.setdefault("warm", {})
+    if not result.context_tokens:
+        # Разговор сжат в последнем запросе, ожидаемый размер неизвестен.
+        marks.pop(chat_key, None)
+        return
+    marks[chat_key] = {"sid": sid, "at": result.last_request_at,
+                       "expected": result.context_tokens, "sig": sig}
+    _warm_schedule(ctx.application, chat_key)
+
+
+def _warm_forget(app: Application, chat_key: str) -> None:
+    if app.bot_data.get("warm", {}).pop(chat_key, None) is not None:
+        _warm_cancel(app, chat_key)
+
+
+def _warm_cancel(app: Application, chat_key: str) -> None:
+    jq = app.job_queue
+    if jq is not None:
+        for job in jq.get_jobs_by_name(f"warm:{chat_key}"):
+            job.schedule_removal()
+
+
+def _warm_schedule(app: Application, chat_key: str) -> None:
+    """Пинг через IDLE минут от начала последнего запроса. Поколение отметки
+    едет в задании: уже запущенное задание schedule_removal не снимает, и без
+    сверки оно пинговало бы по отметке нового рана сразу (ревью Codex 19.10)."""
+    jq = app.job_queue
+    if jq is None:
+        return
+    _warm_cancel(app, chat_key)
+    bd = app.bot_data
+    mark = bd["warm"][chat_key]
+    bd["warm_gen"] = gen = bd.get("warm_gen", 0) + 1
+    mark["gen"] = gen
+    cfg: Config = bd["cfg"]
+    delay = max(1.0, mark["at"] + cfg.warm_idle_min * 60 - time.time())
+    jq.run_once(_warm_tick, when=delay, name=f"warm:{chat_key}", data=(chat_key, gen))
+
+
+def _warm_skip_reason(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
+                      mark: dict | None, gen: int) -> str:
+    """Почему пинга сейчас не будет; пусто: можно. Цепочка на этом кончается,
+    следующую назначит настоящий ран."""
+    bd = ctx.application.bot_data
+    if mark is None:
+        return "no mark"
+    if mark.get("gen") != gen:
+        return "mark replaced"
+    if time.time() - mark["at"] < cfg.warm_idle_min * 60 - WARM_EARLY_SEC:
+        return "not idle yet"
+    if bd.get("stopping") or bd.get("draining"):
+        return "bot stopping or restart pending"
+    if not warm.in_window(datetime.now(local_zone()), cfg.warm_hours):
+        return "outside window"
+    if time.time() - mark["at"] > warm.LATE_SEC:
+        # Таймер опоздал (сон машины): кэш, скорее всего, уже истёк, и пинг
+        # переписал бы весь разговор.
+        return "late"
+    store: SessionStore = bd["sessions"]
+    if store.get(chat_key) != mark["sid"]:
+        return "session changed"
+    if _warm_signature(ctx, cfg, chat_key) != mark["sig"]:
+        return "run settings changed"
+    if warm.near_compaction(mark["expected"], _autocompact_for(cfg, chat_key)):
+        return "near autocompact window"
+    return ""
+
+
+async def _warm_tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пинг прогрева: ход в ответвление сессии темы (run_claude,
+    warm_fork_sid) под замком темы, с замками рана по чужому тексту (у темы
+    может быть автоодобрение, а человека рядом нет). В чат ничего не идёт,
+    итог в журнале бота. Прочитал разговор: следующий пинг через IDLE минут."""
+    app = ctx.application
+    bd = app.bot_data
+    chat_key, gen = ctx.job.data
+    cfg: Config = bd["cfg"]
+    reason = _warm_skip_reason(ctx, cfg, chat_key, bd.get("warm", {}).get(chat_key), gen)
+    if reason:
+        log.info("warm skip chat=%s: %s", chat_key, reason)
+        return
+    lock = _chat_lock(ctx, chat_key)
+    if lock.locked():
+        # Идёт ран: он сам назначит пинг после себя.
+        log.info("warm skip chat=%s: run in progress", chat_key)
+        return
+    chat_id_s, _sep, thread_s = chat_key.partition(":")
+    # Учёт работы: перезапуск по заявке ждёт и пинг (ревью Codex 19.10).
+    bd["active_work"] = bd.get("active_work", 0) + 1
+    try:
+        async with lock:
+            mark = bd.get("warm", {}).get(chat_key)
+            reason = _warm_skip_reason(ctx, cfg, chat_key, mark, gen)
+            if reason:
+                log.info("warm skip chat=%s: %s", chat_key, reason)
+                return
+            result = await run_claude(
+                cfg.claude_bin, chat_key, int(chat_id_s), int(thread_s) if thread_s else None,
+                _warm_prompt(), bd["sessions"],
+                cwd=cfg.claude_cwd,
+                hook_settings=cfg.hook_settings_path,
+                persona=_persona_for(ctx, cfg, chat_key),
+                memory_scope_hint=_memory_scope_hint(ctx, cfg, chat_key),
+                effort=_effort_for(ctx, cfg, chat_key),
+                model=_model_for(ctx, cfg, chat_key),
+                autocompact=_autocompact_for(cfg, chat_key),
+                max_runtime_sec=WARM_RUNTIME_SEC,
+                # Реестр процессов: остановка бота и поправка «!» гасят пинг.
+                # Реестр сессий нет: поправка восстановила бы в тему id
+                # ответвления, которого нет на диске.
+                process_registry=bd["procs"],
+                session_targets=bd["session_targets"],
+                cost_totals=bd.get("cost_totals"),
+                unattended_sids=bd.setdefault("unattended_sids", set()),
+                untrusted_sids=bd.setdefault("untrusted_sids", set()),
+                should_stop=lambda: bool(bd.get("stopping") or bd.get("draining")),
+                warm_fork_sid=warm.fork_sid(chat_key),
+            )
+            ok = (not result.is_error and result.requests == 1 and not result.compacted
+                  and warm.healthy(result.first_cache_read, result.first_cache_write, mark["expected"]))
+            if not ok:
+                log.warning("warm chain stopped chat=%s: error=%s requests=%d compacted=%d "
+                            "read=%d write=%d expected=%d text=%r",
+                            chat_key, result.is_error, result.requests, result.compacted,
+                            result.first_cache_read, result.first_cache_write, mark["expected"],
+                            result.text[:200])
+                return
+            mark["at"] = result.last_request_at
+            _warm_schedule(app, chat_key)
+    finally:
+        bd["active_work"] -= 1
 
 
 # Триггеры, при которых бот озвучивает ответ на ТЕКСТОВЫЙ запрос. Сценарий:

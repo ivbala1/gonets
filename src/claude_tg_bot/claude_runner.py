@@ -209,6 +209,13 @@ class ClaudeResult:
     # (таймаут, отмена, сбой) здесь то, что агент успел ответить до неё
     # (разбор задач 19.10.2026).
     texts: tuple[str, ...] = ()
+    # Запросы основного диалога к модели: сколько, когда начался последний
+    # (time.time(); от него кэш живёт час) и кэш первого (прогрев, warm.py).
+    # 0: запросов не было (отказ до API).
+    requests: int = 0
+    last_request_at: float = 0.0
+    first_cache_read: int = 0
+    first_cache_write: int = 0
 
 
 @dataclass
@@ -229,6 +236,10 @@ class _Attempt:
     result_texts: list[str] = field(default_factory=list)  # тексты всех result по порядку
     # Ран по чужому тексту остановлен по init: инструменты без замка.
     blocked_tools: list[str] = field(default_factory=list)
+    requests: int = 0  # см. ClaudeResult
+    last_request_at: float = 0.0
+    first_cache_read: int = 0
+    first_cache_write: int = 0
 
 
 def _describe_tool_use(evt: dict) -> str | None:
@@ -288,6 +299,62 @@ def _request_context(evt: dict) -> int | None:
         return None
     return int((u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
                + (u.get("cache_creation_input_tokens") or 0)) or None
+
+
+@dataclass
+class _RequestTrack:
+    """Запросы основного диалога рана по событиям stream-json (прогрев,
+    warm.py): число, начало последнего и кэш первого. Подагенты не в счёт."""
+    next_at: float
+    count: int = 0
+    last_at: float = 0.0
+    first_read: int = 0
+    first_write: int = 0
+    ids: set = field(default_factory=set)
+
+    def note(self, evt: dict) -> None:
+        if evt.get("parent_tool_use_id"):
+            return
+        kind = evt.get("type")
+        if kind == "user" or (kind == "system" and evt.get("subtype") == "init"):
+            # Следующий запрос начнётся не раньше этого события.
+            self.next_at = time.time()
+            return
+        if kind != "assistant":
+            return
+        msg = evt.get("message") or {}
+        usage, mid = msg.get("usage"), msg.get("id")
+        # Несколько событий одного message.id это один запрос.
+        if not isinstance(usage, dict) or not mid or mid in self.ids:
+            return
+        self.ids.add(mid)
+        self.count += 1
+        self.last_at = self.next_at
+        if self.count == 1:
+            self.first_read = int(usage.get("cache_read_input_tokens") or 0)
+            self.first_write = int(usage.get("cache_creation_input_tokens") or 0)
+
+
+def _request_fields(att: "_Attempt") -> dict:
+    return {"requests": att.requests, "last_request_at": att.last_request_at,
+            "first_cache_read": att.first_cache_read, "first_cache_write": att.first_cache_write}
+
+
+# Прогрев не готовит вход (run_claude): токен истекает раньше, и пинга нет.
+WARM_OAUTH_MARGIN_SEC = 300
+
+
+def _warm_cost(cost_totals: MutableMapping[str, str] | None, main_sid: str | None,
+               total: float) -> float | None:
+    """Цена пинга: total_cost_usd ответвления накоплен вместе с сессией темы
+    (замер 19.10.2026), вычитается её сумма с прошлого ответа. Учёт не
+    меняется: следующий настоящий ответ считается от той же суммы."""
+    prev_raw = cost_totals.get(main_sid) if cost_totals is not None and main_sid else None
+    try:
+        prev = float(prev_raw) if prev_raw is not None else None
+    except ValueError:
+        return None
+    return total - prev if prev is not None and total >= prev else None
 
 
 # Сколько сессий помнить для цены ответа: давние после /reset и TTL не нужны,
@@ -577,6 +644,7 @@ async def run_claude(
     on_run_start: Callable[[], None] | None = None,
     unexited: list[asyncio.subprocess.Process] | None = None,
     ask_id: int | None = None,
+    warm_fork_sid: str = "",
 ) -> ClaudeResult:
     """Запустить claude -p для конкретного чата/темы.
 
@@ -614,6 +682,12 @@ async def run_claude(
     unexited - сюда процесс попытки, не вышедший и после SIGKILL (_reap_proc):
         регистрацию в process_registry ран снимает, а бот держит проект
         задачи до его выхода (ревью Codex 14.10).
+    warm_fork_sid - прогрев кэша (warm.py): ход в ответвление сохранённой
+        сессии темы под этим id, без сохранения на диск и одним ходом модели.
+        Сессию темы и учёт цены не меняет: store только читается, повтора
+        свежей сессией нет, подготовки входа нет (она запускает отдельный
+        claude с сохранением; токен на грани, и пинга нет). session_id
+        результата это сессия темы, cost_usd цена пинга.
     """
     # F1: пере-валидация hook settings если файл менялся.
     # Fail-closed: если hook стал невалиден, отказываемся запускать Claude
@@ -635,9 +709,17 @@ async def run_claude(
                 is_error=True,
             )
 
-    # Pre-flight: освежить OAuth-токен, если он на грани протухания. Иначе после
-    # долгого простоя первый запрос мог упасть с 401 (инцидент 2026-06-20).
-    await ensure_oauth_fresh(claude_bin)
+    if warm_fork_sid:
+        # Подготовка входа запустила бы отдельный claude с сохранением сессии
+        # вне учёта процессов (ревью Codex 19.10): прогрев её не делает, вход
+        # освежит следующий настоящий ран.
+        exp = _oauth_expires_at()
+        if exp is not None and exp - time.time() <= WARM_OAUTH_MARGIN_SEC:
+            return ClaudeResult(text="warm: oauth token expiring", is_error=True)
+    else:
+        # Pre-flight: освежить OAuth-токен, если он на грани протухания. Иначе после
+        # долгого простоя первый запрос мог упасть с 401 (инцидент 2026-06-20).
+        await ensure_oauth_fresh(claude_bin)
 
     # bypassPermissions нужен, чтобы headless не виснул на approve для безопасных tools.
     # Для destructive tools PreToolUse-hook перехватит и спросит через Telegram.
@@ -711,7 +793,16 @@ async def run_claude(
         nonlocal on_run_start
         if should_stop is not None and should_stop():
             return None
-        if resume_sid:
+        if warm_fork_sid and resume_sid:
+            # Ответвление без записи на диск: файла сессии не появляется, а
+            # сессия темы не меняется (замер 19.10.2026). Один ход модели:
+            # попытка вызвать инструмент обрывает ран, а не множит запросы.
+            args = [claude_bin, *common, "--resume", resume_sid, "--fork-session",
+                    "--session-id", warm_fork_sid, "--no-session-persistence",
+                    "--max-turns", "1"]
+            active_sid = warm_fork_sid
+            sid_short = f"{resume_sid[:8]} fork={warm_fork_sid[:8]}"
+        elif resume_sid:
             args = [claude_bin, *common, "--resume", resume_sid]
             active_sid = resume_sid
             sid_short = resume_sid[:8]
@@ -725,10 +816,17 @@ async def run_claude(
             # рестарт бота посреди рана не оставят транскрипт без метки.
             on_session_start(active_sid)
 
+        # «claude warm start»: строки «claude start/done» разбирают внешние
+        # сводки цены по журналу, пинг в них не смешивается.
         log.info(
-            "claude start chat=%s sid=%s cwd=%s effort=%s",
+            "claude %s chat=%s sid=%s cwd=%s effort=%s",
+            "warm start" if warm_fork_sid else "start",
             chat_key, sid_short, cwd, effort or "(default)",
         )
+        # Начало следующего запроса к модели: старт процесса, потом событие
+        # init и каждый результат инструмента. Метка не позже настоящего
+        # начала, значит срок кэша от неё считается с запасом.
+        req = _RequestTrack(next_at=time.time())
         # start_new_session=True: claude становится session+pgroup leader, его дети
         # (Bash-tool, MCP-серверы и т.п.) попадают в ту же pgroup. Это позволяет
         # /cancel и timeout убивать ВСЁ поддерево через os.killpg, а не только верх.
@@ -828,6 +926,7 @@ async def run_claude(
                         continue
                     if not isinstance(evt, dict):
                         continue
+                    req.note(evt)
                     if activity_cb is not None:
                         try:
                             activity_cb()
@@ -955,6 +1054,10 @@ async def run_claude(
             ctx_max=ctx_max,
             compacted=compacted,
             blocked_tools=blocked_tools,
+            requests=req.count,
+            last_request_at=req.last_at,
+            first_cache_read=req.first_read,
+            first_cache_write=req.first_write,
         )
 
     # Роутер памяти закрепляет проект за сессией по первому сообщению и внутри
@@ -963,7 +1066,14 @@ async def run_claude(
     # остаётся от прежнего проекта. Сверка идёт ЗДЕСЬ, перед каждым --resume,
     # а не в обработчике переименования: тот может не сработать (занятый чат,
     # рестарт), и тогда старая сессия жила бы вечно.
-    existing = resume_target(store, scope_store, chat_key, memory_scope_hint)
+    if warm_fork_sid:
+        # Прогрев только читает сессию темы: resume_target сбросил бы её при
+        # смене скоупа, это решает следующий настоящий ран.
+        existing = store.get(chat_key)
+        if not existing:
+            return ClaudeResult(text="warm: no session", is_error=True)
+    else:
+        existing = resume_target(store, scope_store, chat_key, memory_scope_hint)
 
     stopped = ClaudeResult(text=_("⛔ отменено: бот останавливается"), is_error=True)
     att = await _attempt(existing)
@@ -977,6 +1087,8 @@ async def run_claude(
     # потерян — старой сессии не существует).
     if (
         att.resumed
+        # Прогрев свежую сессию не заводит: она сохранилась бы на диск.
+        and not warm_fork_sid
         and not att.timed_out
         and att.returncode not in (0, -15, -9, 143, 137)
         and _is_stale_session_error(att.stderr.decode(errors="replace"))
@@ -1003,6 +1115,7 @@ async def run_claude(
         return ClaudeResult(
             text=_("⛔ claude убит по таймауту ({timeout}s)").format(timeout=max_runtime_sec),
             session_id=att.active_sid, is_error=True, texts=tuple(att.result_texts),
+            **_request_fields(att),
         )
 
     if att.returncode != 0 or (att.final_event and att.final_event.get("is_error") is True):
@@ -1021,7 +1134,12 @@ async def run_claude(
         stderr_txt = att.stderr.decode(errors="replace").strip()
         total, _unused = _usage_stats(out) if out else (0.0, 0)
         err_sid = (out.get("session_id") if out else None) or att.active_sid
-        cost = _answer_cost(cost_totals, err_sid, total, att.resumed) if total > 0 else 0.0
+        if total <= 0:
+            cost = 0.0
+        elif warm_fork_sid:
+            cost = _warm_cost(cost_totals, existing, total)
+        else:
+            cost = _answer_cost(cost_totals, err_sid, total, att.resumed)
         text = _format_error_text(att.returncode, out, stderr_txt, raw_out)
         log.error(
             "claude rc=%s stop=%s api_status=%s msg=%r",
@@ -1039,7 +1157,7 @@ async def run_claude(
             is_error=True,
             api_error_status=api_status if isinstance(api_status, int) else None,
             auth_error="claude" if api_status == 401 or is_auth_error(diagnostic) else "",
-            texts=tuple(att.result_texts),
+            texts=tuple(att.result_texts), **_request_fields(att),
         )
 
     out = att.final_event
@@ -1057,6 +1175,18 @@ async def run_claude(
     result_text = out.get("result") or out.get("response") or _("[пустой ответ]")
     sid = out.get("session_id") or att.active_sid
     total, turn_input = _usage_stats(out)
+    if warm_fork_sid:
+        # Сессия темы и учёт цены не меняются; sid результата это сессия темы.
+        cost = _warm_cost(cost_totals, existing, total)
+        log.info("claude warm done chat=%s sid=%s read=%d write=%d requests=%d compacted=%d cost=%s",
+                 chat_key, (existing or "")[:8], att.first_cache_read, att.first_cache_write,
+                 att.requests, att.compacted, f"${cost:.4f}" if cost is not None else "?")
+        return ClaudeResult(
+            text=result_text, session_id=existing or "",
+            cost_usd=cost, session_cost_usd=total,
+            context_tokens=att.ctx_last or 0, context_max=att.ctx_max, compacted=att.compacted,
+            texts=tuple(att.result_texts), **_request_fields(att),
+        )
     cost = _answer_cost(cost_totals, sid, total, att.resumed)
     if out.get("session_id"):
         store.set(chat_key, sid)
@@ -1073,5 +1203,5 @@ async def run_claude(
         text=result_text, session_lost=session_lost, session_id=sid,
         cost_usd=cost, session_cost_usd=total,
         context_tokens=att.ctx_last or 0, context_max=att.ctx_max, compacted=att.compacted,
-        texts=tuple(att.result_texts),
+        texts=tuple(att.result_texts), **_request_fields(att),
     )
