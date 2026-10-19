@@ -504,8 +504,15 @@ async def ensure_oauth_fresh(claude_bin: str, *, buffer_sec: int = 120) -> None:
         log.info("oauth token expiring (%.0fs left) — warmup-refresh via claude", exp - time.time())
         proc = None
         try:
+            # Ран идёт без хука бота и его запретов: инструментов и MCP у него
+            # нет, остальное отказ без вопроса, сессия не сохраняется. Без
+            # этого он видел Bash, Gmail и allow из настроек пользователя
+            # (ревью Codex 19.10.2026, проверено на 2.1.303). --tools
+            # принимает несколько слов: за ним флаг, а не запрос.
             proc = await asyncio.create_subprocess_exec(
-                claude_bin, "-p", "--output-format", "json",
+                claude_bin, "-p", "--tools", "", "--strict-mcp-config",
+                "--permission-mode", "dontAsk", "--no-session-persistence",
+                "--output-format", "json",
                 "--model", "claude-haiku-4-5-20251001", "ok",
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,

@@ -696,5 +696,53 @@ class HookTimeoutTests(unittest.TestCase):
                         cfgmod.load_config(skip_hook_validation=True).approve_timeout_sec, 1)
 
 
+class ClaudeVersionTests(unittest.TestCase):
+    """onFailure понимает Claude Code 2.1.295 и новее: со старым CLI, без
+    CLI или с непонятной версией бот не стартует (ревью Codex 19.10.2026)."""
+
+    @staticmethod
+    def _env(d: str, claude: Path) -> dict[str, str]:
+        from claude_tg_bot.config import HOOK_APPROVE_MODULE
+        path = Path(d) / "settings.json"
+        path.write_text(json.dumps({"hooks": {"PreToolUse": [{
+            "matcher": "Bash|Monitor|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
+            "hooks": [{"type": "command", "command": f"python -m {HOOK_APPROVE_MODULE}",
+                       "timeout": 960, "onFailure": "block"}]}]}}))
+        return {"TELEGRAM_BOT_TOKEN": "1:test", "TELEGRAM_ALLOWED_USER_IDS": "1",
+                "CLAUDE_BIN": str(claude), "CLAUDE_HOOK_SETTINGS": str(path)}
+
+    def _load(self, d: str, version_output: str | None) -> None:
+        from claude_tg_bot import config as cfgmod
+        claude = Path(d) / "claude"
+        if version_output is not None:
+            claude.write_text(f"#!/bin/sh\necho '{version_output}'\n")
+            claude.chmod(0o755)
+        with mock.patch.object(cfgmod, "load_dotenv"), \
+                mock.patch.dict(os.environ, self._env(d, claude), clear=True):
+            cfgmod.load_config()
+
+    def test_new_cli_starts(self) -> None:
+        for out in ("2.1.295 (Claude Code)", "2.1.303 (Claude Code)", "2.2.0", "3.0.1"):
+            with self.subTest(out=out), tempfile.TemporaryDirectory() as d:
+                self._load(d, out)
+
+    def test_old_missing_or_unknown_cli_refuses_start(self) -> None:
+        for out in ("2.1.294 (Claude Code)", "1.9.999", "", "Claude Code", None):
+            with self.subTest(out=out), tempfile.TemporaryDirectory() as d, \
+                    self.assertRaises(RuntimeError) as cm:
+                self._load(d, out)
+            self.assertIn("2.1.295", str(cm.exception))
+
+    def test_hook_process_skips_version_check(self) -> None:
+        # Процесс хука и прочие утилиты грузят настройки без проверки: CLI
+        # для них не запускается.
+        from claude_tg_bot import config as cfgmod
+        with mock.patch.object(cfgmod, "_validate_claude_version") as check, \
+                tempfile.TemporaryDirectory() as d, mock.patch.object(cfgmod, "load_dotenv"), \
+                mock.patch.dict(os.environ, self._env(d, Path("/usr/bin/true")), clear=True):
+            cfgmod.load_config(skip_hook_validation=True)
+        check.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
