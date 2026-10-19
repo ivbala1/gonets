@@ -6,7 +6,12 @@
 сообщение Ивана одной строкой итога.
 
     python -m claude_tg_bot.skills.task_new "исходные слова Ивана" [--context "пояснение"]
-    python -m claude_tg_bot.skills.task_new --open    # открытые задачи со ссылками
+    python -m claude_tg_bot.skills.task_new --open    # открытые задачи: id, имя, этап, ссылка
+    python -m claude_tg_bot.skills.task_new "слова Ивана" --to <id> [--context "..."]
+
+--to добавляет слова в открытую задачу (решение Ивана 19.10.2026): они видны
+в её теме и идут ходом обдумывания, как сообщение Ивана там. «Делай» и
+закрытие так не делаются, они только в теме.
 
 Перед новой задачей Домовой смотрит открытые: продолжение открытой идёт в её
 тему, а не новой задачей (разбор 19.10.2026: новая тема на продолжение
@@ -37,11 +42,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("words", nargs="*", help="исходные слова Ивана")
     parser.add_argument("--context", default="", help="пояснение Домового, справка")
     parser.add_argument("--open", action="store_true", help="открытые задачи со ссылками, ничего не заводит")
+    parser.add_argument("--to", default="", help="id открытой задачи: добавить слова в неё")
     args = parser.parse_args(argv)
     if args.open:
         cfg = load_config(skip_hook_validation=True)
         opened = tasks.open_tasks(tasks.load(tasks.registry_dir(cfg.state_dir)))
-        print(tasks.open_list(opened) if opened else "открытых задач нет")
+        print(tasks.open_list(opened, with_id=True) if opened else "открытых задач нет")
         return 0
     words = " ".join(args.words).strip()
     if not words:
@@ -58,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         # на него ответит строка итога после закрытия (19.10.2026).
         ask = os.environ.get("CLAUDE_TG_ASK_ID", "")
         r = httpx.post(f"http://{host}:{cfg.approve_http_port}/task",
-                       json={"words": words, "context": args.context, "key": key,
+                       json={"words": words, "context": args.context, "key": key, "to": args.to,
                              "chat_key": os.environ.get("CLAUDE_TG_CHAT_KEY", ""),
                              "ask_id": int(ask) if ask.isdigit() else None},
                        headers=headers, timeout=120)

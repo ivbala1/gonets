@@ -1365,18 +1365,89 @@ async def _task_new(ctx: ContextTypes.DEFAULT_TYPE, words: str, tid: str, origin
 
 
 async def _task_from_http(ctx: ContextTypes.DEFAULT_TYPE, words: str, context: str, key: str,
-                          chat_key: str = "", ask_id: int | None = None) -> str:
+                          chat_key: str = "", ask_id: int | None = None, to: str = "") -> str:
     """Вход POST /task (Домовой, скилл task_new): задача как из /task в
     личном чате, память этого чата переходит в задачу. chat_key и ask_id из
     окружения позвавшего рана: откуда звали и на какое сообщение Ивана
     ответит строка итога после закрытия (решение Ивана 19.10.2026). Без темы
-    рана (вызов из терминала): личка, без ответа."""
+    рана (вызов из терминала): личка, без ответа. to: слова добавляются в
+    открытую задачу (_task_add)."""
+    if to:
+        return await _task_add(ctx, to, words, context, key)
     cfg: Config = ctx.application.bot_data["cfg"]
     tid = f"h{key}" if key else f"h{int(time.time() * 1000)}"
     chat, _sep, thread = (chat_key or str(cfg.primary_chat_id)).partition(":")
     origin = {"chat_id": int(chat), "thread_id": int(thread) if thread else None, "ask_id": ask_id}
     return await _task_new(ctx, words, tid, origin_key=str(cfg.primary_chat_id), origin=origin,
                            context=context)
+
+
+async def _task_add(ctx: ContextTypes.DEFAULT_TYPE, tid: str, words: str, context: str = "",
+                    key: str = "") -> str:
+    """Слова Ивана через Домового в открытую задачу (решение Ивана 19.10.2026):
+    видны в теме и идут ходом обдумывания, как его сообщение там. «Делай» так
+    не одобряется (касание без текста), закрыть нельзя: это только в теме.
+    Идущее выполнение добавка ждёт, как сообщение в теме. key: повтор того
+    же запроса (Домовой не дождался ответа) второй раз не добавляет. Вернёт
+    строку для ответа: что добавлено и куда, или причину отказа."""
+    cfg: Config = ctx.application.bot_data["cfg"]
+    bd = ctx.application.bot_data
+    if bd.get("draining") or bd.get("stopping"):
+        return _("♻️ бот готовится к перезапуску, в задачу не добавлено: повтори через пару минут")
+    try:
+        task = tasks.load(tasks.registry_dir(cfg.state_dir), strict=True).get(tid)
+    except (OSError, ValueError) as e:
+        log.error("tasks registry unreadable: %s", e)
+        return _("Реестр задач не читается, см. журнал бота")
+    if task is None:
+        return _("Задачи {tid} нет: открытые показывает task_new --open").format(tid=tid)
+    if task.get("status") == "creating" or not task.get("thread_id"):
+        return _("Тема задачи ещё заводится: повтори через минуту")
+    if task.get("status") not in tasks.OPEN_STATUSES:
+        return _("Задача «{name}» закрыта: заведи новую и в пояснении сошлись на неё").format(
+            name=tasks.short_name(task))
+    link = tasks.topic_link(task["chat_id"], task["thread_id"])
+    if key and _task_update(cfg, tid, expect=tasks.OPEN_STATUSES, add_key=key) is not None \
+            and task.get("add_key") == key:
+        return _("Уже добавлено в задачу «{name}»: {link}").format(name=tasks.short_name(task), link=link)
+    try:
+        await _send_retrying(lambda: ctx.bot.send_message(
+            task["chat_id"], tasks.addition_echo(words), message_thread_id=task["thread_id"],
+            link_preview_options=LinkPreviewOptions(is_disabled=True)))
+    except Exception as e:
+        log.warning("task addition echo failed %s", tid, exc_info=True)
+        if key:
+            with contextlib.suppress(OSError, ValueError):
+                _task_update(cfg, tid, add_key=task.get("add_key"))
+        return _("В тему задачи не ушло ({error}), не добавлено").format(error=type(e).__name__)
+    # Касание без текста: проект и не начатое одобрение снимаются, «делай»
+    # в словах одобрением не считается.
+    act, was, snap = _task_touch_now(ctx, task["chat_id"], task["thread_id"], None)
+    busy = act == "busy"
+    if snap is not None and (act in ("cancelled", "dropped") or (act == "thinking" and was in ("done", "failed"))):
+        ctx.application.create_task(_task_card(ctx, snap))
+    # Ход это работа для перезапуска по заявке; счёт до create_task, снимает _task_add_run.
+    bd["active_work"] = bd.get("active_work", 0) + 1
+    try:
+        ctx.application.create_task(_task_add_run(ctx, task, tasks.addition_prompt(words, context)))
+    except BaseException:
+        bd["active_work"] -= 1
+        raise
+    if busy:
+        return _("Добавил в задачу «{name}», агент ответит после идущего выполнения: {link}").format(
+            name=tasks.short_name(task), link=link)
+    return _("Добавил в задачу «{name}»: {link}").format(name=tasks.short_name(task), link=link)
+
+
+async def _task_add_run(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -> None:
+    """Ход обдумывания по словам из _task_add; учёт работы снимается здесь."""
+    try:
+        upd = _synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
+        await _dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True)
+    except Exception:
+        log.exception("task addition run failed %s", task["id"])
+    finally:
+        ctx.application.bot_data["active_work"] -= 1
 
 
 async def _task_intro(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -> None:

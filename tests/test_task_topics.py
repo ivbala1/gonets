@@ -1288,6 +1288,95 @@ class CommandTests(_TaskBase):
         self.assertEqual(self.task("hk2")["origin"], {"chat_id": USER, "thread_id": None, "ask_id": None})
 
 
+class AdditionTests(_TaskBase):
+    """Слова Ивана через Домового в открытую задачу (решение Ивана 19.10.2026):
+    видны в теме, идут ходом обдумывания; «Делай» и закрытие только в теме."""
+
+    async def add(self, tid: str, words: str, context: str = "", key: str = "") -> str:
+        text = await botmod._task_from_http(self.ctx, words, context, key, chat_key=str(USER), to=tid)
+        await self.settle()
+        return text
+
+    def task_ids(self) -> list[str]:
+        return list(tasks.load(tasks.registry_dir(self.state), strict=True))
+
+    def echoes(self, thread: int = THREAD) -> list[str]:
+        return [c.args[1] for c in self.bot.send_message.await_args_list
+                if c.kwargs.get("message_thread_id") == thread and c.args[1].startswith("📨")]
+
+    async def test_words_shown_in_topic_and_thought_over(self) -> None:
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
+        self.replies = ["Понял так: сначала бэкап; проверю по списку файлов"]
+        text = await self.add("t7-5", "сначала сделай бэкап", "Иван за рулём")
+        self.assertEqual(text, f"Добавил в задачу «1 README»: {tasks.topic_link(GROUP, THREAD)}")
+        self.assertEqual(self.echoes(), ["📨 Через Домового: сначала сделай бэкап"])
+        self.assertEqual(len(self.runs), 1)
+        run = self.runs[0]
+        self.assertEqual((run["kw"]["permission_mode"], run["chat_key"]), ("plan", f"{GROUP}:{THREAD}"))
+        self.assertTrue(run["prompt"].startswith("Владелец пишет в эту задачу через Домового. Его слова:\n"
+                                                 "сначала сделай бэкап"))
+        self.assertIn("Иван за рулём", run["prompt"])
+        # проект снят: добавка это ход обдумывания
+        self.assertEqual(self.task("t7-5")["status"], "thinking")
+        self.assertIn("бэкап", botmod.send_reply_text.await_args.args[2])
+
+    async def test_do_word_through_domovoy_never_approves(self) -> None:
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        await self.add("t7-5", "делай")
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+        self.assertNotEqual(self.task("t7-5")["status"], "running")
+        query = await self.press(f"nt:t7-5:do:{SHA}")
+        self.assertIn("уже не действует", query.answer.call_args.args[0])
+
+    async def test_addition_waits_for_running_exec(self) -> None:
+        self.put_command(status="running", plan=PLAN, plan_sha=SHA, exec_gen=1,
+                         exec_started="2026-10-19T10:00:00+04:00", name="1 README")
+        lock = botmod._chat_lock(self.ctx, f"{GROUP}:{THREAD}")
+        await lock.acquire()
+        text = await botmod._task_from_http(self.ctx, "и CHANGELOG", "", "", to="t7-5")
+        self.assertIn("после идущего выполнения", text)
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.runs, [])
+        with tasks.locked(tasks.registry_dir(self.state)) as data:
+            data["t7-5"]["status"] = "done"
+        lock.release()
+        await self.settle()
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+
+    async def test_closed_unknown_and_creating_refused(self) -> None:
+        self.put_command("t7-5", status="closed", name="1 README")
+        self.put_command("t7-6", thread=None, status="creating")
+        self.assertIn("закрыта: заведи новую", await self.add("t7-5", "ещё"))
+        self.assertIn("Задачи t7-9 нет", await self.add("t7-9", "ещё"))
+        self.assertIn("ещё заводится", await self.add("t7-6", "ещё"))
+        self.assertEqual(self.echoes(), [])
+        self.assertEqual(self.runs, [])
+
+    async def test_repeat_of_same_request_adds_once(self) -> None:
+        self.put_command(name="1 README")
+        await self.add("t7-5", "и CHANGELOG", key="k1")
+        again = await self.add("t7-5", "и CHANGELOG", key="k1")
+        self.assertIn("Уже добавлено", again)
+        self.assertEqual(len(self.echoes()), 1)
+        self.assertEqual(len(self.runs), 1)
+
+    async def test_http_to_validated(self) -> None:
+        app = SimpleNamespace(bot_data=self.bot_data, create_task=self.ctx.application.create_task,
+                              running=False, bot=self.bot)
+        self.bot_data["task_new"] = lambda *a, **kw: botmod._task_from_http(self.ctx, *a, **kw)
+        request = SimpleNamespace(
+            app={"cfg": SimpleNamespace(approve_shared_secret=""), "application": app},
+            headers={}, remote="127.0.0.1",
+            json=AsyncMock(return_value={"words": "ещё", "to": "../x y"}))
+        self.assertEqual((await approval.handle_task(request)).status, 400)
+        self.put_command(name="1 README")
+        request.json = AsyncMock(return_value={"words": "и CHANGELOG", "to": "t7-5"})
+        body = json.loads((await approval.handle_task(request)).text)
+        await self.settle()
+        self.assertIn("Добавил в задачу «1 README»", body["text"])
+        self.assertEqual(len(self.task_ids()), 1)  # новой задачи нет
+
+
 class VoiceTests(_TaskBase):
     async def test_voice_do_approves(self) -> None:
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
