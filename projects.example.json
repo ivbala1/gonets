@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to projects.json and fill in real absolute paths. A forum topic name (from Telegram service events) is matched as a case-insensitive substring against 'match'; for a matching topic the bot adds the block below to --append-system-prompt. Override the path with CLAUDE_TG_BOT_PROJECTS_FILE. / Скопируй в projects.json и впиши реальные абсолютные пути.",
+
+  "alpha": {
+    "name": "Alpha",
+    "match": ["alpha", "альфа"],
+    "docs": [
+      "/home/you/src/alpha/CLAUDE.md"
+    ],
+    "repos": [
+      "/home/you/src/alpha"
+    ]
+  },
+
+  "beta": {
+    "name": "Beta",
+    "match": ["beta"],
+    "prompt": "This conversation is in the Telegram topic of project Beta. Read /home/you/src/beta/CONTEXT.md before acting and stay within the project."
+  }
+}

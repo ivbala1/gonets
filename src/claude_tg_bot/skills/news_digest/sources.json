@@ -1,0 +1,129 @@
+{
+  "_comment": "Sources of the morning digest. weight: focus - main topics, brief - candidates that get in only with direct use. type: feed (Atom/RSS; include/exclude - regexes on the title), page (a page without a feed: lines that were not there yesterday; format html or text; link - address for the message if another one is read), github_search (q without a date, the code adds created within days), hn (Hacker News front page, match - regex on the title).",
+  "sources": [
+    {
+      "name": "claude-code",
+      "weight": "focus",
+      "type": "feed",
+      "url": "https://github.com/anthropics/claude-code/releases.atom",
+      "max_chars": 3500
+    },
+    {
+      "name": "claude-apps",
+      "weight": "focus",
+      "type": "page",
+      "title": "Claude apps release notes",
+      "url": "https://support.claude.com/en/articles/12138966-release-notes"
+    },
+    {
+      "name": "anthropic-news",
+      "weight": "focus",
+      "type": "page",
+      "title": "Anthropic news",
+      "url": "https://www.anthropic.com/news",
+      "max_chars": 2500
+    },
+    {
+      "name": "codex",
+      "weight": "focus",
+      "type": "feed",
+      "url": "https://learn.chatgpt.com/docs/changelog/rss.xml",
+      "max_chars": 2000
+    },
+    {
+      "name": "cursor",
+      "weight": "focus",
+      "type": "feed",
+      "url": "https://cursor.com/changelog/rss.xml"
+    },
+    {
+      "name": "mods-catalog",
+      "weight": "focus",
+      "type": "page",
+      "format": "text",
+      "title": "Claude Code mods catalog (awesome-claude-code-mods)",
+      "url": "https://raw.githubusercontent.com/karanb192/awesome-claude-code-mods/main/README.md",
+      "link": "https://github.com/karanb192/awesome-claude-code-mods"
+    },
+    {
+      "name": "gh-claude-code",
+      "weight": "focus",
+      "type": "github_search",
+      "q": "topic:claude-code",
+      "min_stars": 100
+    },
+    {
+      "name": "gh-claude-plugins",
+      "weight": "focus",
+      "type": "github_search",
+      "q": "topic:claude-code-plugin",
+      "min_stars": 40
+    },
+    {
+      "name": "gh-claude-mods",
+      "weight": "focus",
+      "type": "github_search",
+      "q": "claude code mods in:name,description",
+      "min_stars": 30
+    },
+    {
+      "name": "gh-codex",
+      "weight": "focus",
+      "type": "github_search",
+      "q": "topic:codex",
+      "min_stars": 100
+    },
+    {
+      "name": "gh-mcp",
+      "weight": "focus",
+      "type": "github_search",
+      "q": "topic:mcp-server",
+      "min_stars": 100
+    },
+    {
+      "name": "hn",
+      "weight": "brief",
+      "type": "hn",
+      "min_points": 250,
+      "match": "\\b(AI|LLM|GPT|Claude|Anthropic|OpenAI|Codex|Cursor|agent|agents|MCP|model|Gemini|Copilot|Kubernetes|Terraform|self-host)"
+    },
+    {
+      "name": "simonwillison",
+      "weight": "brief",
+      "type": "feed",
+      "url": "https://simonwillison.net/atom/everything/",
+      "max_items": 12,
+      "max_chars": 800
+    },
+    {
+      "name": "python-telegram-bot",
+      "weight": "brief",
+      "type": "feed",
+      "url": "https://github.com/python-telegram-bot/python-telegram-bot/releases.atom"
+    },
+    {
+      "name": "kubernetes",
+      "weight": "brief",
+      "type": "feed",
+      "url": "https://github.com/kubernetes/kubernetes/releases.atom",
+      "include": "^v\\d+\\.\\d+\\.0$",
+      "max_chars": 800
+    },
+    {
+      "name": "terraform",
+      "weight": "brief",
+      "type": "feed",
+      "url": "https://github.com/hashicorp/terraform/releases.atom",
+      "include": "^v\\d+\\.\\d+\\.0$",
+      "max_chars": 800
+    },
+    {
+      "name": "opentofu",
+      "weight": "brief",
+      "type": "feed",
+      "url": "https://github.com/opentofu/opentofu/releases.atom",
+      "include": "^v\\d+\\.\\d+\\.0$",
+      "max_chars": 800
+    }
+  ]
+}

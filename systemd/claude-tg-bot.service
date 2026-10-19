@@ -1,0 +1,30 @@
+[Unit]
+Description=Gonets: Telegram bridge to Claude Code
+After=network-online.target
+Wants=network-online.target
+# Restarts on request (exit code 75) and after crashes go through
+# Restart=on-failure. Five failed starts within 2 minutes put the unit into
+# failed, and OnFailure sends a Telegram message without the bot's code.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+OnFailure=claude-tg-bot-down.service
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+# The unit's PATH lacks ~/.local/bin, where uv and other MCP server commands live.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# .env is read by python-dotenv from WorkingDirectory. --check validates the
+# config and hook settings without polling: fail fast on a broken .env.
+ExecStartPre=@REPO@/.venv/bin/claude-tg-bot --check
+ExecStart=@REPO@/.venv/bin/claude-tg-bot
+Restart=on-failure
+# direct: an automatic restart does not pass through failed, so OnFailure does
+# not send a false "bot is down" (systemd >= 254).
+RestartMode=direct
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

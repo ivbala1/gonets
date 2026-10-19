@@ -1,0 +1,8 @@
+[Unit]
+Description=Gonets: message that the bot is down
+# Called from OnFailure= of claude-tg-bot.service when systemd gave up
+# restarting it. Uses the system Python without the bot's package or venv.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @REPO@/bot-down-notify.py
