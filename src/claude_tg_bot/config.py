@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import dotenv_values, load_dotenv
 
+from . import warm
+
 # Снимок os.environ перед первым load_dotenv (см. load_config).
 ENV_BEFORE_DOTENV: dict[str, str] | None = None
 
@@ -449,6 +451,11 @@ class Config:
     # действует; пусто = во всех.
     autocompact: str = ""
     autocompact_chats: frozenset[str] = frozenset()
+    # Прогрев кэша разговора (warm.py): темы, окно местного времени [начало,
+    # конец) и тишина в минутах до пинга. Пустой список = выключено.
+    warm_chats: frozenset[str] = frozenset()
+    warm_hours: tuple[int, int] = (9, 22)
+    warm_idle_min: int = 55
     @property
     def primary_chat_id(self) -> int:
         """Стабильно (min) выбранный user_id для сервисных уведомлений/approvals."""
@@ -657,6 +664,17 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     autocompact_chats = frozenset(
         k.strip() for k in os.environ.get("CLAUDE_AUTOCOMPACT_CHATS", "").split(",") if k.strip()
     )
+    warm_chats = frozenset(
+        k.strip() for k in os.environ.get("CLAUDE_TG_WARM_CHATS", "").split(",") if k.strip()
+    )
+    try:
+        warm_hours = warm.parse_hours(os.environ.get("CLAUDE_TG_WARM_HOURS", "") or "09-22")
+    except ValueError as e:
+        raise RuntimeError(f"CLAUDE_TG_WARM_HOURS: {e}") from None
+    warm_idle = _int_env("CLAUDE_TG_WARM_IDLE_MIN", 55)
+    # Кэш живёт 60 минут от начала запроса, пингу нужен запас (warm.LATE_SEC).
+    if not 5 <= warm_idle <= 55:
+        raise RuntimeError(f"CLAUDE_TG_WARM_IDLE_MIN={warm_idle}: нужно 5-55 минут")
     attach_ttl = _int_env("ATTACHMENT_TTL_DAYS", 30)
     photo_max = _int_env("PHOTO_MAX_SIZE_BYTES", 10485760)
     document_max = _int_env("DOCUMENT_MAX_SIZE_BYTES", 524288000)
@@ -838,4 +856,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         run_progress_note_sec=run_progress_note,
         autocompact=autocompact,
         autocompact_chats=autocompact_chats,
+        warm_chats=warm_chats,
+        warm_hours=warm_hours,
+        warm_idle_min=warm_idle,
     )

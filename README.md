@@ -85,6 +85,14 @@ has to ask before it deletes, pushes or sends anything.
   has been silent too long, with "Wait" and "Stop" buttons.
 - **Models and cost.** `/model`, `/effort`, a cost footer after each answer,
   a hint to `/reset` when the context grows large, `/usage` via `ccusage`.
+- **Cache warm-up (optional).** The prompt cache lives one hour. In chats you
+  list, after 55 minutes of silence the bot sends a hidden one-turn ping to a
+  non-persisted fork of the session (`--fork-session
+  --no-session-persistence`) with the same model and flags and read-only
+  locks. It reads the conversation from cache and keeps it warm, so your next
+  message after a long pause does not rewrite a 200k-token context. Measured:
+  about $0.16 per ping on Opus against $1-2 per cold rewrite. Pings run only
+  inside a time window and stop when the cache was not actually read.
 - **Codex fallback.** When Claude is unavailable (401, 429, 5xx) the bot can
   answer through the OpenAI Codex CLI in a sandbox; a `gpt:` prefix sends a
   message to Codex directly.
