@@ -351,7 +351,7 @@ class _Req:
 
 
 def _cfg() -> SimpleNamespace:
-    return SimpleNamespace(approve_shared_secret="s", primary_chat_id=1,
+    return SimpleNamespace(approve_shared_secret="s", primary_chat_id=1, state_dir=Path(tempfile.mkdtemp()),
                            allowed_chat_ids={-100}, allowed_user_ids={1})
 
 

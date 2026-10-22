@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from claude_tg_bot.bot import (  # noqa: E402
     _model_label, on_model, on_model_pick, on_model_pin,
 )
 from claude_tg_bot.config import DEFAULT_MODEL_CHOICES, load_config  # noqa: E402
+from claude_tg_bot import tasks  # noqa: E402
 
 
 class ModelChoicesConfigTests(unittest.TestCase):
@@ -104,6 +107,7 @@ def _cfg(**over) -> SimpleNamespace:
         allowed_chat_ids=frozenset({-100777}),
         model="claude-sonnet-5",
         model_choices=("m-alpha", "m-beta"),
+        state_dir=Path("/nonexistent-state"),
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -359,6 +363,52 @@ class ModelPipelineTests(unittest.TestCase):
         src = (Path(__file__).resolve().parents[1] / "src/claude_tg_bot/bot.py").read_text()
         self.assertIn("model=_model_for(ctx, cfg, chat_key)", src)
         self.assertNotIn("model=cfg.model", src)
+
+
+class TaskTopicModelTests(unittest.TestCase):
+    """Тема задачи по умолчанию на последнем Opus (решение Ивана 20.10.2026):
+    и обдумывание, и выполнение после «Делай» берут модель из `_model_for`.
+    Выбор на сессию и закреп за темой главнее."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        state = Path(self._tmp.name)
+        reg = tasks.registry_dir(state)
+        reg.mkdir(parents=True)
+        tasks.tasks_path(reg).write_text(json.dumps({"x-1": {
+            "id": "x-1", "status": "thinking", "chat_id": -100777, "thread_id": 42}}))
+        self.cfg = _cfg(state_dir=state)
+        self.ctx = _ctx(self.cfg)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_task_topic_defaults_to_task_model(self) -> None:
+        self.assertEqual(tasks.TASK_MODEL, "opus")
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777:42"), "opus")
+        # другие темы и чаты как прежде на дефолте
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777:43"), "claude-sonnet-5")
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777"), "claude-sonnet-5")
+        self.assertEqual(_model_for(self.ctx, self.cfg, "555"), "claude-sonnet-5")
+        # напоминания в футере нет: это дефолт темы задачи
+        self.assertEqual(_model_footer_note(self.ctx, self.cfg, "-100777:42"), "")
+
+    def test_session_choice_and_pin_win(self) -> None:
+        bd = self.ctx.application.bot_data
+        bd["model_by_target"] = {"-100777:42": "m-alpha"}
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777:42"), "m-alpha")
+        bd["model_pending"] = {"-100777:42": "m-beta"}
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777:42"), "m-beta")
+        bd["model_pending"].clear()
+        bd["model_by_target"].clear()
+        self.assertEqual(_model_for(self.ctx, self.cfg, "-100777:42"), "opus")
+
+    def test_exec_goes_through_the_same_run(self) -> None:
+        """Выполнение после «Делай» идёт через _dispatch_to_claude, то есть
+        через тот же run_claude с model=_model_for(...)."""
+        src = (Path(__file__).resolve().parents[1] / "src/claude_tg_bot/bot.py").read_text()
+        self.assertIn("await _dispatch_to_claude(upd, ctx, tasks.exec_prompt(task)", src)
+        self.assertEqual(src.count("await run_claude("), src.count("model=_model_for(ctx, cfg, chat_key)"))
 
 
 if __name__ == "__main__":

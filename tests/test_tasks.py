@@ -20,7 +20,7 @@ from claude_tg_bot.skills.news_digest import core  # noqa: E402
 from claude_tg_bot.skills.news_digest.core import Item  # noqa: E402
 
 NOW = datetime(2026, 10, 13, 10, 0, tzinfo=timezone(timedelta(hours=4)))
-SVOD_LIB = Path.home() / "src" / "svod" / "lib"
+SVOD_LIB = Path.home() / "src" / "svod" / "engine" / "lib"
 PROJECTS = [{"key": "bot", "name": "Бот", "path": "~/src/claude-tg-bot", "about": "мост"},
             {"key": "svod", "name": "Свод", "path": "~/src/svod", "about": "память"},
             {"key": "immich", "name": "Immich", "path": "~/src/personal/Immich", "about": "фото"}]
@@ -190,6 +190,11 @@ class TextTests(unittest.TestCase):
         self.assertNotIn("суть", run)
         self.assertNotIn("у тебя", run)
         self.assertNotIn("\u2014", intro + run + tasks.SCOPE_NOTE + tasks.think_note())
+        # простые команды без карточки (разбор 20.10.2026: ~17 карточек на чтение)
+        for text in (intro, tasks.think_note()):
+            for word in ("export", "$(...)", "python", "Read, Grep, Glob"):
+                self.assertIn(word, text)
+        self.assertIn("полным путём", intro)
         # проект по скиллу называет скилл
         _, task = tasks.reserve({}, "x-1", _item(), -100, NOW)
         task.update(plan="шаги", skill="immich-upgrade")
@@ -1181,6 +1186,11 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(tasks.touch(t, "а без бэкапа?"), "dropped")
         self.assertEqual((t["status"], t["plan"], t["rev"]), ("thinking", "", 4))
         self.assertEqual(tasks.touch(t, "делай"), "thinking")  # проекта нет: обычный ход
+        # голосовое «делай» про прежний проект новый не одобряет (ревью Codex 19.10)
+        t.update(status="proposed", plan="проект", plan_sha=sha)
+        self.assertEqual(tasks.touch(t, "делай", seen_sha="другой"), "dropped")
+        t.update(status="proposed", plan="проект", plan_sha=sha)
+        self.assertEqual(tasks.touch(t, "делай", seen_sha=sha), "go")
         t.update(status="running", plan="проект", plan_sha=sha)
         # одобрено, а ран не начался: поправка отменяет одобрение
         self.assertEqual(tasks.touch(t, "стоп"), "cancelled")
@@ -1216,8 +1226,10 @@ class FlowTests(unittest.TestCase):
         self.assertFalse(tasks.propose(t, 1, "проект", ""))  # Иван написал, пока писался ответ
         self.assertFalse(tasks.propose(t, 2, "  ", ""))
         self.assertTrue(tasks.propose(t, 2, "проект", "immich-upgrade"))
+        # скилл в отпечатке: тот же текст с другим скиллом даёт другую кнопку
         self.assertEqual((t["status"], t["plan_sha"], t["skill"]),
-                         ("proposed", tasks.plan_sha("проект"), "immich-upgrade"))
+                         ("proposed", tasks.plan_sha("проект\n<<DO:immich-upgrade>>"), "immich-upgrade"))
+        self.assertNotEqual(t["plan_sha"], tasks.plan_sha("проект"))
         self.assertFalse(tasks.propose(t, 2, "другой", ""))  # уже не обдумывание
 
     def test_approve_one_exec_for_whole_bot(self):

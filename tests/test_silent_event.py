@@ -28,7 +28,7 @@ from claude_tg_bot.claude_runner import ClaudeResult, SessionStore  # noqa: E402
 
 def _event_request(payload: dict):
     cfg = SimpleNamespace(
-        approve_shared_secret="", primary_chat_id=1,
+        approve_shared_secret="", primary_chat_id=1, state_dir=Path(tempfile.mkdtemp()),
         allowed_chat_ids=frozenset({-100}), allowed_user_ids=frozenset({1}),
     )
     wake = AsyncMock()
@@ -320,10 +320,10 @@ class SilentWakeRunTests(unittest.IsolatedAsyncioTestCase):
         for text in quiet:
             with self.subTest(quiet=text):
                 self.assertIs(by_text[text]["disable_notification"], True)
-        # «Встанет в очередь» шлёт ран утра, пока ждёт замок чата: тоже тихо.
+        # «Встанет в очередь» только на текст Ивана: утро ждёт замок молча
+        # (проект Домового 22.10.2026, 1.7).
         busy = [d for t, d in by_text.items() if t.startswith("⏳")]
-        self.assertEqual(len(busy), 1)
-        self.assertIs(busy[0]["disable_notification"], True)
+        self.assertEqual(busy, [])
 
 
 if __name__ == "__main__":

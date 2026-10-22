@@ -8,6 +8,7 @@ import asyncio
 import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,10 +42,14 @@ from claude_tg_bot.bot import (  # noqa: E402
 )
 from claude_tg_bot.replies import (  # noqa: E402
     extract_ask_marker,
+    load_full_text,
+    plan_voice_series,
     render_markup,
+    save_full_text,
     send_reply_text,
     send_voice_caption,
     voice_text,
+    with_counter,
 )
 from telegram import MessageEntity  # noqa: E402
 import httpx  # noqa: E402
@@ -131,6 +136,114 @@ class VoiceTextTests(unittest.TestCase):
 
     def test_markup_stripped_without_links(self) -> None:
         self.assertEqual(voice_text("**Жирно** и `код`"), ("Жирно и код", False))
+
+
+class VoiceSeriesTests(unittest.TestCase):
+    def test_short_reply_one_chunk(self) -> None:
+        reply = "Коротко.\n\n```\nls -la\n```\nВсё."
+        self.assertEqual(plan_voice_series(reply, 1024), (["Коротко.\n\nВсё."], ["```\nls -la\n```"]))
+        self.assertEqual(with_counter("Кусок", 1, 1), "Кусок")
+        self.assertEqual(with_counter("Кусок", 2, 3), "Кусок\n\n2/3")
+
+    def test_long_reply_fits_captions(self) -> None:
+        para = "**Абзац** про очередь в Доме юстиции 🎫, с [ссылкой](https://a.ge/x). " * 6
+        reply = "\n\n".join(f"{i}. {para}" for i in range(8))
+        chunks, fences = plan_voice_series(reply, 1024)
+        self.assertGreater(len(chunks), 2)
+        self.assertEqual(fences, [])
+        for k, chunk in enumerate(chunks):
+            plain, entities = render_markup(with_counter(chunk, k + 1, len(chunks)))
+            self.assertLessEqual(len(plain.encode("utf-16-le")) // 2, 1024)
+            # Перенос по строкам не рвёт разметку: значков в тексте нет.
+            self.assertNotIn("**", plain)
+            self.assertTrue(entities)
+        # Текст не теряется и не повторяется.
+        self.assertEqual("\n\n".join(chunks).split(), reply.split())
+
+    def test_one_huge_line_split_by_sentences(self) -> None:
+        reply = " ".join(f"Предложение номер {i} про штрафы." for i in range(200))
+        chunks, _fences = plan_voice_series(reply, 1024)
+        self.assertGreater(len(chunks), 3)
+        self.assertTrue(all(len(c) <= 1012 for c in chunks))
+        self.assertEqual(" ".join(chunks), reply)
+
+    def test_review_cases(self) -> None:
+        # Ревью Codex 21.10.2026: крошечный лимит без зацикливания, эмодзи в
+        # UTF-16 не больше подписи, ссылка с пробелами в тексте не рвётся.
+        self.assertTrue(plan_voice_series("слово " * 50, 12)[0])
+        chunks, _f = plan_voice_series("🎫" * 1100, 1024)
+        for k, c in enumerate(chunks):
+            plain = render_markup(with_counter(c, k + 1, len(chunks)))[0]
+            self.assertLessEqual(len(plain.encode("utf-16-le")) // 2, 1024)
+        link = "[очень длинная ссылка " + "про очередь " * 20 + "в Доме юстиции](https://a.ge/x)"
+        reply = " ".join(["Текст про штрафы и сроки подачи."] * 20 + [link] + ["Ещё текст."] * 20)
+        chunks, _f = plan_voice_series(reply, 1024)
+        self.assertEqual(sum(link in c for c in chunks), 1)
+
+    def test_series_first_chunk_only_links(self) -> None:
+        # Ревью Codex 21.10.2026: первый кусок без слов, второй длиннее лимита
+        # синтеза; раньше max() падал на пустом списке и ответ терялся.
+        links = "\n".join(f"https://a.ge/{i}/" + "x" * 80 for i in range(10))
+        reply = links + "\n\n" + "слово " * 150
+        ok, msg = self._series(reply, max_chars=100)
+        self.assertTrue(ok)
+        self.assertEqual(msg.reply_voice.await_count, 1)
+
+    def test_series_without_button_when_save_fails(self) -> None:
+        reply = "\n\n".join(f"Абзац {i}. " + "слово " * 150 for i in range(3))
+        with patch.object(botmod, "save_full_text", side_effect=OSError("disk full")):
+            ok, msg = self._series(reply)
+        self.assertTrue(ok)
+        self.assertTrue(all(c.kwargs["reply_markup"] is None for c in msg.reply_voice.call_args_list))
+
+    def _series(self, reply: str, tts=None, max_chars: int = 4000):
+        msg = SimpleNamespace(reply_voice=AsyncMock(), reply_text=AsyncMock())
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(telegram_caption_limit=1024, voice_reply_max_chars=max_chars,
+                                  state_dir=Path(tmp), telegram_text_limit=4000,
+                                  large_reply_as_file_threshold=12000)
+            with patch.object(botmod, "synthesize", tts or AsyncMock(return_value=b"ogg")):
+                ok = asyncio.run(botmod._send_voice_series(
+                    cfg, ctx, SimpleNamespace(message=msg), 42, object(), reply))
+        return ok, msg
+
+    def test_series_sends_in_order_with_button_on_last(self) -> None:
+        reply = "\n\n".join(f"Абзац {i}. " + "слово " * 150 for i in range(4)) + "\n```\nls\n```"
+        ok, msg = self._series(reply)
+        self.assertTrue(ok)
+        calls = msg.reply_voice.call_args_list
+        self.assertGreater(len(calls), 1)
+        n = len(calls)
+        for k, c in enumerate(calls):
+            self.assertTrue(c.kwargs["caption"].endswith(f"{k + 1}/{n}"))
+            self.assertEqual(c.kwargs["reply_markup"] is not None, k == n - 1)
+        self.assertTrue(calls[0].kwargs["caption"].startswith("Абзац 0."))
+        # Блок кода текстом после серии, без копии ответа.
+        msg.reply_text.assert_awaited_once()
+        self.assertEqual(msg.reply_text.call_args.args[0], "ls")
+
+    def test_series_rest_as_text_over_tts_limit(self) -> None:
+        reply = "\n\n".join(f"Абзац {i}. " + "слово " * 150 for i in range(4))
+        ok, msg = self._series(reply, max_chars=1000)
+        self.assertTrue(ok)
+        self.assertEqual(msg.reply_voice.await_count, 1)
+        self.assertIn("Абзац 3.", msg.reply_text.call_args.args[0])
+        self.assertNotIn("Абзац 0.", msg.reply_text.call_args.args[0])
+
+    def test_series_tts_fail_first_gives_up(self) -> None:
+        ok, msg = self._series("Короткий ответ.", tts=AsyncMock(side_effect=RuntimeError))
+        self.assertFalse(ok)
+        msg.reply_voice.assert_not_awaited()
+
+    def test_full_text_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            token = save_full_text(state, "весь ответ\nв две строки", 42)
+            self.assertEqual(load_full_text(state, token, 42), "весь ответ\nв две строки")
+            self.assertIsNone(load_full_text(state, token, 43))
+            self.assertIsNone(load_full_text(state, "../../etc/passwd", 42))
+            self.assertIsNone(load_full_text(state, "0" * 16, 42))
 
 
 class MarkupTests(unittest.TestCase):
@@ -413,6 +526,25 @@ class GatherTests(unittest.IsolatedAsyncioTestCase):
         _gather_fill(_gather_reserve(_msg_update(), self.ctx, "chat"), "голос", voice=True)
         await self._drain()
         self.assertTrue(self.dispatch.await_args.kwargs["send_voice_reply"])
+
+    async def test_next_batch_does_not_wait_for_previous_run(self) -> None:
+        """Регрессия 22.10.2026: сообщение, написанное во время долгого рана,
+        ждало его конца и вставало в очередь замка за кнопками и событиями,
+        пришедшими позже (сообщение 11:00 дошло до Claude в 11:57)."""
+        release = asyncio.Event()
+
+        async def long_run(*args, **kwargs):
+            await release.wait()
+
+        self.dispatch.side_effect = long_run
+        _gather_fill(_gather_reserve(_msg_update(), self.ctx, "chat"), "первое")
+        await asyncio.sleep(0.3)  # первая пачка ушла (флаш проверяет раз в 0,2 с), её ран идёт
+        self.assertEqual(self._sent(), ["первое"])
+        _gather_fill(_gather_reserve(_msg_update(), self.ctx, "chat"), "второе")
+        await asyncio.sleep(0.3)
+        self.assertEqual(self._sent(), ["первое", "второе"])  # второе уже у замка
+        release.set()
+        await self._drain()
 
     async def test_next_message_after_flush_opens_new_batch(self) -> None:
         _gather_fill(_gather_reserve(_msg_update(), self.ctx, "chat"), "первое")

@@ -258,7 +258,7 @@ class RoundFourTests(unittest.TestCase):
     def test_6_specific_program_paths(self) -> None:
         from claude_tg_bot.approval import _SKILL_PYTHON
         for cmd in ("~/.local/bin/cat a", str(BOT / '.venv/bin/cat') + ' a',
-                    "~/src/svod/bin/ls", "/opt/homebrew/bin/cat a"):
+                    "~/src/svod/engine/bin/ls", "/opt/homebrew/bin/cat a"):
             self.assertEqual(level(cmd), ORANGE, cmd)
         with tempfile.TemporaryDirectory() as d:
             alias = Path(d) / 'cat'
@@ -267,7 +267,7 @@ class RoundFourTests(unittest.TestCase):
         cmd = str(_SKILL_PYTHON) + ' -m claude_tg_bot.skills.yt_subs --help'
         self.assertTrue(_bash_auto_allowed(cmd, None))
         self.assertEqual(level(cmd), ORANGE)
-        self.assertEqual(level('~/src/svod/bin/memory recall test'), YELLOW)
+        self.assertEqual(level('~/src/svod/engine/bin/memory recall test'), YELLOW)
         self.assertEqual(level('/usr/bin/ls'), YELLOW)
 
     def test_7_redirect_cwd_and_symlink(self) -> None:

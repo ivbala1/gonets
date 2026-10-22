@@ -46,6 +46,7 @@ from dotenv import load_dotenv
 
 from ...i18n import _
 from ...notify import send_message
+from ...dashes import soften_dashes
 from .._oneshot import resolve_claude_bin, run_claude_oneshot
 from .core import (
     PLAIN_TOPIC_ID,
@@ -274,7 +275,9 @@ def run_digest_claude(prompt: str, timeout: int) -> str:
         raise RuntimeError(_("claude stdout не JSON: {error}").format(error=e)) from e
     if payload.get("is_error"):
         raise RuntimeError(_("claude вернул is_error=true"))
-    return (payload.get("result") or "").strip()
+    # Тире на дефис здесь: хук против тире в плановых ранах бота молчит, его
+    # строка «Исправлено» подменила бы сводку (решение Ивана 22.10.2026).
+    return soften_dashes((payload.get("result") or "").strip())
 
 
 def _int_env(name: str) -> int | None:

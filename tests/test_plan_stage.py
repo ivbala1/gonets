@@ -210,6 +210,83 @@ class TaskThinkTests(_HookBase):
         card.assert_not_called()
 
 
+class ThinkReadListTests(_HookBase):
+    """Разбор 20.10.2026: за 8 минут обдумывания ~17 карточек на чтение.
+    Читающие формы без карточки, пишущие и секреты по-прежнему нет."""
+
+    READS = (
+        'iconv -f utf-16le -t utf-8 "/mnt/c/Windows/System32/Tasks/WSL-autostart-claude-tg-bot"'
+        " | sed 's/\\r//' | head -70",
+        "iconv -futf-16le -tutf-8 a.txt", "iconv -l",
+        '/mnt/c/Windows/System32/tasklist.exe 2>&1 | grep -i -E "chrome|explorer" | head -20',
+        '/mnt/c/Windows/System32/tasklist.exe /FI "IMAGENAME eq chrome.exe" /FO CSV /NH',
+        "/mnt/c/Windows/System32/tasklist.exe /v /fi \"SESSION eq 1\"",
+        "date", "date +%F",
+        "file -L ~/.local/bin/agent-browser | cut -c1-200",
+        "strings -n 8 -a ~/.local/bin/agent-browser | grep -E dashboard | head -40",
+        "tailscale serve status 2>&1 | head", "tailscale serve status --json",
+        "tailscale funnel status", "tailscale status --json",
+        'agent-browser --help 2>&1 | grep -i -n -E "stream|screencast" | head -30',
+        "agent-browser --version", "~/.local/bin/agent-browser --help",
+        f"{Path.home()}/.local/bin/chrome-relay --help", "restic --help", "claude --help",
+        "systemctl --user status chrome-relay 2>&1 | head -12",
+        # `;` в конце ничего не запускает
+        'cd ~/src && grep -l -i -E "chrome.relay|browser" README.md | head; ',
+        # GitHub чтением (задача «Обновить Immich» 21.10.2026)
+        "gh release list -R immich-app/immich --limit 6",
+        "gh api repos/immich-app/immich/releases/tags/v3.3.4 --jq .body",
+        'gh api repos/immich-app/immich/compare/v3.3.3...v3.3.4 --jq ".files[].filename"',
+    )
+    WRITES = (
+        "iconv -f utf-16le -t utf-8 -o /tmp/x a.txt", "iconv -f a -t b --output=/tmp/x a.txt",
+        "iconv -f a -t b --out /tmp/x a.txt", "iconv -co /tmp/x a.txt", "iconv -f a -t b *.txt",
+        "date -s 2026-01-01", "date --set=now",
+        "tailscale serve 8080", "tailscale serve --bg 8080", "tailscale serve reset",
+        "tailscale funnel 443 on", "tailscale up", "tailscale down",
+        "/mnt/c/Windows/System32/tasklist.exe /S host /U u /P pass",
+        "/mnt/c/Windows/System32/tasklist.exe /FI", "tasklist.exe",
+        # справка только у известных программ и без подкоманды
+        "chrome-relay status", "chrome-relay status --help", "foo --help",
+        "./bin/agent-browser --help", "/tmp/agent-browser --help",
+        "systemctl --user restart chrome-relay", "file -C -m x",
+        # склейка, переменные, подстановка и интерпретаторы как раньше
+        "export PATH=$HOME/.local/bin:$PATH; agent-browser --version",
+        'strings -n 8 "$(readlink -f ~/.local/bin/agent-browser)"',
+        "tailscale status --json | python3 -c 'import sys'",
+        "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command Get-Date",
+        "find . -exec rm {} \\;",
+        "gh api -X POST repos/a/b/issues -f title=x", "gh api repos/a/b/issues --input x.json",
+        "gh api graphql -f 'query=mutation { x }'", "gh release create v1", "gh pr merge 1", "gh repo view --web",
+    )
+    SECRETS = (
+        "iconv -f utf-8 -t utf-8 ~/src/claude-tg-bot/.env", "iconv -f utf-8 -t ascii ~/.ssh/id_rsa",
+        "iconv -f utf-8 -t utf-8 ~/.claude/.credentials.json", "strings ~/src/claude-tg-bot/.env",
+        "file ~/.ssh/id_ed25519",
+    )
+
+    def test_reads_pass_without_card(self) -> None:
+        for cmd in self.READS:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(approval._plan_read_allowed(cmd))
+                out, card = self._decide("Bash", {"command": cmd}, think=True)
+                self.assertEqual(out["decision"], "allow")
+                card.assert_not_called()
+
+    def test_writing_forms_are_not_reads(self) -> None:
+        for cmd in self.WRITES + self.SECRETS:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(approval._plan_read_allowed(cmd))
+                self.assertFalse(approval._plan_read_allowed(cmd, two_mind=True))
+                # /plan: отказ без карточки
+                out, card = self._decide("Bash", {"command": cmd})
+                self.assertEqual(out["decision"], "deny")
+                card.assert_not_called()
+                # обдумывание задачи: карточка мимо окна ⏩ и автоаппрува чата
+                out, card = self._decide("Bash", {"command": cmd}, think=True, burst=True, auto_chat=True)
+                card.assert_called()
+                self.assertTrue(card.call_args.args[2].no_burst)
+
+
 class BurstSecretTests(_HookBase):
     def test_window_does_not_pass_secret(self) -> None:
         out, card = self._decide("Bash", {"command": "cat ~/src/claude-tg-bot/.env"},

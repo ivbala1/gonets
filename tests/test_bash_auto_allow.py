@@ -270,7 +270,7 @@ class MemoryReadAutoAllowTests(unittest.TestCase):
     """Чтение памяти Свода и `sed -n` идут без карточки: это вопросы вроде
     «что у меня в памяти про X», ради которых ждать аппрува глупо."""
 
-    _MEM = "~/src/svod/bin/memory"
+    _MEM = "~/src/svod/engine/bin/memory"
     _CFG = "MEMORY_CONFIG_DIR=~/.agent-memory-config "
 
     def test_read_subcommands_allowed(self) -> None:
@@ -283,7 +283,7 @@ class MemoryReadAutoAllowTests(unittest.TestCase):
             self._MEM + ' why "кардиолог"',
             self._MEM + " explain user_debts",
             self._MEM + " status --fetch --json",
-            f"MEMORY_CONFIG_DIR={home}/.agent-memory-config {home}/src/svod/bin/memory search x",
+            f"MEMORY_CONFIG_DIR={home}/.agent-memory-config {home}/src/svod/engine/bin/memory search x",
             "export MEMORY_CONFIG_DIR=~/.agent-memory-config; " + self._MEM + ' search "x"',
             "sed -n 1,12p ~/.agent-memory/personal/memory/project_domovoy.md",
             "sed -n '40,$p' a.md b.md | head -5",
@@ -298,7 +298,7 @@ class MemoryReadAutoAllowTests(unittest.TestCase):
         """Команда со скриншота 04.10.2026: память, grep и ls одной цепочкой."""
         env_re = re.compile(r"(?:(?:ls|grep|head|echo)(?: .*)?)")
         cmd = (
-            'export MEMORY_CONFIG_DIR=~/.agent-memory-config; ~/src/svod/bin/memory search '
+            'export MEMORY_CONFIG_DIR=~/.agent-memory-config; ~/src/svod/engine/bin/memory search '
             '"отпуск море билеты отель виза страховка" 2>&1 | head -20; '
             'echo ---; grep -rli -e "отпуск" -e "Отпуск" -e "билет[а-я]* " '
             '~/.agent-memory/personal/memory/ --include=*.md 2>/dev/null | grep -v archive '
@@ -321,8 +321,8 @@ class MemoryReadAutoAllowTests(unittest.TestCase):
             self._MEM + " status --fetch x",
             self._MEM + ' "remember" --file z',
             self._MEM + "x search a",
-            "~/src/svod/bin/memory-eval probes",
-            "/tmp/src/svod/bin/memory search x",
+            "~/src/svod/engine/bin/memory-eval probes",
+            "/tmp/src/svod/engine/bin/memory search x",
             "MEMORY_CONFIG_DIR=/tmp/evil " + self._MEM + " search x",
             "export MEMORY_CONFIG_DIR=/tmp/evil",
             "export PATH=/tmp/x",
@@ -387,7 +387,7 @@ class MemoryWriteAutoAllowTests(unittest.TestCase):
         self.drafts = Path(self._tmp.name) / "memory-drafts"
         self.drafts.mkdir()
         self.draft = str(self.drafts / "rec.md")
-        self.mem = "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/bin/memory remember"
+        self.mem = "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/engine/bin/memory remember"
 
     def allowed(self, cmd: str):
         return memory_write_auto_allowed(cmd, _ALLOW, self.drafts)
@@ -398,11 +398,11 @@ class MemoryWriteAutoAllowTests(unittest.TestCase):
             f"--source claude-code --session s1 --base abc1234 --json --file {self.draft} 2>&1 | head -3")
         self.assertEqual(calls, [{"scope": "personal", "name": "user_x", "dry_run": ""}])
         calls = self.allowed(
-            f"~/src/svod/bin/memory remember --scope=clients/alpha --id k1 --record r "
+            f"~/src/svod/engine/bin/memory remember --scope=clients/alpha --id k1 --record r "
             f"--section 'Релизы' --line '- [[r]] заметка' --file={self.draft} --dry-run")
         self.assertEqual(calls, [{"scope": "clients/alpha", "name": "r", "dry_run": "1"}])
         calls = self.allowed(
-            f"export MEMORY_CONFIG_DIR=~/.agent-memory-config; ~/src/svod/bin/memory remember "
+            f"export MEMORY_CONFIG_DIR=~/.agent-memory-config; ~/src/svod/engine/bin/memory remember "
             f"--scope personal --id i --file '{self.draft}' --content-type markdown")
         self.assertEqual(calls, [{"scope": "personal", "name": "i", "dry_run": ""}])
 
@@ -426,9 +426,9 @@ class MemoryWriteAutoAllowTests(unittest.TestCase):
             f"{self.mem} --scope personal --id x --file {d} extra",
             f"{self.mem} --scope personal --id x --file {d}; rm -rf ~",
             f"{self.mem} --scope personal --id $X --file {d}",
-            f"MEMORY_CONFIG_DIR=/tmp/evil ~/src/svod/bin/memory remember --scope personal --id x --file {d}",
-            f"/tmp/src/svod/bin/memory remember --scope personal --id x --file {d}",
-            f"~/src/svod/bin/memory search x",
+            f"MEMORY_CONFIG_DIR=/tmp/evil ~/src/svod/engine/bin/memory remember --scope personal --id x --file {d}",
+            f"/tmp/src/svod/engine/bin/memory remember --scope personal --id x --file {d}",
+            f"~/src/svod/engine/bin/memory search x",
             # Находки ревью 04.10.2026: манифест тянет файлы по своим путям
             # и удаляет записи; `~` без раскрытия bash'ем читает другой файл.
             f"{self.mem} --scope personal --id x --content-type manifest --file {d}",
