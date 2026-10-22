@@ -37,12 +37,12 @@ class AgentEnvTests(unittest.TestCase):
             }
             env = config.agent_env(base, env_file=env_file)
         self.assertEqual(env, {"CLAUDE_BIN": "/bin/claude", "PATH": "/usr/bin",
-                               "HOME": "/home/u", "GH_TOKEN": "g"})
+                               "HOME": "/home/u", "GH_TOKEN": "g", **config.STREAM_CAP_ENV})
 
     def test_missing_env_file_is_fine(self) -> None:
         env = config.agent_env({"TELEGRAM_BOT_TOKEN": "t", "A": "b"},
                                env_file=Path("/nonexistent/.env"))
-        self.assertEqual(env, {"A": "b"})
+        self.assertEqual(env, {"A": "b", **config.STREAM_CAP_ENV})
 
     def test_oneshot_child_has_no_bot_token(self) -> None:
         proc = MagicMock(returncode=0)
@@ -305,7 +305,7 @@ class UntrustedGuardHookTests(unittest.TestCase):
 
 def _event_request(payload: dict, *, allowed_chats=frozenset({-100}), users=frozenset({1})):
     cfg = SimpleNamespace(
-        approve_shared_secret="", primary_chat_id=min(users),
+        approve_shared_secret="", primary_chat_id=min(users), state_dir=Path(tempfile.mkdtemp()),
         allowed_chat_ids=allowed_chats, allowed_user_ids=users,
     )
     wake = AsyncMock()

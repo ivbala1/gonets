@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from claude_tg_bot import approval  # noqa: E402
 
 def _call(payload: dict, *, factory: bool = True):
     cfg = SimpleNamespace(
-        approve_shared_secret="", primary_chat_id=1,
+        approve_shared_secret="", primary_chat_id=1, state_dir=Path(tempfile.mkdtemp()),
         allowed_chat_ids=frozenset(), allowed_user_ids=frozenset({1}),
     )
     wake = AsyncMock()

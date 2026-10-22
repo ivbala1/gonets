@@ -235,8 +235,8 @@ class MiscReadTests(_Base):
             "ip route show",
             "python3 -m json.tool",
             "python3 -m json.tool --sort-keys a.json",
-            "~/src/svod/bin/memory remember --help",
-            "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/bin/memory --help",
+            "~/src/svod/engine/bin/memory remember --help",
+            "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/engine/bin/memory --help",
             "diff a.md b.md",
             "ls /missing 2>/dev/null; ls /tmp",
             "grep -n x src/a.py 2>/dev/null| head -3",
@@ -265,7 +265,7 @@ class MiscReadTests(_Base):
             "ls 2>/dev/null;rm x",
             "ls 2>/dev/null&>out",
             "ls >/dev/null.evil",
-            "~/src/svod/bin/memory remember --scope global --id x",
+            "~/src/svod/engine/bin/memory remember --scope global --id x",
         )
 
 

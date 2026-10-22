@@ -432,8 +432,8 @@ _SYSTEM_BIN_DIRS = frozenset({"/bin", "/usr/bin", "/sbin", "/usr/sbin"})
 _SYSTEM_REAL_DIRS = _SYSTEM_BIN_DIRS | {"/usr/lib/cargo/bin/coreutils"}
 _KNOWN_PROGRAMS = (
     Path(__file__).resolve().parents[2] / ".venv/bin/python",
-    Path.home() / "src/svod/bin/memory",
-    Path.home() / "src/svod/bin/memory-context",
+    Path.home() / "src/svod/engine/bin/memory",
+    Path.home() / "src/svod/engine/bin/memory-context",
 )
 _KNOWN_TARGETS = {path: path.resolve() for path in _KNOWN_PROGRAMS}
 
@@ -1880,7 +1880,7 @@ _PROTECTED_FILES = (
 
 def _with_targets(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     """Пути плюс их настоящие цели: ~/.claude/hooks бывает ссылкой на
-    ~/.agent-dotfiles/hooks, и запись по настоящему пути тоже красная
+    ~/src/svod/agent/hooks, и запись по настоящему пути тоже красная
     (ревью 11.10.2026)."""
     out = list(paths)
     for p in paths:

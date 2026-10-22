@@ -101,6 +101,13 @@ class FooterTests(unittest.IsolatedAsyncioTestCase):
             compacted=True))
         self.assertEqual(text, "💸 $0.20 (сессия $3.00) · 🧠 контекст сжат (макс 300k)")
 
+    async def test_no_reset_hint_with_autocompact(self) -> None:
+        cfg = SimpleNamespace(show_cost_footer=True, context_warn_tokens=200_000)
+        msg = SimpleNamespace(reply_text=AsyncMock())
+        await replies.send_cost_footer(cfg, SimpleNamespace(message=msg), cr.ClaudeResult(
+            text="", cost_usd=0.1, session_cost_usd=2.0, context_tokens=250_000), warn_reset=False)
+        self.assertEqual(msg.reply_text.call_args.args[0], "💸 $0.10 (сессия $2.00) · 🧠 контекст 250k")
+
     async def test_no_spend_no_footer(self) -> None:
         self.assertIsNone(await self._footer(cr.ClaudeResult(text="", cost_usd=0.0)))
 

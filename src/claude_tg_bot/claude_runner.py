@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from . import limits
 from .auth import is_auth_error
 from .config import agent_env
 from .i18n import _
@@ -216,6 +217,11 @@ class ClaudeResult:
     last_request_at: float = 0.0
     first_cache_read: int = 0
     first_cache_write: int = 0
+    # Окна лимита подписки из последнего rate_limit_event рана; ошибка рана
+    # оказалась исчерпанием подписки и время, когда пробовать снова.
+    rate: dict | None = None
+    limit_hit: bool = False
+    limit_reset: float | None = None
 
 
 @dataclass
@@ -240,6 +246,10 @@ class _Attempt:
     last_request_at: float = 0.0
     first_cache_read: int = 0
     first_cache_write: int = 0
+    # Окна лимита подписки из последнего rate_limit_event рана (limits.parse_event).
+    rate: dict | None = None
+    # Первое событие рана: замер цены дела в процентах окна (журнал «claude done»).
+    rate_first: dict | None = None
 
 
 def _describe_tool_use(evt: dict) -> str | None:
@@ -631,6 +641,7 @@ async def run_claude(
     hook_settings: Path,
     persona: str = "",
     memory_scope_hint: str = "",
+    show_chat_key: str = "",
     effort: str = "",
     model: str = "",
     max_runtime_sec: int = 0,
@@ -782,6 +793,12 @@ async def run_claude(
     # Тема рана: заявка на перезапуск (restart_request.py) шлёт ход
     # перезапуска туда, откуда её подали.
     child_env["CLAUDE_TG_CHAT_KEY"] = chat_key
+    # Где показывать то, что ждёт человека (передача экрана): тема мастерской
+    # заглушена, её ран показывает это в личке (проект Домового 22.10.2026).
+    if show_chat_key:
+        child_env["CLAUDE_TG_SHOW_CHAT_KEY"] = show_chat_key
+    else:
+        child_env.pop("CLAUDE_TG_SHOW_CHAT_KEY", None)
     # Сообщение Ивана, на которое отвечает ран: задача, заведённая из рана
     # (task_new), ответит на него строкой итога после закрытия (19.10.2026).
     if ask_id:
@@ -825,10 +842,13 @@ async def run_claude(
 
         # «claude warm start»: строки «claude start/done» разбирают внешние
         # сводки цены по журналу, пинг в них не смешивается.
+        # model= последним полем: разбор строк «claude done» (limit_costs.py,
+        # скрипты разбора 22.10) ждёт свой порядок, а «claude start» читается
+        # без привязки к концу строки (проект 22.10.2026, 1.6).
         log.info(
-            "claude %s chat=%s sid=%s cwd=%s effort=%s",
+            "claude %s chat=%s sid=%s cwd=%s effort=%s model=%s",
             "warm start" if warm_fork_sid else "start",
-            chat_key, sid_short, cwd, effort or "(default)",
+            chat_key, sid_short, cwd, effort or "(default)", model or "(default)",
         )
         # Начало следующего запроса к модели: старт процесса, потом событие
         # init и каждый результат инструмента. Метка не позже настоящего
@@ -879,6 +899,8 @@ async def run_claude(
         compacted = 0
         blocked_tools: list[str] = []
         init_checked = False
+        rate: dict | None = None
+        rate_first: dict | None = None
         # Повтор свежей сессией после протухшего --resume не новый старт рана.
         run_start, on_run_start = on_run_start, None
 
@@ -890,7 +912,7 @@ async def run_claude(
             stderr читается конкурентной таской — иначе заполненный pipe
             (64 KiB) взаимно заблокировал бы нас и claude.
             """
-            nonlocal final_event, ctx_last, ctx_max, compacted, init_checked
+            nonlocal final_event, ctx_last, ctx_max, compacted, init_checked, rate, rate_first
             assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
             async def _readline() -> bytes:
@@ -957,6 +979,13 @@ async def run_claude(
                             await asyncio.gather(stderr_task, return_exceptions=True)
                             await _reap_proc(proc)
                             return b"".join(lines), b""
+                    seen = limits.parse_event(evt)
+                    if seen is not None:
+                        # В снимок сразу: другие темы решают по нему, пока этот ран идёт.
+                        rate = seen
+                        rate_first = rate_first or seen
+                        limits.record(seen)
+                        continue
                     if evt.get("type") == "result":
                         final_event = evt
                         said = evt.get("result")
@@ -1065,6 +1094,8 @@ async def run_claude(
             last_request_at=req.last_at,
             first_cache_read=req.first_read,
             first_cache_write=req.first_write,
+            rate=rate,
+            rate_first=rate_first,
         )
 
     # Роутер памяти закрепляет проект за сессией по первому сообщению и внутри
@@ -1157,6 +1188,8 @@ async def run_claude(
         )
         api_status = out.get("api_error_status") if out else None
         diagnostic = stderr_txt + "\n" + str(out.get("result", "") if out else "")
+        said = str((out.get("result") or "") if out else "") or stderr_txt
+        limit_hit = (att.rate or {}).get("status") == "rejected" or limits.is_limit_error(said)
         return ClaudeResult(
             text=text, session_id=att.active_sid,
             cost_usd=cost, session_cost_usd=total,
@@ -1165,6 +1198,8 @@ async def run_claude(
             api_error_status=api_status if isinstance(api_status, int) else None,
             auth_error="claude" if api_status == 401 or is_auth_error(diagnostic) else "",
             texts=tuple(att.result_texts), **_request_fields(att),
+            rate=att.rate, limit_hit=limit_hit,
+            limit_reset=limits.hit_reset(att.rate, said) if limit_hit else None,
         )
 
     out = att.final_event
@@ -1202,10 +1237,11 @@ async def run_claude(
         session_lost = not att.resumed
     # ctx это вход последнего запроса, max за ран, input_sum прежняя сумма по
     # всем запросам рана (то, что до 13.10.2026 писалось как ctx).
-    log.info("claude done chat=%s sid=%s result_len=%d cost=%s session=$%.4f ctx=%s max=%d input_sum=%d",
+    log.info("claude done chat=%s sid=%s result_len=%d cost=%s session=$%.4f ctx=%s max=%d input_sum=%d limits=%s",
              chat_key, sid[:8], len(result_text),
              f"${cost:.4f}" if cost is not None else "?", total,
-             att.ctx_last if att.ctx_last is not None else "?", att.ctx_max, turn_input)
+             att.ctx_last if att.ctx_last is not None else "?", att.ctx_max, turn_input,
+             limits.span(att.rate_first, att.rate))
     return ClaudeResult(
         text=result_text, session_lost=session_lost, session_id=sid,
         cost_usd=cost, session_cost_usd=total,

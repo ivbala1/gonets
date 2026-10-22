@@ -348,6 +348,30 @@ class PlanCardTests(_Base):
         await self.dispatch("План одобрен — выполняй его.", expect_epoch=epoch)
         self.assertEqual(self.runs, [])
 
+    async def test_still_wanted_checked_under_lock(self) -> None:
+        # Разбор 22.10.2026: нажатие, ждавшее замка, а дело уже сделано, рана не даёт.
+        await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: False)
+        self.assertEqual(self.runs, [])
+        await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: True)
+        self.assertEqual(len(self.runs), 1)
+
+
+    async def test_run_end_marks_taken_otklik_unknown(self) -> None:
+        """Ревью Codex 22.10.2026: ран взял отклик и кончился без итога: под
+        замком темы запись получает «результат неизвестен», а не висит sending."""
+        from claude_tg_bot import otklik
+        base = otklik.otklik_dir(self.state)
+        rec = otklik.new_record("Acme", "почта", "Hello")
+        rec.update(chat_id=GROUP, source=str(GROUP), status="approved")
+        otklik.save(base, rec)
+        self.ctx.bot.edit_message_text = AsyncMock()
+
+        async def takes(_run) -> None:
+            otklik.take(base, rec["id"], str(GROUP))
+        self.run_hook = takes
+        await self.dispatch("[Кнопка отклика] ✅ ок")
+        self.assertEqual(otklik.load(base, rec["id"])["status"], "unknown")
+
 
 # ---- B32: кнопка вопроса после рестарта ----
 

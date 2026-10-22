@@ -47,7 +47,16 @@ def agent_env(base: dict[str, str] | None = None, *, env_file: Path = BOT_ENV_FI
         pass
     for name in names:
         env.pop(name, None)
+    # Трансляция agent-browser без потолка 1280x720: иначе кадр большого окна
+    # (развёрнутый «Агент», всплывающее окно входа) приходит уменьшенным и
+    # касания с телефона при передаче экрана идут мимо (21.10.2026).
+    for name, value in STREAM_CAP_ENV.items():
+        env.setdefault(name, value)
     return env
+
+
+STREAM_CAP_ENV = {"AGENT_BROWSER_STREAM_MAX_WIDTH": "3840",
+                  "AGENT_BROWSER_STREAM_MAX_HEIGHT": "2160"}
 
 # Ожидаемые инструменты, которые ДОЛЖНЫ проходить через approve-хук.
 # Если matcher из settings не покрывает какой-то из них — это означает,
@@ -524,6 +533,27 @@ class Config:
     warm_chats: frozenset[str] = frozenset()
     warm_hours: tuple[int, int] = (9, 22)
     warm_idle_min: int = 55
+    # Чаты разговора с Домовым (ключи тем через запятую): с 97% пятичасового или
+    # 99% недельного лимита Claude остаток только у сообщений Ивана в них
+    # (limits.py). Пусто: резерва нет ни у кого, все раны в этой зоне ждут сброса.
+    limit_reserve_chats: frozenset[str] = frozenset()
+    # Пути общих данных, которые Write и Edit не трогают (APPROVE_GUARDED_DATA_PATHS),
+    # и подсказка в отказе: чем их менять.
+    approve_guarded_data_paths: frozenset[Path] = frozenset()
+    approve_guarded_data_hint: str = ""
+    # Мастерская помощника (проект Домового 22.10.2026): тема для долгой
+    # работы. Её модель, усилие и пометка /scope по умолчанию, ответы фоновых
+    # ранов бот пересылает в личку, карточки и передачу экрана показывает там.
+    # Строка цены только у ответов дороже этого (решение Ивана 22.10.2026: 21
+    # строка за полтора часа); 0 = у каждого, как раньше. Итог дня в /status.
+    cost_footer_min_usd: float = 0.0
+    # Чаты, где субагент зовётся только с явной ролью цены (approval
+    # _agent_role_refusal; чаты Домового, разбор 22.10.2026).
+    agent_role_chat_keys: frozenset[str] = frozenset()
+    workshop_chat_key: str = ""
+    workshop_model: str = "opus"
+    workshop_effort: str = "high"
+    workshop_scope: str = ""
     @property
     def primary_chat_id(self) -> int:
         """Стабильно (min) выбранный user_id для сервисных уведомлений/approvals."""
@@ -540,6 +570,17 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         print(f"[config] WARNING: {name}={raw!r} не целое число — беру {default}", file=sys.stderr)
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[config] WARNING: {name}={raw!r} не число — беру {default}", file=sys.stderr)
         return default
 
 
@@ -662,6 +703,20 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
             continue
         wl_paths.append(resolved)
     approve_whitelist_paths = frozenset(wl_paths)
+
+    # Общие данные, которые агент меняет только своей командой под замком
+    # синхронизации (журнал и таблицы Домового, ревью Codex 22.10.2026): Write
+    # и Edit по ним отказ с подсказкой. Только абсолютные пути.
+    guarded_paths = []
+    for p in (x.strip() for x in os.environ.get("APPROVE_GUARDED_DATA_PATHS", "").split(",")):
+        expanded = Path(p).expanduser() if p else None
+        if expanded is None or not expanded.is_absolute():
+            if p:
+                print(f"[config] WARNING: APPROVE_GUARDED_DATA_PATHS skip {p!r}: not absolute", file=sys.stderr)
+            continue
+        guarded_paths.append(expanded.resolve())
+    approve_guarded_data_paths = frozenset(guarded_paths)
+    guarded_hint = os.environ.get("APPROVE_GUARDED_DATA_HINT", "").strip()
 
     # Автоаппрув по чатам: решение Ивана 14.09.2026 для личного диалога
     # тренера, где карточки на запись журнала только мешали.
@@ -866,6 +921,14 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
                     file=sys.stderr,
                 )
     codex_prefix = os.environ.get("CODEX_PREFIX", "gpt:").strip() or "gpt:"
+    workshop_chat_key = os.environ.get("WORKSHOP_CHAT_KEY", "").strip()
+    if workshop_chat_key and not re.fullmatch(r"-?\d+:\d+", workshop_chat_key):
+        print(f"[config] WARNING: WORKSHOP_CHAT_KEY={workshop_chat_key!r} не вида <chat>:<thread>, мастерская выключена",
+              file=sys.stderr)
+        workshop_chat_key = ""
+    limit_reserve_chats = frozenset(
+        k.strip() for k in os.environ.get("CLAUDE_TG_LIMIT_RESERVE_CHATS", "").split(",") if k.strip()
+    )
 
     return Config(
         telegram_bot_token=token,
@@ -928,4 +991,14 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         warm_chats=warm_chats,
         warm_hours=warm_hours,
         warm_idle_min=warm_idle,
+        limit_reserve_chats=limit_reserve_chats,
+        approve_guarded_data_paths=approve_guarded_data_paths,
+        approve_guarded_data_hint=guarded_hint,
+        workshop_chat_key=workshop_chat_key,
+        agent_role_chat_keys=frozenset(
+            k.strip() for k in os.environ.get("AGENT_ROLE_CHAT_KEYS", "").split(",") if k.strip()),
+        cost_footer_min_usd=_float_env("COST_FOOTER_MIN_USD", 0.0),
+        workshop_model=os.environ.get("WORKSHOP_MODEL", "opus").strip(),
+        workshop_effort=os.environ.get("WORKSHOP_EFFORT", "high").strip(),
+        workshop_scope=os.environ.get("WORKSHOP_SCOPE", "").strip(),
     )

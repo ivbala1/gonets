@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import difflib
 import glob
 import hmac
@@ -35,7 +36,7 @@ from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
-from . import audit, danger, mailsend
+from . import audit, danger, events, mailsend, otklik
 from .burst import burst_target_key
 from .config import LOOPBACK_HOSTS, Config
 from .i18n import _, N_
@@ -264,7 +265,7 @@ def _format_mailsend(mail: dict[str, Any]) -> str:
                   "без ✅ на карточке письма mailsend откажет. Форма для письма: "
                   "<code>{form}</code>").format(form=_esc(_MAILSEND_FORM)))
     lines = [_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"),
-             _("кому: <code>{to}</code>").format(to=_esc_truncate(', '.join(mail.get('to') or []), 300))]
+             _("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(', '.join(mail.get('to') or []), 300))]
     if mail.get("cc"):
         lines.append(_("копия: <code>{cc}</code>").format(cc=_esc_truncate(', '.join(mail['cc']), 300)))
     if mail.get("reply_to"):
@@ -312,6 +313,8 @@ class Pending:
     # cfg.primary_chat_id с thread=None.
     target_chat_id: int | None = None
     target_thread_id: int | None = None
+    # Чат рана, если карточка показана не там (мастерская показывает в личке).
+    origin_key: str = ""
     # Рабочий каталог агента из входа хука: относительный путь в команде
     # оценивается от него (ревью 11.10.2026).
     cwd: str | None = None
@@ -331,6 +334,7 @@ class ApprovalRegistry:
         target_chat_id: int | None = None,
         target_thread_id: int | None = None,
         cwd: str | None = None,
+        origin_key: str = "",
     ) -> Pending:
         aid = uuid.uuid4().hex[:12]
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -343,6 +347,7 @@ class ApprovalRegistry:
             target_chat_id=target_chat_id,
             target_thread_id=target_thread_id,
             cwd=cwd,
+            origin_key=origin_key,
         )
         self._items[aid] = p
         return p
@@ -636,7 +641,7 @@ def _format_outbound(tool_input: dict[str, Any]) -> str:
     lines = [_("📤 <b>отправка от твоего имени</b>")]
     to = tool_input.get("to") or tool_input.get("chat_id")
     if to not in (None, ""):
-        lines.append(_("кому: <code>{to}</code>").format(to=_esc_truncate(str(to), 300)))
+        lines.append(_("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(str(to), 300)))
     for key, label in (("cc", _("копия")), ("bcc", _("скрытая копия")),
                        ("message_id", _("ответ на сообщение")),
                        ("replyToMessageId", _("ответ на письмо")),
@@ -1508,6 +1513,10 @@ def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
         return _remember_args(parts, segment, None) is not None
     if parts[0] == "systemctl":
         return _systemctl_read_ok(parts, segment)
+    if parts[0] == _TASKLIST:
+        return _tasklist_read_ok(parts, segment)
+    if parts[0] == "iconv":
+        return _iconv_read_ok(parts, segment)
     if parts[0] == "journalctl":
         return _journalctl_read_ok(parts, segment)
     if parts[:2] == ["gh", "api"]:
@@ -1661,7 +1670,9 @@ def _bash_command_is_safe(command: str, *patterns: re.Pattern[str],
     до скана — они часто встречаются в диагностических командах.
     `>/dev/null.evil` не стрипуется и остаётся запрещённым.
     """
-    cmd = command.strip()
+    # Одна `;` в конце ничего не запускает, а пустой сегмент после неё слал
+    # карточкой целую читающую команду (разбор 20.10.2026). `\;` не снимается.
+    cmd = re.sub(r"(?<!\\);\s*$", "", command.strip()).rstrip()
     if not cmd:
         return False
     sanitized = _BASH_SAFE_REDIRECT_RE.sub("", cmd)
@@ -1730,7 +1741,7 @@ _SKILL_CALL_RE = re.compile(
 _HOME_RE = rf"(?:~|{re.escape(str(Path.home()))})"
 _MEMORY_CONFIG_RE = rf"{_HOME_RE}/\.agent-memory-config/?"
 _MEMORY_READ_RE = re.compile(
-    rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/bin/memory"
+    rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/engine/bin/memory"
     r" (?:(?:recall|search|why|index|explain)(?: .*)?|status(?: --(?:fetch|json))*"
     r"|(?:[a-z]+ )?--help)"
     rf"|export MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE}"
@@ -1768,6 +1779,62 @@ def _bash_auto_allowed(command: str, bash_re: re.Pattern[str] | None,
     return _bash_command_is_safe(command, *patterns, cwd=cwd)
 
 
+# tasklist.exe Windows (из WSL) только про этот ПК: `/S`, `/U`, `/P` (чужая
+# машина, пароль в командной строке) и прочее идут карточкой. Разбор
+# 20.10.2026: обдумывание задачи слало карточкой каждый список процессов.
+_TASKLIST = "/mnt/c/Windows/System32/tasklist.exe"
+_TASKLIST_BOOL = frozenset({"/nh", "/v", "/svc", "/apps"})
+_TASKLIST_VALUE = frozenset({"/fi", "/fo"})
+
+
+def _tasklist_read_ok(parts: list[str], segment: str) -> bool:
+    if _has_unquoted_glob(segment):
+        return False
+    i = 1
+    while i < len(parts):
+        a = parts[i].lower()
+        if a in _TASKLIST_BOOL:
+            i += 1
+        elif a in _TASKLIST_VALUE and i + 1 < len(parts):
+            i += 2
+        elif a == "/m":
+            # `/M [модуль]`: необязательное имя модуля следующим словом.
+            i += 2 if i + 1 < len(parts) and not parts[i + 1].startswith("/") else 1
+        else:
+            return False
+    return True
+
+
+# iconv только в stdout: кодировки, `-c`, `-s`, `-l`. `-o`/`--output` пишет
+# файл, сокращения длинных флагов (`--out`, `--from`) и прочие флаги идут
+# карточкой. Входные файлы проверяет общий запрет секретов.
+_ICONV_BOOL = frozenset({"-c", "-s", "--silent", "-l", "--list", "--verbose"})
+_ICONV_VALUE = frozenset({"-f", "-t", "--from-code", "--to-code"})
+
+
+def _iconv_read_ok(parts: list[str], segment: str) -> bool:
+    if _has_unquoted_glob(segment):
+        return False
+    i = 1
+    while i < len(parts):
+        a = parts[i]
+        if a == "--":
+            break
+        if a in _ICONV_BOOL:
+            i += 1
+        elif a.split("=", 1)[0] in ("--from-code", "--to-code") and "=" in a:
+            i += 1
+        elif a in _ICONV_VALUE:
+            i += 2
+        elif a[:2] in ("-f", "-t") and len(a) > 2:
+            i += 1
+        elif a.startswith("-") and a != "-":
+            return False
+        else:
+            i += 1
+    return True
+
+
 # Чтение этапа плана: свой неизменный список, без APPROVE_BASH_AUTO_ALLOW_REGEX
 # (настройка может разрешать и запись) и без вызовов скиллов бота (скилл
 # действует, а не читает). Ревью Codex 13.10.2026.
@@ -1778,9 +1845,24 @@ _PLAN_READ_RE = re.compile(
     r"|systemctl --user (?:status|is-active|is-failed|list-units|list-timers|cat)(?: .*)?"
     r"|git (?:status|diff|log|show|branch|remote -v|ls-files|describe|stash list|grep)(?: .*)?"
     r"|tailscale (?:status|ip|version)(?: .*)?|ss(?: -[ltunpaeHmio]+)*"
+    # Настройки serve/funnel только показом: `tailscale serve <порт>` публикует.
+    r"|tailscale (?:serve|funnel) status(?: --json)?"
     # Версия установленной программы: имя без пути, только `--version`
     # (`npm version` и `-V` у части программ значат другое).
     r"|[a-z][a-z0-9._+-]* --version"
+    # Справка верхнего уровня только у известных программ: произвольная
+    # программа или скрипт может не знать `--help` и сделать своё дело
+    # (`chrome-relay status --help` выполняет status, поэтому без подкоманд).
+    # Путь допустим только к каталогам установки, не к рабочим каталогам.
+    rf"|(?:(?:{_HOME_RE}/\.local|/usr(?:/local)?)/bin/)?"
+    r"(?:agent-browser|chrome-relay|tailscale|claude|codex|restic) --(?:help|version)"
+    # Список процессов Windows: флаги разбирает `_tasklist_read_ok`.
+    rf"|{re.escape(_TASKLIST)}(?: .*)?"
+    # Перекодировка в stdout: флаги разбирает `_iconv_read_ok` (без `-o`).
+    r"|iconv(?: .*)?"
+    # GitHub только чтением: подкоманды разбирают `_gh_read_ok` и
+    # `_gh_api_read_ok` (GET без полей и `--input`), как в обычном чате.
+    r"|gh (?:pr|issue|run|release|repo|api) .*"
 )
 
 
@@ -1818,7 +1900,7 @@ _PLAN_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 # Область global (контракт всех сессий) остаётся на карточке: внедрённый
 # чужим текстом «закон» иначе молча попал бы в каждую будущую сессию.
 _MEMORY_WRITE_RE = re.compile(
-    rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/bin/memory remember(?: .*)?"
+    rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/engine/bin/memory remember(?: .*)?"
 )
 _REMEMBER_VALUE_FLAGS = frozenset({
     "--scope", "--id", "--file", "--content-type", "--source", "--session",
@@ -1832,7 +1914,7 @@ MEMORY_DRAFTS_DIRNAME = "memory-drafts"
 def _is_remember_call(parts: list[str]) -> bool:
     if parts and parts[0].startswith("MEMORY_CONFIG_DIR="):
         parts = parts[1:]
-    return len(parts) >= 2 and parts[0].endswith("/src/svod/bin/memory") and parts[1] == "remember"
+    return len(parts) >= 2 and parts[0].endswith("/src/svod/engine/bin/memory") and parts[1] == "remember"
 
 
 def _remember_args(parts: list[str], segment: str, drafts: Path | None) -> dict[str, str] | None:
@@ -1969,6 +2051,58 @@ def _unattended_auto_allowed(is_unattended: bool, permission_mode: str) -> bool:
     return is_unattended and permission_mode not in ("", "plan")
 
 
+AGENT_MODELS = frozenset({"haiku", "sonnet", "opus"})
+AGENT_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def origin_chat_key(chat_id: int, thread_id: int | None) -> str:
+    return f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+
+
+def _agent_role_refusal(cfg: Config, chat_key: str, tool_input: dict[str, Any]) -> str | None:
+    """В чатах AGENT_ROLE_CHAT_KEYS (Домовой) субагент только с явной ролью
+    цены: именованный профиль (scout, worker: модель и усилие в его файле)
+    или general-purpose с допустимыми model и effort. Ответвление сессии
+    (fork) отказ: оно копирует всю сессию и стоило 74% поиска (разбор
+    22.10.2026); словами правило не работало, 29 из 47 вызовов без модели."""
+    keys = getattr(cfg, "agent_role_chat_keys", frozenset())
+    if chat_key not in keys:
+        return None
+    kind = str(tool_input.get("subagent_type") or "general-purpose").strip()
+    hint = _("scout для чтения открытых страниц и файлов, worker для дела по готовому плану, "
+             "general-purpose только с model (haiku, sonnet, opus) и effort (low, medium, high)")
+    if kind == "fork":
+        return _("ответвление сессии (fork) здесь не зовётся: оно копирует всю сессию. Возьми {hint}").format(hint=hint)
+    if kind != "general-purpose":
+        return None
+    model = str(tool_input.get("model") or "").strip().lower()
+    effort = str(tool_input.get("effort") or "").strip().lower()
+    if model not in AGENT_MODELS or effort not in AGENT_EFFORTS:
+        return _("general-purpose без явных model и effort наследует модель и усилие главного рана "
+                 "(дорого). Возьми {hint}").format(hint=hint)
+    return None
+
+
+def _guarded_data_refusal(cfg: Config, tool_name: str, tool_input: dict[str, Any],
+                          cwd: str | None = None) -> str | None:
+    """Отказ для Write и Edit по общим данным (APPROVE_GUARDED_DATA_PATHS).
+    Относительный путь берётся от рабочего каталога агента из хука; без него
+    сверить нельзя, и вызов идёт дальше обычным порядком. Граница: запись
+    через Bash (>>, sed -i) здесь не ловится, это правило промта."""
+    guarded = getattr(cfg, "approve_guarded_data_paths", frozenset())
+    if not guarded or tool_name not in _FILE_TOOLS_FOR_WHITELIST:
+        return None
+    target = _target_path(tool_name, tool_input)
+    raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if target is None and isinstance(raw, str) and raw and cwd and Path(cwd).is_absolute():
+        target = (Path(cwd) / raw).resolve()
+    if target is None or not any(target == g or g in target.parents for g in guarded):
+        return None
+    hint = getattr(cfg, "approve_guarded_data_hint", "")
+    return _("общие данные: этот файл меняется не инструментом {tool}, а командой под замком "
+             "синхронизации{hint}").format(tool=tool_name, hint=f": {hint}" if hint else "")
+
+
 def _target_path(tool_name: str, tool_input: dict[str, Any]) -> Path | None:
     """Target file path для Write/Edit/MultiEdit/NotebookEdit, если подходит для whitelist-проверки.
 
@@ -2063,6 +2197,29 @@ def _is_under_any(target: Path, allowed: frozenset[Path]) -> bool:
     return False
 
 
+def _otklik_match(cfg: Config, pending: Pending, chat_id: int,
+                  thread_id: int | None) -> dict[str, Any] | None:
+    """Отклик, который этот чат взял на отправку, с тем же текстом, что в
+    карточке: для пометки (решение Ивана 22.10.2026: два нажатия остаются,
+    сверять проще). Адресата бот не сверяет: в отклике он записан свободным
+    текстом, поэтому Иван сверяет его сам с «Куда»."""
+    mail = pending.tool_input.get(MAILSEND_CARD_KEY)
+    if isinstance(mail, dict):
+        texts = [str(mail.get("body") or "")]
+    elif _is_outbound_send(pending.tool_name):
+        texts = [str(pending.tool_input[key]) for key, _label in _OUTBOUND_TEXT_FIELDS
+                 if pending.tool_input.get(key) not in (None, "")]
+    else:
+        return None
+    key = pending.origin_key or (f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id))
+    base = otklik.otklik_dir(cfg.state_dir)
+    for body in texts:
+        rec = otklik.outbound_match(base, key, body)
+        if rec is not None:
+            return rec
+    return None
+
+
 async def send_approval_request(
     application: Application, cfg: Config, pending: Pending
 ) -> None:
@@ -2073,6 +2230,23 @@ async def send_approval_request(
     chat_id = pending.target_chat_id if pending.target_chat_id is not None else cfg.primary_chat_id
     thread_id = pending.target_thread_id
     text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
+    if pending.origin_key:
+        text = _("🛠 <b>Мастерская</b>") + "\n" + text
+    try:
+        match = _otklik_match(cfg, pending, chat_id, thread_id)
+    except Exception:
+        log.warning("otklik match for card failed", exc_info=True)
+        match = None
+    if match is not None:
+        note = _("✅ текст совпадает с одобренным откликом {id} «{title}»\n"
+                 "Куда в отклике: {channel}\n<b>сверь адресата выше с «Куда»</b>").format(
+            id=match["id"], title=_esc_truncate(str(match.get("title")), 100),
+            channel=_esc_truncate(str(match.get("channel")), 200))
+        if len(text) + len(note) > CARD_TEXT_CAP + 150:
+            # Карточка у предела Telegram 4096: пометка короче, номер остаётся.
+            note = _("✅ совпадает с одобренным откликом {id}; <b>сверь адресата с «Куда»</b>").format(
+                id=match["id"])
+        text += "\n\n" + note
     rows = [[
         InlineKeyboardButton("✅ Approve", callback_data=f"appr:{pending.approval_id}:allow"),
         InlineKeyboardButton("❌ Deny", callback_data=f"appr:{pending.approval_id}:deny"),
@@ -2189,6 +2363,14 @@ async def handle_approve(request: web.Request) -> web.Response:
     # чтобы auto в одной ветке не разрешал tools из другой. Видимость через audit
     # decision="allow:burst" + одно уведомление при истечении окна.
     target_key = burst_target_key(target_chat_id, target_thread_id)
+    # Мастерская: права и окно ⏩ считаются по её теме, а показ (карточки,
+    # уведомления, таймаут) в личке, тема заглушена (проект Домового 22.10.2026).
+    origin_key = (f"{target_chat_id}:{target_thread_id}" if target_thread_id is not None
+                  else str(target_chat_id))
+    if getattr(cfg, "workshop_chat_key", "") and origin_key == cfg.workshop_chat_key:
+        target_chat_id, target_thread_id = cfg.primary_chat_id, None
+    else:
+        origin_key = ""
     burst_windows: dict[str, float] = application.bot_data.get("burst_until_by_target") or {}
     burst_until = float(burst_windows.get(target_key, 0.0))
     # burst НЕ применяем при неизвестном session_id (target резолвился на primary
@@ -2220,6 +2402,24 @@ async def handle_approve(request: web.Request) -> web.Response:
             "decision": "deny",
             "reason": _("ран по внешнему событию (untrusted): разрешено только чтение"),
         })
+    # Субагенты (Task, Agent): решение здесь, до логики этапа плана, где
+    # неизвестный инструмент получил бы отказ, а бот сам разрешает там
+    # субагентов. После проверки чужого текста: его ран их не зовёт (проект
+    # Домового 22.10.2026, добавка А; ревью Codex п. 7).
+    if tool_name in ("Task", "Agent"):
+        # Чат рана: у мастерской адрес показа уже личка, её тема в origin_key.
+        role_refusal = _agent_role_refusal(cfg, origin_key or origin_chat_key(target_chat_id, target_thread_id),
+                                           tool_input)
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve %s aid=%s tool=%s target=%s (agent role)",
+                 "deny" if role_refusal else "allow", aid, tool_name, target_key)
+        await asyncio.to_thread(
+            audit.write_event, audit_path, approval_id=aid, tool_name=tool_name, tool_input=tool_input,
+            decision="deny:agent-role" if role_refusal else "allow:agent",
+        )
+        if role_refusal:
+            return web.json_response({"decision": "deny", "reason": role_refusal})
+        return web.json_response({"decision": "allow", "reason": "agent"})
     # Перезапуск или остановка самого бота из его рана обрывает этот ран и
     # чужие (restart.py): отказ до всех автоаппрувов, с подсказкой про заявку.
     self_stop = _self_restart_refusal(tool_name, tool_input)
@@ -2235,6 +2435,18 @@ async def handle_approve(request: web.Request) -> web.Response:
             decision="deny:self-restart",
         )
         return web.json_response({"decision": "deny", "reason": self_stop})
+    # Общие данные (журнал и таблицы Домового) пишет только команда под
+    # замком синхронизации: Write и Edit по ним отказ до всех автоаппрувов,
+    # иначе правка пропадала при rebase или перетирала соседнюю сессию.
+    guarded = _guarded_data_refusal(cfg, tool_name, tool_input, cwd)
+    if guarded:
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve deny aid=%s tool=%s target=%s (guarded data)", aid, tool_name, target_key)
+        await asyncio.to_thread(
+            audit.write_event, audit_path, approval_id=aid, tool_name=tool_name,
+            tool_input=tool_input, decision="deny:guarded-data",
+        )
+        return web.json_response({"decision": "deny", "reason": guarded})
     # Отправка от имени Ивана мимо всех автоаппрувов ниже, сразу на карточку
     # (_OUTBOUND_SEND_RE).
     outbound = _is_outbound_send(tool_name)
@@ -2567,6 +2779,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         target_chat_id=target_chat_id,
         target_thread_id=target_thread_id,
         cwd=cwd,
+        origin_key=origin_key,
     )
     # Окно ⏩ обдумывание задачи не берёт (force_card): кнопки только сбивали бы.
     pending.no_burst = force_card
@@ -2719,9 +2932,27 @@ async def handle_event(request: web.Request) -> web.Response:
     if not with_notice and not payload.get("wake"):
         # Без карточки и без пробуждения событие не оставило бы в чате ничего.
         return web.json_response({"error": "notice=false requires wake=true"}, status=400)
+    key = payload.get("key")
+    if key is not None and not (isinstance(key, str) and events.KEY_RE.fullmatch(key)):
+        return web.json_response({"error": "key must be 8-128 chars of [A-Za-z0-9._:-]"}, status=400)
+    ttl = payload.get("expires_in")
+    if ttl is not None and (isinstance(ttl, bool) or not isinstance(ttl, int)
+                            or not events.MIN_TTL_SEC <= ttl <= events.MAX_TTL_SEC):
+        return web.json_response({"error": "expires_in must be int seconds 60..86400"}, status=400)
+    # Абсолютный срок (Unix-время): отправитель знает конец своего окна, а
+    # повторы доставки сдвигали бы относительный (ревью Codex 22.10.2026).
+    expires_at = payload.get("expires_at")
+    if expires_at is not None:
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)) \
+                or expires_at > time.time() + events.MAX_TTL_SEC:
+            return web.json_response({"error": "expires_at must be unix time within 24h"}, status=400)
+        if expires_at <= time.time():
+            return web.json_response({"error": "event expired before delivery"}, status=410)
 
     application: Application = request.app["application"]
-    if application.bot_data.get("draining") or application.bot_data.get("stopping"):
+    target_key = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+    if (application.bot_data.get("draining") or application.bot_data.get("stopping")
+            or target_key in (application.bot_data.get("draining_keys") or ())):
         # Бот ждёт конца работы перед перезапуском (restart.py): событие не
         # принято, отправитель повторит позже. До уведомления, чтобы повтор
         # не дал второе (ревью Codex 13.10.2026).
@@ -2734,7 +2965,7 @@ async def handle_event(request: web.Request) -> web.Response:
     try:
         response, handed_off = await _handle_event_admitted(
             application, payload, source, title, text, chat_id, thread_id, fresh, untrusted, silent,
-            with_notice)
+            with_notice, key, ttl, events.event_dir(cfg.state_dir), expires_at)
         return response
     finally:
         if not handed_off:
@@ -2744,46 +2975,96 @@ async def handle_event(request: web.Request) -> web.Response:
 async def _handle_event_admitted(
     application: Application, payload: dict, source: str, title: str, text: str,
     chat_id: int, thread_id: int | None, fresh: bool, untrusted: bool, silent: bool,
-    with_notice: bool = True,
+    with_notice: bool = True, key: str | None = None, ttl: int | None = None,
+    store: Path | None = None, expires_at: float | None = None,
 ) -> tuple[web.Response, bool]:
     """Уведомление и пробуждение принятого события. Второе значение: учёт
-    принятого события передан задаче пробуждения (она снимет его сама)."""
+    принятого события передан задаче пробуждения (она снимет его сама).
+    Пробуждение до ответа ложится на диск (events.py): рестарт между ответом
+    и стартом рана его не теряет, повтор с тем же ключом не будит второй раз."""
     notice = f"🔔 <b>{_esc(source)}</b>" + (f": {_esc(title)}" if title else "")
     if text:
         notice += f"\n{_esc_truncate(text, TRUNCATE_PAYLOAD)}"
+    wake = application.bot_data.get("event_wake") if payload.get("wake") else None
+    prompt = str(payload.get("prompt") or "").strip() or (
+        _("Внешнее событие от «{source}»: {title}\n\n{text}\n\n"
+          "Сделай первичный разбор: что это, серьёзно ли, что проверить. "
+          "Ничего не мутируй без approve.").format(source=source, title=title, text=text)
+    )
+    event_id = None
+    sends_notice = with_notice or wake is None
+    if wake is not None and store is not None:
+        rec = events.new_record(key=key, chat_id=chat_id, thread_id=thread_id, prompt=prompt, fresh=fresh,
+                                untrusted=untrusted, silent=silent, source=source, title=title, ttl=ttl,
+                                expires_at=expires_at, receiving=sends_notice,
+                                boot=application.bot_data.get("boot_id"))
+        try:
+            reserved = events.reserve(store, rec)
+            old = None if reserved else events.load(store, rec["id"])
+        except OSError:
+            # Без файла 200 обещал бы то, чего рестарт не переживёт: пусть
+            # отправитель повторит (ревью Codex 22.10.2026).
+            log.exception("event store failed source=%s", source)
+            return web.json_response({"error": "event store failed, retry later"}, status=503), False
+        if not reserved:
+            if old is not None and old.get("fp") != rec["fp"]:
+                log.warning("event key reused for another event: source=%s", source)
+                return web.json_response({"error": "key already used for another event"}, status=409), False
+            if old is not None and old.get("status") == "receiving":
+                # Первый такой же запрос ещё ждёт Telegram: ответ ему решит,
+                # принято ли событие; повтор пусть придёт позже.
+                return web.json_response({"error": "same event is being accepted, retry later"},
+                                         status=503), False
+            log.info("event duplicate by key, not woken again: source=%s", source)
+            return web.json_response({"ok": True, "duplicate": True}), False
+        event_id = rec["id"]
 
     sent = None
     # Без карточки только когда пробуждение точно будет: при недоступной
     # фабрике ниже ответ 202 и рана нет, карточка остаётся единственным следом.
-    if with_notice or application.bot_data.get("event_wake") is None:
+    if sends_notice:
         try:
             sent = await application.bot.send_message(
                 chat_id=chat_id, text=notice, parse_mode="HTML", message_thread_id=thread_id,
                 disable_notification=silent,
             )
+        except asyncio.CancelledError:
+            # Клиент оборвал запрос: ответа 200 не было, ключ свободен.
+            if event_id is not None:
+                with contextlib.suppress(OSError):
+                    events.drop(store, event_id)
+            raise
         except Exception:
             log.exception("event notice failed source=%s", source)
+            if event_id is not None:
+                # Не принято: повтор с тем же ключом должен пройти.
+                with contextlib.suppress(OSError):
+                    events.drop(store, event_id)
             return web.json_response({"error": "telegram send failed"}, status=502), False
+        if event_id is not None:
+            try:
+                if events.update(store, event_id, status="accepted") is None:
+                    raise OSError("event record unreadable")
+            except OSError:
+                # Запись осталась бы «принимается» и держала повторы на 503.
+                log.exception("event store failed source=%s", source)
+                with contextlib.suppress(OSError):
+                    events.drop(store, event_id)
+                return web.json_response({"error": "event store failed, retry later"}, status=503), False
 
     if payload.get("wake"):
         # Ленивая привязка: bot.py кладёт сюда coroutine-фабрику при старте,
         # чтобы approval.py не импортировал bot (цикл).
-        wake = application.bot_data.get("event_wake")
         if wake is None:
             log.error("event wake requested, но фабрика не установлена")
             return web.json_response(
                 {"ok": True, "wake": False, "reason": "wake unavailable"}, status=202
             ), False
-        prompt = str(payload.get("prompt") or "").strip() or (
-            _("Внешнее событие от «{source}»: {title}\n\n{text}\n\n"
-              "Сделай первичный разбор: что это, серьёзно ли, что проверить. "
-              "Ничего не мутируй без approve.").format(source=source, title=title, text=text)
-        )
         # Трекаем задачу: голый create_task не дожидается shutdown и теряет
         # ссылку (сборщик может убить её на середине).
         tasks: set[asyncio.Task] = application.bot_data.setdefault("event_wake_tasks", set())
         task = asyncio.create_task(
-            wake(chat_id, thread_id, prompt, fresh, untrusted=untrusted, silent=silent))
+            wake(chat_id, thread_id, prompt, fresh, untrusted=untrusted, silent=silent, event_id=event_id))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 

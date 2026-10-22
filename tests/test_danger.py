@@ -49,7 +49,7 @@ class BashLevelTests(unittest.TestCase):
             "chmod -R 777 ~", "npm install", "pip install x", "reboot",
             "cat > ~/.bashrc <<'EOF'\nx\nEOF", f"echo x >> {BOT / 'src' / 'claude_tg_bot' / 'bot.py'}",
             "bash -c 'rm -rf /tmp/../home'", "sed -n '1w /tmp/x' a",
-            "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/bin/memory remember --scope global --id x --file /tmp/a",
+            "MEMORY_CONFIG_DIR=~/.agent-memory-config ~/src/svod/engine/bin/memory remember --scope global --id x --file /tmp/a",
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual(level(cmd), RED, classify("Bash", {"command": cmd}))
@@ -60,7 +60,7 @@ class BashLevelTests(unittest.TestCase):
             "python3 script.py", "./run.sh", "make build", "npm run deploy", "ssh host uptime",
             "git commit -m x", "git add .", "echo x > out.txt", "tee out.txt", "xargs grep x",
             "aws s3 ls", "sort -o out a", "eval ls", "curl -o file https://x",
-            "~/src/svod/bin/memory remember --scope personal --id x --file /tmp/a",
+            "~/src/svod/engine/bin/memory remember --scope personal --id x --file /tmp/a",
             "cat `which ls`", "docker exec c ls",
         ):
             with self.subTest(cmd=cmd):

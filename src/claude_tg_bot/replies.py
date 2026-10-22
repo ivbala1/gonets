@@ -7,16 +7,19 @@ SEND_FILE-маркеры, cost-футер.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import os
 import re
+import secrets
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from telegram import MessageEntity, Update
+from telegram import MessageEntity, ReplyParameters, Update
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import ContextTypes
 
@@ -64,7 +67,11 @@ async def _send_retrying(send: Callable[[], Awaitable[Any]]) -> Any:
 
 async def send_reply_text(cfg: Config, update: Update, text: str) -> None:
     """Длинный текст — как файл, короткий — чанками. Splitter по \\n, не посреди слова."""
-    msg = update.message
+    await send_text_to(cfg, update.message, text)
+
+
+async def send_text_to(cfg: Config, msg, text: str) -> None:
+    """То же, что send_reply_text, ответом на любое сообщение (кнопка под голосовым)."""
     if not text.strip():
         return
     if len(text) >= cfg.large_reply_as_file_threshold:
@@ -77,30 +84,55 @@ async def send_reply_text(cfg: Config, update: Update, text: str) -> None:
 
         await _send_retrying(doc)
         return
+    # Первый кусок цитирует настоящее сообщение Ивана (проект Домового 22.10.2026,
+    # 1.8): в личке видно, на что ответ. Сообщение удалено: ответ всё равно уходит
+    # (allow_sending_without_reply), отказ цитаты: повтор без неё. У пробуждений
+    # без сообщения (номер 0) цитаты нет.
+    quote = _quote_of(msg)
     for chunk in split_for_telegram(text, cfg.telegram_text_limit):
         plain, entities = render_markup(chunk)
-        if not entities:
-            await _send_retrying(lambda chunk=chunk: msg.reply_text(chunk))
-            continue
+        extra = {"reply_parameters": quote} if quote is not None else {}
+        quote = None
         try:
-            await _send_retrying(lambda plain=plain, entities=entities: msg.reply_text(plain, entities=entities))
+            if not entities:
+                await _send_retrying(lambda chunk=chunk, extra=extra: msg.reply_text(chunk, **extra))
+                continue
+            try:
+                await _send_retrying(lambda plain=plain, entities=entities, extra=extra:
+                                     msg.reply_text(plain, entities=entities, **extra))
+            except BadRequest:
+                if extra:
+                    raise
+                # Сущности не приняты: ответ важнее шрифтов.
+                log.exception("markup entities rejected, sending raw")
+                await _send_retrying(lambda chunk=chunk: msg.reply_text(chunk))
         except BadRequest:
-            # Сущности не приняты: ответ важнее шрифтов.
-            log.exception("markup entities rejected, sending raw")
+            if not extra:
+                raise
+            log.warning("quoted reply rejected, sending without quote", exc_info=True)
             await _send_retrying(lambda chunk=chunk: msg.reply_text(chunk))
 
 
-async def send_voice_caption(msg, audio: bytes, caption: str) -> None:
+def _quote_of(msg) -> ReplyParameters | None:
+    mid = getattr(msg, "message_id", 0)
+    if not isinstance(mid, int) or mid <= 0 or getattr(getattr(msg, "chat", None), "type", "") != "private":
+        return None
+    return ReplyParameters(message_id=mid, allow_sending_without_reply=True)
+
+
+async def send_voice_caption(msg, audio: bytes, caption: str, reply_markup=None) -> Any:
     """Голосовой ответ с подписью; разметка в подписи та же, что в тексте."""
     plain, entities = render_markup(caption)
     if not entities:
-        await msg.reply_voice(voice=audio, caption=caption)
-        return
+        return await _send_retrying(lambda: msg.reply_voice(
+            voice=audio, caption=caption, reply_markup=reply_markup))
     try:
-        await msg.reply_voice(voice=audio, caption=plain, caption_entities=entities)
+        return await _send_retrying(lambda: msg.reply_voice(
+            voice=audio, caption=plain, caption_entities=entities, reply_markup=reply_markup))
     except BadRequest:
         log.exception("markup entities rejected in caption, sending raw")
-        await msg.reply_voice(voice=audio, caption=caption)
+        return await _send_retrying(lambda: msg.reply_voice(
+            voice=audio, caption=caption, reply_markup=reply_markup))
 
 
 # Ссылки в голос не идут: «эйч-ти-ти-пи двоеточие слэш слэш» слушать незачем.
@@ -151,6 +183,144 @@ def voice_text(reply: str) -> tuple[str, bool]:
                 dropped = True
         kept.append(line)
     return render_markup("\n".join(kept).strip())[0], dropped
+
+
+# Длинный голосовой ответ идёт серией голосовых, у каждого полная подпись
+# со своим куском текста (подпись у бота до 1024 знаков, Premium не поднимает).
+# Telegram сам проигрывает голосовые подряд. Блоки кода в подпись и голос не
+# идут: они приходят текстом после серии. Решение Ивана 21.10.2026.
+_COUNTER_RESERVE = 12  # «\n\n10/10» и запас на подсчёт знаков
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _rendered_len(text: str) -> int:
+    return _utf16_len(render_markup(text)[0])
+
+
+def _pack(pieces: list[str], sep: str, budget: int) -> list[str]:
+    out: list[str] = []
+    cur = ""
+    for p in pieces:
+        cand = f"{cur}{sep}{p}" if cur else p
+        if cur and _rendered_len(cand) > budget:
+            out.append(cur)
+            cur = p
+        else:
+            cur = cand
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _split_outside_markup(text: str, sep: re.Pattern) -> list[str]:
+    # Делить только вне [текст](адрес), **жирного** и прочей разметки:
+    # иначе ссылка распадается на сырые куски (ревью Codex 21.10.2026).
+    spans = [m.span() for m in _INLINE_RE.finditer(text)]
+    pieces: list[str] = []
+    pos = 0
+    for m in sep.finditer(text):
+        if any(a < m.start() < b for a, b in spans):
+            continue
+        pieces.append(text[pos:m.start()])
+        pos = m.end()
+    pieces.append(text[pos:])
+    return pieces
+
+
+def _hard_cut(text: str, budget: int) -> list[str]:
+    # Последний случай, кусок без пробелов: режем по длине в UTF-16, как
+    # считает Telegram (эмодзи по две единицы).
+    # Счёт по исходному тексту: разметка при отрисовке знаки только убирает.
+    parts: list[str] = []
+    cur, used = "", 0
+    for ch in text:
+        size = _utf16_len(ch)
+        if cur and used + size > budget:
+            parts.append(cur)
+            cur, used = "", 0
+        cur += ch
+        used += size
+    if cur:
+        parts.append(cur)
+    return parts if _rendered_len(text) > budget else [text]
+
+
+def _split_long_line(line: str, budget: int) -> list[str]:
+    # Строка длиннее подписи: по предложениям, затем по словам, в крайнем
+    # случае жёстко.
+    parts: list[str] = []
+    for sentence in _pack(_split_outside_markup(line, _SENTENCE_END_RE), " ", budget):
+        if _rendered_len(sentence) <= budget:
+            parts.append(sentence)
+            continue
+        for words in _pack(_split_outside_markup(sentence, re.compile(" ")), " ", budget):
+            parts.extend(_hard_cut(words, budget))
+    return parts
+
+
+def plan_voice_series(reply: str, caption_limit: int) -> tuple[list[str], list[str]]:
+    """Ответ → (куски для подписей голосовых, блоки кода текстом после серии).
+    Режется по строкам: разметка у бота внутри строки, перенос её не рвёт.
+    Кусок заканчивается на пустой строке, если она есть во второй половине."""
+    fences = [m.group(0) for m in _FENCE_BLOCK_RE.finditer(reply)]
+    body = re.sub(r"\n{3,}", "\n\n", _FENCE_BLOCK_RE.sub("", reply)).strip()
+    # Нижняя граница: при крошечном TELEGRAM_CAPTION_LIMIT бюджет не ноль.
+    budget = max(caption_limit - _COUNTER_RESERVE, 1)
+    lines: list[str] = []
+    for line in body.split("\n"):
+        lines.extend([line] if _rendered_len(line) <= budget else _split_long_line(line, budget))
+    chunks: list[str] = []
+    cur: list[str] = []
+    for line in lines:
+        while cur and _rendered_len("\n".join(cur + [line])) > budget:
+            cut = len(cur)
+            blanks = [i for i, x in enumerate(cur) if not x.strip() and i > 0 and i >= len(cur) // 2]
+            if blanks:
+                cut = blanks[-1]
+            chunks.append("\n".join(cur[:cut]))
+            cur = cur[cut:]
+            while cur and not cur[0].strip():
+                cur.pop(0)
+        cur.append(line)
+    chunks.append("\n".join(cur))
+    return [c.strip("\n") for c in chunks if c.strip()], fences
+
+
+def with_counter(chunk: str, index: int, total: int) -> str:
+    return f"{chunk}\n\n{index}/{total}" if total > 1 else chunk
+
+
+# Кнопка «📄 Полный текст» под последним голосовым серии: весь ответ одним
+# сообщением по нажатию, без автоматического дубля. Текст лежит на диске,
+# чтобы кнопка работала и после перезапуска бота; старше 14 дней удаляется.
+_FULL_TEXT_DIR = "voice-texts"
+_FULL_TEXT_TTL_SEC = 14 * 86400
+_FULL_TEXT_TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def save_full_text(state_dir: Path, text: str, chat_id: int) -> str:
+    folder = state_dir / _FULL_TEXT_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for old in folder.glob("*.txt"):
+        with contextlib.suppress(OSError):
+            if now - old.stat().st_mtime > _FULL_TEXT_TTL_SEC:
+                old.unlink()
+    token = secrets.token_hex(8)
+    (folder / f"{token}.txt").write_text(f"{chat_id}\n{text}", encoding="utf-8")
+    return token
+
+
+def load_full_text(state_dir: Path, token: str, chat_id: int) -> str | None:
+    """Текст по кнопке; None, если его нет или кнопка нажата в другом чате."""
+    if not _FULL_TEXT_TOKEN_RE.match(token):
+        return None
+    try:
+        head, _sep, text = (state_dir / _FULL_TEXT_DIR / f"{token}.txt").read_text(
+            encoding="utf-8").partition("\n")
+    except OSError:
+        return None
+    return text if head == str(chat_id) else None
 
 
 # Разметка ответа в шрифты Telegram. Задаётся сущностями, а не parse_mode:
@@ -431,10 +601,14 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
     return (found[0] if found else None), cleaned
 
 
-async def send_cost_footer(cfg: Config, update: Update, result: ClaudeResult, model_note: str = "") -> None:
+async def send_cost_footer(
+    cfg: Config, update: Update, result: ClaudeResult, model_note: str = "", *, warn_reset: bool = True,
+) -> None:
     """Короткий футер: цена ответа, сессии и контекст. model_note это
     напоминание о недефолтной модели ветки («🤖 opus ⏳»), пусто на дефолте;
     в теме задачи к нему дописан расход задачи («задача ≈$1.35»).
+    warn_reset=False убирает подсказку про /reset: в теме с автосжатием
+    разговор сжимает сам CLI (решение Ивана 21.10.2026).
 
     Цена ответа это разница накопительной суммы сессии с прошлым ответом
     (claude_runner._answer_cost), контекст это вход последнего запроса
@@ -442,6 +616,12 @@ async def send_cost_footer(cfg: Config, update: Update, result: ClaudeResult, mo
     предупреждение срабатывало почти всегда (ревью Codex). Шлём только при
     расходе по сессии: $0-ошибки, cancel, 404 без футера."""
     if not cfg.show_cost_footer or result.session_cost_usd <= 0:
+        return
+    warn = warn_reset and cfg.context_warn_tokens > 0 and result.context_tokens >= cfg.context_warn_tokens
+    # Дешёвый ответ без строки (решение Ивана 22.10.2026); строка остаётся,
+    # если есть что сказать: большой контекст, недефолтная модель, расход задачи.
+    if (result.cost_usd is not None and result.cost_usd < getattr(cfg, "cost_footer_min_usd", 0.0)
+            and not warn and not model_note):
         return
     if result.cost_usd is not None:
         cost = _("💸 ${cost:.2f} (сессия ${session:.2f})").format(
@@ -462,7 +642,7 @@ async def send_cost_footer(cfg: Config, update: Update, result: ClaudeResult, mo
     footer = cost + (f" · {ctx}" if ctx else "")
     if model_note:
         footer += f" · {model_note}"
-    if cfg.context_warn_tokens > 0 and result.context_tokens >= cfg.context_warn_tokens:
+    if warn_reset and cfg.context_warn_tokens > 0 and result.context_tokens >= cfg.context_warn_tokens:
         footer += _("\n⚠️ контекст большой: /reset удешевит и ускорит следующие ответы")
     try:
         await update.message.reply_text(footer)

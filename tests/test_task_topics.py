@@ -1288,6 +1288,37 @@ class CommandTests(_TaskBase):
         self.assertEqual(self.task("hk2")["origin"], {"chat_id": USER, "thread_id": None, "ask_id": None})
 
 
+class ReviewFixTests(_TaskBase):
+    """Исправления по ревью Codex 19.10 вне добавки."""
+
+    async def test_button_from_other_chat_refused(self) -> None:
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        query = SimpleNamespace(id="q-x", data=f"nt:t7-5:do:{SHA}", answer=AsyncMock(),
+                                message=SimpleNamespace(chat_id=USER, chat=SimpleNamespace(id=USER)),
+                                edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        await botmod.on_task_pick(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=USER),
+                                                  update_id=9), self.ctx)
+        await self.settle()
+        self.assertIn("не из темы", query.answer.call_args.args[0])
+        self.assertEqual(self.runs, [])
+
+    async def test_no_proposal_while_ivan_messages_gather(self) -> None:
+        self.put_command()
+        self.bot_data["gather_batches"] = {f"{GROUP}:{THREAD}": SimpleNamespace(sealed=False, cancelled=False)}
+        self.replies = [f"{PLAN}\n<<DO>>"]
+        await botmod._dispatch_to_claude(_update(_msg()), self.ctx, "что с README?", send_voice_reply=False)
+        await self.settle()
+        self.assertEqual(self.task("t7-5")["status"], "thinking")
+
+    async def test_card_follows_turn_after_waiting(self) -> None:
+        # Сообщение дождалось конца выполнения: ход переводит done в thinking,
+        # карточка это показывает
+        self.put_command(status="done", result="✅ Готово", result_ok=True)
+        await botmod._dispatch_to_claude(_update(_msg()), self.ctx, "а ещё X", send_voice_reply=False)
+        await self.settle()
+        self.assertTrue(any(tasks.STAGE_LINES["thinking"] in t for t in self.card_texts()))
+
+
 class AdditionTests(_TaskBase):
     """Слова Ивана через Домового в открытую задачу (решение Ивана 19.10.2026):
     видны в теме, идут ходом обдумывания; «Делай» и закрытие только в теме."""
@@ -1333,7 +1364,7 @@ class AdditionTests(_TaskBase):
                          exec_started="2026-10-19T10:00:00+04:00", name="1 README")
         lock = botmod._chat_lock(self.ctx, f"{GROUP}:{THREAD}")
         await lock.acquire()
-        text = await botmod._task_from_http(self.ctx, "и CHANGELOG", "", "", to="t7-5")
+        text = await botmod._task_from_http(self.ctx, "и CHANGELOG", "", "", chat_key=str(USER), to="t7-5")
         self.assertIn("после идущего выполнения", text)
         await asyncio.sleep(0.05)
         self.assertEqual(self.runs, [])
@@ -1360,6 +1391,76 @@ class AdditionTests(_TaskBase):
         self.assertEqual(len(self.echoes()), 1)
         self.assertEqual(len(self.runs), 1)
 
+    async def test_plan_dropped_before_echo_goes_out(self) -> None:
+        # Проект снимается до ожидания сети: одобрение не успеет стартовать
+        # (ревью Codex 19.10)
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        seen: list = []
+
+        async def send(chat_id, text, **kw):
+            if text.startswith("📨"):
+                seen.append(self.task("t7-5")["status"])
+
+        self.bot.send_message.side_effect = send
+        await self.add("t7-5", "и CHANGELOG")
+        self.assertEqual(seen, ["thinking"])
+
+    async def test_two_additions_keep_their_order(self) -> None:
+        self.put_command()
+        gate = asyncio.Event()
+
+        async def send(chat_id, text, **kw):
+            if text == "📨 Через Домового: первое":
+                await gate.wait()
+
+        self.bot.send_message.side_effect = send
+        first = asyncio.ensure_future(botmod._task_from_http(self.ctx, "первое", "", "", chat_key=str(USER),
+                                                             to="t7-5"))
+        await asyncio.sleep(0)
+        second = asyncio.ensure_future(botmod._task_from_http(self.ctx, "второе", "", "", chat_key=str(USER),
+                                                              to="t7-5"))
+        await asyncio.sleep(0.05)
+        gate.set()
+        await first
+        await second
+        await self.settle()
+        self.assertEqual([r["prompt"].split("\n")[1] for r in self.runs], ["первое", "второе"])
+
+    async def test_crash_after_accept_is_reported_on_start(self) -> None:
+        # Авария после «Добавил», до хода: при старте тема узнаёт, что ответа не будет
+        self.put_command()
+
+        async def lost(ctx, task, prompt):
+            ctx.application.bot_data["active_work"] -= 1  # процесс умер, ран не начался
+
+        with patch.object(botmod, "_task_add_run", lost):
+            await self.add("t7-5", "и CHANGELOG")
+        self.assertEqual(self.task("t7-5")["think_open"], botmod.ADD_PENDING)
+        await botmod._tasks_recover(self.ctx)
+        said = [c.args[1] for c in self.bot.send_message.await_args_list if c.kwargs.get("message_thread_id") == THREAD]
+        self.assertIn(tasks.THINK_INTERRUPTED, said)
+
+    async def test_mark_cleared_after_addition_turn(self) -> None:
+        self.put_command()
+        await self.add("t7-5", "и CHANGELOG")
+        self.assertIsNone(self.task("t7-5").get("think_open"))
+        self.assertEqual(self.bot_data["active_work"], 0)
+
+    async def test_repeat_keys_remembered(self) -> None:
+        self.put_command(name="1 README")
+        await self.add("t7-5", "A", key="kA")
+        await self.add("t7-5", "B", key="kB")
+        self.assertIn("Уже добавлено", await self.add("t7-5", "A", key="kA"))
+        self.assertEqual(len(self.echoes()), 2)
+
+    async def test_only_from_private_chat(self) -> None:
+        self.put_command()
+        text = await botmod._task_from_http(self.ctx, "ещё", "", "", chat_key=f"{GROUP}:55", to="t7-5")
+        self.assertIn("только из личного чата", text)
+        text = await botmod._task_from_http(self.ctx, "ещё", "", "", to="t7-5")
+        self.assertIn("только из личного чата", text)
+        self.assertEqual(self.echoes(), [])
+
     async def test_http_to_validated(self) -> None:
         app = SimpleNamespace(bot_data=self.bot_data, create_task=self.ctx.application.create_task,
                               running=False, bot=self.bot)
@@ -1370,7 +1471,7 @@ class AdditionTests(_TaskBase):
             json=AsyncMock(return_value={"words": "ещё", "to": "../x y"}))
         self.assertEqual((await approval.handle_task(request)).status, 400)
         self.put_command(name="1 README")
-        request.json = AsyncMock(return_value={"words": "и CHANGELOG", "to": "t7-5"})
+        request.json = AsyncMock(return_value={"words": "и CHANGELOG", "to": "t7-5", "chat_key": str(USER)})
         body = json.loads((await approval.handle_task(request)).text)
         await self.settle()
         self.assertIn("Добавил в задачу «1 README»", body["text"])
