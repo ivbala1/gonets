@@ -225,3 +225,48 @@ class AskCardTests(_Base):
         await botmod.on_ask_pick(upd, self.ctx)
         self.assertIn("устарел", query.answer.await_args.args[0])
         self.assertEqual(self.runs, [])
+
+
+class WorkshopOtklikFreshTests(unittest.TestCase):
+    """Разбор 22.10.2026, решение Ивана: ✅ в мастерской свежей сессией, модель та же."""
+
+    def _press(self, source: str, at_jobs=None):
+        from claude_tg_bot import otklik
+        with tempfile.TemporaryDirectory() as d:
+            base = otklik.otklik_dir(Path(d))
+            rec = otklik.new_record("Acme", "почта", "Hello")
+            rec.update(chat_id=1, message_id=10, source=source)
+            otklik.save(base, rec)
+            cfg = SimpleNamespace(allowed_user_ids={7}, state_dir=Path(d), workshop_chat_key=WS)
+            query = SimpleNamespace(data=f"otk:{rec['id']}:{rec['sha']}:0:o",
+                                    message=SimpleNamespace(message_id=10, chat_id=1),
+                                    answer=AsyncMock(), edit_message_text=AsyncMock(),
+                                    edit_message_reply_markup=AsyncMock())
+            update = SimpleNamespace(callback_query=query, update_id=1, effective_user=SimpleNamespace(id=7))
+            ctx = SimpleNamespace(application=SimpleNamespace(bot_data={"cfg": cfg, "at_jobs": at_jobs}),
+                                  bot=SimpleNamespace(edit_message_text=AsyncMock()))
+            dispatch = AsyncMock(return_value=None)
+            orig_d, orig_u, orig_s = botmod._dispatch_to_claude, botmod.Update, botmod._synthetic_update
+            botmod._dispatch_to_claude, botmod.Update = dispatch, (lambda **kw: kw)
+            botmod._synthetic_update = lambda *a: "synthetic"
+            try:
+                asyncio.run(botmod.on_otklik_pick(update, ctx))
+            finally:
+                botmod._dispatch_to_claude, botmod.Update, botmod._synthetic_update = orig_d, orig_u, orig_s
+            return dispatch.call_args
+
+    def test_workshop_source_runs_fresh(self) -> None:
+        call = self._press(WS)
+        self.assertTrue(call.kwargs["fresh"]())
+        self.assertEqual(call.args[0], "synthetic")
+
+    def test_private_source_keeps_session(self) -> None:
+        self.assertFalse(self._press("1").kwargs["fresh"]())
+
+    def test_pending_limit_retry_keeps_session(self) -> None:
+        # Ревью 23.10.2026: повтор после лимита продолжит сессию темы, ✅ её не сносит.
+        import json
+        jobs = SimpleNamespace(data={"j1": {"v": json.dumps({"chat_key": WS, "limit_retry": 1})}})
+        self.assertFalse(self._press(WS, jobs).kwargs["fresh"]())
+        other = SimpleNamespace(data={"j1": {"v": json.dumps({"chat_key": "1", "limit_retry": 1})}})
+        self.assertTrue(self._press(WS, other).kwargs["fresh"]())

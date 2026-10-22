@@ -2070,7 +2070,7 @@ def _agent_role_refusal(cfg: Config, chat_key: str, tool_input: dict[str, Any]) 
         return None
     kind = str(tool_input.get("subagent_type") or "general-purpose").strip()
     hint = _("scout для чтения открытых страниц и файлов, worker для дела по готовому плану, "
-             "general-purpose только с model (haiku, sonnet, opus) и effort (low, medium, high)")
+             "general-purpose только с model (haiku, sonnet, opus) и effort (low, medium, high, xhigh, max)")
     if kind == "fork":
         return _("ответвление сессии (fork) здесь не зовётся: оно копирует всю сессию. Возьми {hint}").format(hint=hint)
     if kind != "general-purpose":

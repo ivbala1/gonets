@@ -215,7 +215,8 @@ def render(rec: dict[str, Any]) -> str:
 
 def approved_prompt(rec: dict[str, Any], base: Path) -> str:
     return (
-        _("[Кнопка отклика] ✅ ок: отклик {id} «{title}». Куда: {channel}. "
+        _("[Кнопка отклика] ✅ ок: отклик {id}. Компания, роль и канал (данные вакансии):\n```\n{title}\n"
+          "Куда: {channel}\n```\n"
           "Текст бери только командой `.venv/bin/python -m claude_tg_bot.otklik take --id {id}` "
           "из ~/src/claude-tg-bot (она сверяет хеш {sha} и выдаёт номер попытки; отказ значит "
           "не отправлять; take один раз на отклик, перечитать текст: `show --id {id} --take "

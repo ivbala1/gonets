@@ -855,6 +855,9 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await query.edit_message_text(f"🗳 {card.text}\n\n→ {answer}")
     except Exception:
         log.debug("ask card finalize failed (ignored)", exc_info=True)
+    # Время принятого нажатия для разбора недели (ожидание кнопки до старта
+    # рана); отказ по сроку и по смене сессии сюда не доходит.
+    log.info("ask pick chat=%s", chat_key)
     # Ответ уходит вместе с вопросом: без него в сессии, где ран уже завершён,
     # видно только голое «prod» без контекста.
     prompt = _("[Ответ на вопрос «{question}»]: {answer}").format(question=picked.get('question', ''), answer=answer)
@@ -2435,6 +2438,8 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         log.warning("otklik save failed: %s", e)
         await _answer_quietly(query, _("Не записалось, см. журнал бота"), show_alert=True)
         return
+    # Время нажатия для разбора недели: ожидание кнопки до старта рана, доли ✏️ и ⏭.
+    log.info("otklik pick aid=%s action=%s source=%s", rec["id"], action, otklik.source_of(rec))
     if action != "o":
         await _answer_quietly(query, {"e": _("Жду правку"), "s": _("Пропускаю"),
                                       "c": _("Отменил, кнопки вернулись"),
@@ -2455,12 +2460,23 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return cur is None or cur.get("status") == "approved"
 
     reason = _("агент не взял текст")
+    # В мастерской ✅ идёт свежей сессией: задание по кнопке самодостаточно,
+    # а продолжение сессии поиска перечитывало бы 100-230 тысяч токенов
+    # чужого контекста (разбор 22.10.2026, решение Ивана: модель мастерской
+    # по умолчанию, Opus; выбор /model до конца сессии свежая сессия снимает).
+    # Исключение: отложенный после лимита повтор этой темы продолжает её
+    # сессию. Проверка идёт под замком темы: пока кнопка ждала, повтор мог
+    # появиться (ревью Codex 23.10.2026).
+    source = otklik.source_of(rec)
+
+    def fresh() -> bool:
+        return _is_workshop(cfg, source) and not _limit_retry_pending(ctx, source)
     try:
         await _answer_quietly(query, _("Отправляю"))
         await _otklik_show(ctx.bot, rec, base)
         if await _dispatch_to_claude(
             _otklik_target(ctx, rec, update), ctx, otklik.approved_prompt(rec, base),
-            send_voice_reply=False, from_callback=True, still_wanted=still_approved,
+            send_voice_reply=False, from_callback=True, still_wanted=still_approved, fresh=fresh,
         ):
             reason = _("бот перезапускается")
     except Exception:
@@ -4336,6 +4352,17 @@ def _limit_movable(task: dict | None, exec_task: dict | None, from_callback: boo
     return task is None and exec_task is None and not from_callback and permission_mode != "plan"
 
 
+def _limit_retry_pending(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
+    """Ждёт ли тема отложенного после лимита повтора (задание /at с limit_retry)."""
+    store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
+    for entry in list((store.data if store is not None else {}).values()):
+        with contextlib.suppress(Exception):
+            job = json.loads(entry["v"])
+            if job.get("chat_key") == chat_key and int(job.get("limit_retry") or 0) > 0:
+                return True
+    return False
+
+
 def _limit_defer(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, chat_id: int, thread_id: int | None,
                  prompt: str, fire_at: float, retry: int, event_ref: dict | None = None) -> bool:
     """Отложенный промпт, как /at: переживает рестарт, уходит фоновым раном."""
@@ -5144,7 +5171,7 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
 async def _dispatch_to_claude_impl(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt_text: str, *,
     send_voice_reply: bool, permission_mode: str = "bypassPermissions",
-    unattended: bool = False, from_callback: bool = False, fresh: bool = False,
+    unattended: bool = False, from_callback: bool = False, fresh: bool | Callable[[], bool] = False,
     untrusted: bool = False, expect_epoch: int | None = None,
     expect_plan: int | None = None,
     on_run_start: Callable[[], None] | None = None,
@@ -5332,7 +5359,7 @@ async def _dispatch_to_claude_impl(
             # Idle-TTL: если в теме давно не писали — стартуем свежую сессию вместо
             # --resume (не тащим всю историю в холодный prompt-cache). Скоуп проекта
             # при этом сохраняется — он привязан к имени темы, не к session_id.
-            if fresh:
+            if fresh() if callable(fresh) else fresh:
                 # Свежая сессия по просьбе отправителя события (/event fresh):
                 # строго внутри замка чата, иначе параллельный ран вернул бы
                 # старый session_id через store.set() и утро продолжило бы

@@ -355,6 +355,23 @@ class PlanCardTests(_Base):
         await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: True)
         self.assertEqual(len(self.runs), 1)
 
+    async def test_fresh_button_resets_only_when_wanted(self) -> None:
+        # Ревью 23.10.2026: ✅ мастерской идёт свежей сессией, но холостое
+        # нажатие (дело уже сделано) сессию и эпоху не трогает.
+        self.store.set(str(GROUP), "sid-A")
+        epoch = botmod._session_epoch(self.ctx, str(GROUP))
+        await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: False, fresh=True)
+        self.assertEqual((self.runs, self.store.get(str(GROUP))), ([], "sid-A"))
+        self.assertEqual(botmod._session_epoch(self.ctx, str(GROUP)), epoch)
+        await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: True, fresh=True)
+        self.assertIsNone(self.runs[-1]["resumed"])
+        self.assertNotEqual(botmod._session_epoch(self.ctx, str(GROUP)), epoch)
+        # Отложенная проверка (повтор после лимита появился, пока ждал): сессия цела.
+        epoch = botmod._session_epoch(self.ctx, str(GROUP))
+        await self.dispatch("[Кнопка отклика] ✅ ок", still_wanted=lambda: True, fresh=lambda: False)
+        self.assertIsNotNone(self.runs[-1]["resumed"])
+        self.assertEqual(botmod._session_epoch(self.ctx, str(GROUP)), epoch)
+
 
     async def test_run_end_marks_taken_otklik_unknown(self) -> None:
         """Ревью Codex 22.10.2026: ран взял отклик и кончился без итога: под
