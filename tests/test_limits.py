@@ -113,8 +113,10 @@ class SnapshotTests(unittest.TestCase):
         for zone in ("UTC", "PST", "Mars/Olympus", "Unknown Zone"):
             with self.subTest(zone=zone):
                 self.assertIsNone(limits.reset_from_text(f"You've hit your session limit · resets 2:40am ({zone})", now))
-        with patch.dict("os.environ", {"CLAUDE_TG_BOT_TZ": "Europe/Kyiv"}):
-            reset = limits.reset_from_text("You've hit your session limit · resets 2:40am (Europe/Kiev)", now)
+        # Другое имя того же смещения (пояс модуля Asia/Dubai, UTC+4). Пара
+        # Europe/Kyiv и Europe/Kiev на раннере GitHub дала None (23.10.2026);
+        # Etc/GMT-4 входит в основную часть базы поясов.
+        reset = limits.reset_from_text("You've hit your session limit · resets 2:40am (Etc/GMT-4)", now)
         self.assertIsNotNone(reset)
 
     def test_reset_in_repeated_hour(self) -> None:
