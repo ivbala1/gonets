@@ -85,34 +85,70 @@ FOCUS_JS = (
 PROBE_DELAY = 0.3  # клик уходит без ожидания ответа Chrome: дать фокусу смениться
 PROBE_GAP = 0.2
 PROBE_TIMEOUT = 5.0
+# Что стало со страницей после «Готово»: на ПК Иван не видел, удался ли вход
+# и можно ли закрывать экран (просьба 23.10.2026). Наружу только сайт,
+# заголовок и есть ли на виду поле пароля; значения полей не читаются.
+# Поле во фрейме или теневом дереве не видно: это наблюдение, не вывод о входе.
+PAGE_JS = (
+    "(()=>{const v=e=>e.checkVisibility?e.checkVisibility({opacityProperty:true,"
+    "visibilityProperty:true}):!!(e.offsetWidth||e.offsetHeight);"
+    "return {host:location.hostname,title:(document.title||'').slice(0,200),"
+    "pwd:[...document.querySelectorAll('input[type=password]')].some(v)}})()"
+)
+PAGE_TIMEOUT = 3.0
+TITLE_CAP = 80
 
 
-async def focus_kind(session: str) -> str:
-    """Вид поля в фокусе вкладки сессии; не узнали, значит unknown."""
+async def _eval(session: str, js: str, timeout: float) -> Any:
+    """Скрипт во вкладке сессии; любой сбой даёт None."""
     if not session:
-        return "unknown"
+        return None
     try:
         proc = await asyncio.create_subprocess_exec(
-            handoff._agent_browser(), "eval", FOCUS_JS,
+            handoff._agent_browser(), "eval", js,
             env=dict(os.environ, **{handoff.SESSION_ENV: session}),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except OSError:
-        return "unknown"
+        return None
     try:
-        async with asyncio.timeout(PROBE_TIMEOUT):
+        async with asyncio.timeout(timeout):
             out, _err = await proc.communicate()
     except TimeoutError:
-        return "unknown"
+        return None
     finally:
         # И по таймауту, и при отмене (экран закрыт): процесс не бросаем.
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
     try:
-        kind = json.loads(out.decode("utf-8", "replace").strip() or '""')
+        return json.loads(out.decode("utf-8", "replace").strip() or "null")
     except ValueError:
-        return "unknown"
+        return None
+
+
+async def focus_kind(session: str) -> str:
+    """Вид поля в фокусе вкладки сессии; не узнали, значит unknown."""
+    kind = await _eval(session, FOCUS_JS, PROBE_TIMEOUT)
     return kind if isinstance(kind, str) and kind in FOCUS_KINDS else "unknown"
+
+
+def _clean_text(v: Any, cap: int) -> str:
+    if not isinstance(v, str):
+        return ""
+    text = " ".join("".join(ch if ch.isprintable() else " " for ch in v).split())
+    return text if len(text) <= cap else text[:cap - 1] + "…"
+
+
+async def page_state(session: str) -> dict[str, Any]:
+    """Сайт, заголовок и поле пароля вкладки; не узнали, пустой словарь."""
+    raw = await _eval(session, PAGE_JS, PAGE_TIMEOUT)
+    if not isinstance(raw, dict):
+        return {}
+    host = _clean_text(raw.get("host"), 100)
+    if not host or any(not (ch.isalnum() or ch in ".-:[]") for ch in host):
+        return {}
+    return {"host": host, "title": _clean_text(raw.get("title"), TITLE_CAP),
+            "pwd": raw.get("pwd") is True}
 
 HEADERS = {
     "Cache-Control": "no-store",
@@ -282,6 +318,7 @@ class Screen:
         log.info("screen %s: open", hid)
         frames = 0
         reason = "closed"
+        page = None
         try:
             await phone.send_json({"type": "info", "left": max(0, int(rec["expires"] - time.time())),
                                    "reason": rec.get("reason", ""), "site": rec.get("site", ""),
@@ -290,25 +327,27 @@ class Screen:
             async with ClientSession() as http:
                 async with http.ws_connect(url, headers={"Origin": "http://127.0.0.1"},
                                            max_msg_size=0) as browser:
-                    reason, frames = await self._pump(hid, phone, browser)
+                    reason, frames, page = await self._pump(hid, phone, browser)
         except Exception as e:  # noqa: BLE001: причина в журнал без содержимого
             log.warning("screen %s: stream failed: %s", hid, type(e).__name__)
             reason = "stream"
         finally:
             if self.active.get(hid) is phone:
                 self.active.pop(hid, None)
-            await self._close(phone, reason)
+            await self._close(phone, reason, page)
             log.info("screen %s: closed (%s), frames %d", hid, reason, frames)
         return phone
 
-    async def _pump(self, hid: str, phone: web.WebSocketResponse, browser) -> tuple[str, int]:
+    async def _pump(self, hid: str, phone: web.WebSocketResponse, browser
+                    ) -> tuple[str, int, dict[str, Any] | None]:
         frames = 0
         result = "closed"
+        page: dict[str, Any] | None = None
         rec = handoff.load(self.base, hid)
         # Перепроверка после подключения к трансляции: итог мог прийти за это время.
         alive = rec is not None and handoff.is_live(rec)
         if not alive:
-            return (rec or {}).get("status") or "expired", 0
+            return (rec or {}).get("status") or "expired", 0, None
         session = str(rec.get("session") or "")
         # Последняя просьба проверить фокус: повторы сливаются в одну.
         probe_id: int | None = None
@@ -350,7 +389,7 @@ class Screen:
                     await phone.send_str(out)
 
         async def to_browser() -> None:
-            nonlocal result, probe_id
+            nonlocal result, probe_id, page
             second, count = int(time.monotonic()), 0
             async for m in phone:
                 if m.type != WSMsgType.TEXT:
@@ -370,8 +409,12 @@ class Screen:
                 except ValueError:
                     continue
                 if isinstance(msg, dict) and msg.get("type") in ("done", "cant"):
+                    # Снимок до записи итога: после неё агент продолжает и
+                    # может уйти со страницы (ревью GPT 23.10.2026).
+                    snap = await page_state(session) if msg["type"] == "done" else {}
                     if handoff.finish(self.base, hid, msg["type"], "page") is not None:
                         result = msg["type"]
+                        page = snap or None
                         return
                     continue
                 if isinstance(msg, dict) and msg.get("type") in ("probe", "typed"):
@@ -412,14 +455,18 @@ class Screen:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        return result, frames
+        return result, frames, page
 
     @staticmethod
-    async def _close(ws: web.WebSocketResponse, reason: str) -> None:
+    async def _close(ws: web.WebSocketResponse, reason: str,
+                     page: dict[str, Any] | None = None) -> None:
         if ws.closed:
             return
+        msg: dict[str, Any] = {"type": "closed", "reason": reason}
+        if page:
+            msg["page"] = page
         try:
-            await ws.send_json({"type": "closed", "reason": reason})
+            await ws.send_json(msg)
         except Exception:  # noqa: BLE001
             pass
         await ws.close()
@@ -513,6 +560,16 @@ button.on { background:var(--on); color:#fff; }
 button.ok { background:var(--ok); color:#fff; flex:1; }
 button.no { background:var(--no); color:#fff; flex:1; }
 .row { display:flex; gap:6px; width:100%; }
+/* Итог поверх экрана: на ПК картинка выше окна и строка под ней не видна. */
+#end { display:none; position:fixed; left:50%; top:40%; transform:translate(-50%,-50%); z-index:5;
+  width:min(520px, calc(100% - 32px)); background:var(--bar); color:var(--fg); border-radius:16px;
+  padding:24px 20px; text-align:center; box-shadow:0 8px 40px rgba(0,0,0,.45); }
+#end .big { font-size:44px; line-height:1; margin-bottom:12px; }
+#end .head { font-size:20px; font-weight:600; margin-bottom:8px; }
+#end .sub { color:var(--muted); margin-top:6px; overflow-wrap:anywhere; }
+#end .warn { color:#e8453c; margin-top:10px; font-weight:600; }
+body.ended #cv { opacity:.25; filter:grayscale(1); }
+body.ended .tools, body.ended #kbbar { display:none; }
 </style></head>
 <body>
 <div id="top">
@@ -522,6 +579,8 @@ button.no { background:var(--no); color:#fff; flex:1; }
 </div>
 <div id="wrap"><canvas id="cv" width="10" height="10"></canvas></div>
 <div id="msg">Подключаюсь…</div>
+<div id="end" role="status" aria-live="polite"><div class="big" id="endi"></div>
+  <div class="head" id="endh"></div><div id="endd"></div></div>
 <div class="tools">
   <div class="row">
     <button id="btab" title="Следующее поле">⇥</button>
@@ -552,7 +611,7 @@ button.no { background:var(--no); color:#fff; flex:1; }
   const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
   const wrap = document.getElementById("wrap"), msgEl = document.getElementById("msg");
   const leftEl = document.getElementById("left"), kb = document.getElementById("kbt");
-  let ws = null, finished = false, deadline = 0, imgW = 0, imgH = 0, zoom = 1, drag = false;
+  let ws = null, finished = false, waitingEnd = false, deadline = 0, imgW = 0, imgH = 0, zoom = 1, drag = false;
   // Область капчи от агента (--region): показываем только её с запасом, ⛶ весь экран.
   let region = null, full = false, crop = { x: 0, y: 0, w: 0, h: 0 };
   const PAD = 24;
@@ -573,10 +632,41 @@ button.no { background:var(--no); color:#fff; flex:1; }
   }
   setInterval(tick, 1000);
 
-  const REASONS = { done: "Готово. Агент продолжает, страницу можно закрыть.",
-    cant: "Отмечено «Не могу». Агент пропустит, страницу можно закрыть.",
-    expired: "Время вышло, экран закрыт.", denied: "Ссылка недействительна.",
-    replaced: "Экран открыт в другом окне.", stream: "Трансляция оборвалась: агент закрыл вкладку?" };
+  const ICONS = { done: "✅", cant: "🙅", expired: "⌛", denied: "⛔", replaced: "↪️", stream: "⚠️" };
+  const HEADS = { done: "Готово, агент продолжает", cant: "Отмечено «Не могу»", expired: "Время вышло",
+    denied: "Ссылка недействительна", replaced: "Экран открыт в другом окне",
+    stream: "Трансляция оборвалась" };
+
+  function line(cls, text) {
+    const d = document.createElement("div");
+    d.className = cls; d.textContent = text; return d;
+  }
+  // Итог крупно поверх экрана, кнопки убраны, в заголовке вкладки тоже.
+  function showEnd(icon, head, details) {
+    document.body.classList.add("ended");
+    document.getElementById("endi").textContent = icon;
+    document.getElementById("endh").textContent = head;
+    const box = document.getElementById("endd");
+    box.replaceChildren(...details);
+    document.getElementById("end").style.display = "block";
+    document.title = icon + " " + head;
+    say("");
+  }
+  function finish(reason, page) {
+    finished = true; leftEl.textContent = "";
+    const details = [];
+    if (reason === "done" && page && page.host) {
+      details.push(line("sub", "Вкладка агента: " + page.host + (page.title ? ", «" + page.title + "»" : "")));
+      details.push(page.pwd
+        ? line("warn", "На странице ещё видно поле пароля: возможно, вход не прошёл. Если так, напиши агенту в Telegram.")
+        : line("sub", "Поля пароля на странице не видно."));
+    }
+    if (reason === "cant") details.push(line("sub", "Агент пропустит этот шаг."));
+    if (reason === "stream") details.push(line("sub", "Агент закрыл вкладку?"));
+    details.push(line("sub", "Окно можно закрыть."));
+    const icon = reason === "done" && page && page.pwd ? "⚠️" : ICONS[reason] || "ℹ️";
+    showEnd(icon, HEADS[reason] || "Экран закрыт", details);
+  }
 
   function connect() {
     if (!token) { say("В ссылке нет ключа. Открой экран кнопкой из Telegram."); return; }
@@ -611,15 +701,22 @@ button.no { background:var(--no); color:#fff; flex:1; }
       } else if (m.type === "typed") {
         if (sending && m.id === typedSeq) { kb.value = ""; stopSending(); }
       } else if (m.type === "closed") {
-        finished = true; leftEl.textContent = "";
-        say(REASONS[m.reason] || "Экран закрыт.");
+        finish(m.reason, m.page);
       }
     };
     ws.onclose = () => {
       // Вставка оборвалась: сколько букв дошло, неизвестно, сами не повторяем.
       const cut = sending ? "Вставка прервалась: проверь поле на сайте, текст остался в строке. " : "";
       stopSending();
-      if (!finished) say(cut + "Связь прервалась. Обнови страницу; не грузится, включи v2rayNG или Tailscale.");
+      if (finished) return;
+      if (waitingEnd) {
+        // «Готово» ушло, ответ нет: дошло ли, знает только агент.
+        finished = true;
+        showEnd("⚠️", "Связь прервалась", [line("sub", "«Готово» могло дойти. Проверь в Telegram, что пишет агент."),
+          line("sub", "Если агент ещё ждёт, обнови страницу.")]);
+        return;
+      }
+      say(cut + "Связь прервалась. Обнови страницу; не грузится, включи v2rayNG или Tailscale.");
     };
   }
 
@@ -788,7 +885,13 @@ button.no { background:var(--no); color:#fff; flex:1; }
   document.getElementById("btab").onclick = () => { if (!sending) { press("Tab"); probe(); } };
   document.getElementById("bbs").onclick = () => { if (!sending) press("Backspace"); };
   document.getElementById("ben").onclick = () => { if (!sending) press("Enter"); };
-  document.getElementById("bdone").onclick = () => send({ type: "done" });
+  document.getElementById("bdone").onclick = () => {
+    if (!ws || ws.readyState !== 1) { say("Нет связи: «Готово» не отправлено. Обнови страницу."); return; }
+    send({ type: "done" });
+    waitingEnd = true;
+    // Ответ придёт через секунду-две: служба смотрит, что стало со страницей.
+    showEnd("⏳", "Принято, смотрю страницу…", []);
+  };
   document.getElementById("bcant").onclick = () => { if (confirm("Точно не получается?")) send({ type: "cant" }); };
   // Ушёл за паролем в другое приложение: телефон рвёт связь в фоне.
   // Вернулся, подключаемся сами, без обновления страницы.

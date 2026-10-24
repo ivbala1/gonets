@@ -23,6 +23,9 @@ from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 from claude_tg_bot import bot, handoff, screen_server  # noqa: E402
 
 
+_REAL_PAGE_STATE = screen_server.page_state
+
+
 def _open_record(base: Path, *, chat_key: str = "1", port: int = 1) -> tuple[dict, str]:
     rec, token = handoff.new_record("капча", "hh.ru", chat_key, "s1", port)
     rec["status"], rec["chat_id"], rec["message_id"] = handoff.OPEN, 1, 10
@@ -378,6 +381,16 @@ class SanitizeTests(unittest.TestCase):
 class ServerTests(unittest.TestCase):
     """Сквозной прогон: поддельная трансляция agent-browser и телефон."""
 
+    PAGE = {"host": "hh.ru", "title": "Кабинет", "pwd": False}
+
+    def setUp(self) -> None:
+        # Настоящий agent-browser в тестах не зовём: что стало со страницей,
+        # отвечает подмена.
+        self.page_state = AsyncMock(return_value={})
+        p = patch.object(screen_server, "page_state", self.page_state)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_proxy_filters_and_done_from_page(self) -> None:
         asyncio.run(self._run())
 
@@ -427,8 +440,19 @@ class ServerTests(unittest.TestCase):
                                         "x": 3, "y": 4, "button": "left", "clickCount": 1,
                                         "modifiers": 2})
                     await ws.send_json({"type": "ack", "seq": 1})
+                    seen: list = []
+
+                    async def snap(session: str) -> dict:
+                        # Снимок до записи итога: агент ещё ждёт и не ушёл со страницы.
+                        seen.append(handoff.load(base, rec["id"])["status"])
+                        return self.PAGE
+                    self.page_state.side_effect = snap
                     await ws.send_json({"type": "done"})
-                    self.assertEqual((await ws.receive_json())["reason"], "done")
+                    # Итог с тем, что стало со страницей: на ПК видно, удался ли вход.
+                    self.assertEqual(await ws.receive_json(),
+                                     {"type": "closed", "reason": "done", "page": self.PAGE})
+                    self.page_state.assert_awaited_once_with("s1")
+                    self.assertEqual(seen, [handoff.OPEN])
                     await ws.close()
                     # После итога страница тоже 404.
                     self.assertEqual((await client.get(f"/s/{rec['id']}")).status, 404)
@@ -467,6 +491,8 @@ class ServerTests(unittest.TestCase):
                     handoff.finish(base, rec["id"], "done", "button")
                     closed = await asyncio.wait_for(ws.receive_json(), 3)
                     self.assertEqual(closed, {"type": "closed", "reason": "done"})
+                    # Итог кнопкой бота: агент уже продолжает, страницу не снимаем.
+                    self.page_state.assert_not_awaited()
                     await ws.close()
 
                     # Десять неверных токенов: вход по этой передаче закрыт и с верным.
@@ -555,6 +581,24 @@ class ServerTests(unittest.TestCase):
         missing = AsyncMock(side_effect=FileNotFoundError)
         with patch.object(asyncio, "create_subprocess_exec", missing):
             self.assertEqual(asyncio.run(screen_server.focus_kind("s1")), "unknown")
+
+    def test_page_state_only_site_title_and_password(self) -> None:
+        async def run(out: bytes) -> dict:
+            proc = AsyncMock()
+            proc.communicate.return_value = (out, b"")
+            with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+                return await _REAL_PAGE_STATE("s1")
+        ok = json.dumps({"host": "eservices.rs.ge", "title": "  Кабинет\n" + "x" * 200,
+                         "pwd": True, "value": "hunter2"}).encode()
+        got = asyncio.run(run(ok))
+        self.assertEqual(set(got), {"host", "title", "pwd"})
+        self.assertEqual((got["host"], got["pwd"]), ("eservices.rs.ge", True))
+        self.assertTrue(got["title"].startswith("Кабинет x"))
+        self.assertEqual(len(got["title"]), screen_server.TITLE_CAP)
+        self.assertEqual(asyncio.run(run(b'{"host": "evil<b>", "title": "t", "pwd": false}')), {})
+        self.assertEqual(asyncio.run(run(b'"text"')), {})
+        self.assertEqual(asyncio.run(run(b"not json")), {})
+        self.assertEqual(asyncio.run(_REAL_PAGE_STATE("")), {})
 
     def _check_got(self, got: list) -> None:
         self.assertEqual([m["type"] for m in got], ["input_mouse", "ack"])

@@ -6100,6 +6100,28 @@ def _mtproto(app: Any, cfg: Config) -> bigfile.BotMTProto:
     return client
 
 
+# Повтор скачивания через Bot API при сетевом сбое. Скачивание только читает,
+# дубля не бывает, поэтому повторяем и тайм-аут. BadRequest (в том числе
+# «File is too big») наследует NetworkError, но повтором не лечится.
+# Случай 23.10.2026: getFile голосового упал по TimedOut, голосовое потеряно.
+_DOWNLOAD_RETRY_DELAYS = (2.0, 5.0)
+
+
+async def _download_retrying(file_obj: Any, target: Path) -> None:
+    delays = iter(_DOWNLOAD_RETRY_DELAYS)
+    while True:
+        try:
+            tg_file = await file_obj.get_file()
+            await tg_file.download_to_drive(custom_path=str(target))
+            return
+        except NetworkError as e:
+            delay = None if isinstance(e, BadRequest) else next(delays, None)
+            if delay is None:
+                raise
+            log.warning("download failed (%s), retry in %.0fs", e, delay)
+            await asyncio.sleep(delay)
+
+
 async def _fetch_attachment(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_obj: Any, size: int | None,
     target: Path, label: str, chat_key: str, gslot: GatherSlot | None,
@@ -6116,8 +6138,7 @@ async def _fetch_attachment(
     msg = update.message
     if not bigfile.needs_mtproto(size):
         try:
-            tg_file = await file_obj.get_file()
-            await tg_file.download_to_drive(custom_path=str(target))
+            await _download_retrying(file_obj, target)
             return "small"
         except Exception as e:
             if not bigfile.too_big_for_bot_api(e):
@@ -6552,8 +6573,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
         else:
             try:
-                tg_file = await msg.voice.get_file()
-                await tg_file.download_to_drive(custom_path=str(tmp))
+                await _download_retrying(msg.voice, tmp)
             except Exception:
                 log.exception("voice download failed user=%s", user.id if user else None)
                 _compose_release(ctx, chat_key, slot)

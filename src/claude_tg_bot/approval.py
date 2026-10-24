@@ -2018,6 +2018,26 @@ def memory_write_auto_allowed(
     return calls or None
 
 
+# Чтение коннектора Todoist поимённо (24.10.2026): у него имена через дефис,
+# и общий глагольный шаблон их не узнаёт, а расширять его нельзя:
+# `analyze-project-health` с дефисом прошёл бы, а он пишущий (ревью Codex).
+# Только сервер claude_ai_Todoist; ран по чужому тексту Todoist не читает
+# (его нет в UNTRUSTED_MCP_READ_SERVERS).
+_TODOIST_SERVER = "claude_ai_Todoist"
+_TODOIST_READ_TOOLS = frozenset({
+    "find-activity", "find-comments", "find-completed-tasks", "find-filters", "find-labels",
+    "find-project-collaborators", "find-projects", "find-reminders", "find-sections",
+    "find-tasks", "find-tasks-by-date", "get-overview", "get-productivity-stats",
+    "get-project-activity-stats", "get-workspace-insights", "fetch", "fetch-object", "search",
+    "user-info", "list-workspaces", "view-attachment",
+})
+
+
+def _todoist_read(tool_name: str) -> bool:
+    parts = tool_name.split("__", 2)
+    return len(parts) == 3 and parts[0] == "mcp" and parts[1] == _TODOIST_SERVER and parts[2] in _TODOIST_READ_TOOLS
+
+
 # MCP-инструменты, где чтение от записи отличает аргумент, а не имя: Grafana
 # `alerting_manage_*` (операции list, get, versions, get_*) и
 # `grafana_api_request` (метод GET). Незнакомая операция значит карточка.
@@ -2495,7 +2515,8 @@ async def handle_approve(request: web.Request) -> web.Response:
             # Свой список читающих глаголов: настройка MCP_AUTO_ALLOW_REGEX
             # может разрешать и запись (ревью Codex 13.10).
             short_tool = tool_name.split("__", 2)[-1]
-            ok = bool(_PLAN_MCP_READ_RE.fullmatch(short_tool)) or _mcp_args_readonly(short_tool, tool_input)
+            ok = (bool(_PLAN_MCP_READ_RE.fullmatch(short_tool)) or _mcp_args_readonly(short_tool, tool_input)
+                  or _todoist_read(tool_name))
         else:
             ok = False
         force_card = not ok and task_think and tool_name not in _PLAN_WRITE_TOOLS and not outbound
@@ -2718,7 +2739,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         # Имя без префикса mcp__<server>__: сервер-часть содержит UUID/дефисы
         # и в regex ей делать нечего.
         short_tool = tool_name.split("__", 2)[-1]
-        if mcp_re.fullmatch(short_tool) or _mcp_args_readonly(short_tool, tool_input):
+        if mcp_re.fullmatch(short_tool) or _mcp_args_readonly(short_tool, tool_input) or _todoist_read(tool_name):
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=%s (mcp-readonly)", aid, tool_name)
             await asyncio.to_thread(
