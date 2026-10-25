@@ -550,6 +550,10 @@ class Config:
     # Чаты, где субагент зовётся только с явной ролью цены (approval
     # _agent_role_refusal; чаты Домового, разбор 22.10.2026).
     agent_role_chat_keys: frozenset[str] = frozenset()
+    # Файл срочного помощника и чаты, где каждый ответ кончается строками
+    # «⏳ Висит» по нему (hangs.py; разбор W43, решение Ивана 25.10.2026).
+    hangs_file: Path | None = None
+    hangs_chat_keys: frozenset[str] = frozenset()
     workshop_chat_key: str = ""
     workshop_model: str = "opus"
     workshop_effort: str = "high"
@@ -997,6 +1001,10 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         workshop_chat_key=workshop_chat_key,
         agent_role_chat_keys=frozenset(
             k.strip() for k in os.environ.get("AGENT_ROLE_CHAT_KEYS", "").split(",") if k.strip()),
+        hangs_file=Path(os.environ["HANGS_FILE"].strip()).expanduser()
+        if os.environ.get("HANGS_FILE", "").strip() else None,
+        hangs_chat_keys=frozenset(
+            k.strip() for k in os.environ.get("HANGS_CHAT_KEYS", "").split(",") if k.strip()),
         cost_footer_min_usd=_float_env("COST_FOOTER_MIN_USD", 0.0),
         workshop_model=os.environ.get("WORKSHOP_MODEL", "opus").strip(),
         workshop_effort=os.environ.get("WORKSHOP_EFFORT", "high").strip(),

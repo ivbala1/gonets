@@ -7,17 +7,27 @@ Usage:
     python -m claude_tg_bot.notify --html --no-preview --silent ... "<b>текст</b>"
     python -m claude_tg_bot.notify --silent --pin "текст"     # закрепить, последней строкой message_id: N
     python -m claude_tg_bot.notify --unpin N                  # открепить (в чат/тему тот же --chat-id)
+
+Закреп текста, который начинается с «Вопрос дня», один на дату и чат: второй
+получает отказ и номер первого (разбор недели помощника W43, предложение 7,
+решение Ивана 25.10.2026). Учёт в state/daily_pins.json; неудачная отправка
+не записывается, и повтор после сбоя проходит.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
 import httpx
 
-from .config import load_config
+from .config import load_config, local_zone
 from .i18n import _
 
 
@@ -110,6 +120,23 @@ def _run(argv: list[str] | None = None) -> tuple[int, int | None]:
     if args.unpin is not None:
         return _unpin(cfg.telegram_bot_token, chat_id, args.unpin), None
 
+    daily = _daily_slot(cfg, text, chat_id, thread_id) if args.pin else None
+    if daily is None:
+        return _deliver(cfg, args, text, chat_id, thread_id, reply_markup, None)
+    # Проверка, отправка и запись под одним замком: два параллельных вызова
+    # не отправят по вопросу и не затрут учёт друг друга.
+    with _daily_lock(daily[0]):
+        if (prev := _daily_sent(*daily)) is not None:
+            print(_("notify: «{prefix}» за {day} уже отправлен и закреплён, второй не шлю").format(
+                prefix=DAILY_PREFIX, day=daily[1].split("|")[-1]), file=sys.stderr)
+            print(f"message_id: {prev}")
+            return 1, prev
+        return _deliver(cfg, args, text, chat_id, thread_id, reply_markup, daily)
+
+
+def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: int | None,
+             reply_markup: dict | None, daily: tuple[Path, str] | None) -> tuple[int, int | None]:
+    """Отправка частями, закреп и вывод message_id (тело прежнего _run)."""
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
     limit = cfg.telegram_text_limit
     # Защита и для вызовов с подставной конфигурацией (ревью 12.10.2026).
@@ -152,6 +179,10 @@ def _run(argv: list[str] | None = None) -> tuple[int, int | None]:
                 first_message_id = int(r.json()["result"]["message_id"])
             except (AttributeError, ValueError, KeyError, TypeError):
                 pass  # доставку это не ломает, просто не будет якоря для reply
+            if daily is not None and first_message_id is not None:
+                # Сразу после доставки: сбой следующей части или закрепа
+                # не должен открыть дорогу второму вопросу.
+                _daily_mark(*daily, first_message_id)
     dest = f"chat_id={chat_id}" + (f" thread_id={thread_id}" if thread_id is not None else "")
     print(f"sent {len(chunks)} message(s) to {dest}")
     if args.pin:
@@ -165,6 +196,75 @@ def _run(argv: list[str] | None = None) -> tuple[int, int | None]:
                          silent=True):
             return 1, first_message_id
     return 0, first_message_id
+
+
+DAILY_PREFIX = "Вопрос дня"
+DAILY_KEEP_SEC = 40 * 24 * 3600
+
+
+def _daily_slot(cfg, text: str, chat_id: int, thread_id: int | None) -> tuple[Path, str] | None:
+    """(файл учёта, ключ «чат|дата») для закрепа «Вопрос дня», иначе None.
+    Без state_dir в конфиге учёта нет."""
+    state_dir = getattr(cfg, "state_dir", None)
+    if state_dir is None or not text.startswith(DAILY_PREFIX):
+        return None
+    where = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+    return Path(state_dir) / "daily_pins.json", f"{where}|{datetime.now(local_zone()).date().isoformat()}"
+
+
+@contextlib.contextmanager
+def _daily_lock(path: Path):
+    """Замок учёта на время проверки, отправки и записи. Замок не взялся
+    (каталога нет, права): идём без него, доставка важнее."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path.with_suffix(".lock"), "a")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        fh.close()
+
+
+def _daily_load(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _daily_sent(path: Path, key: str) -> int | None:
+    entry = _daily_load(path).get(key)
+    try:
+        return int(entry["message_id"])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+def _daily_mark(path: Path, key: str, message_id: int) -> None:
+    """Запись атомарно (временный файл и замена). Сбой записи доставку не
+    ломает, лишь не защитит от второго вопроса. Дата берётся до отправки:
+    отправка, пересёкшая полночь, числится за прошлым днём."""
+    now = time.time()
+
+    def fresh(v: object) -> bool:
+        try:
+            return isinstance(v, dict) and now - float(v.get("at") or 0) < DAILY_KEEP_SEC
+        except (TypeError, ValueError):
+            return False
+    data = {k: v for k, v in _daily_load(path).items() if fresh(v)}
+    data[key] = {"message_id": message_id, "at": now}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        print(f"notify: daily_pins не записан: {type(e).__name__}", file=sys.stderr)
 
 
 def _print_id_on_failure(pin: bool, message_id: int | None) -> None:

@@ -46,6 +46,7 @@ from claude_tg_bot.replies import (  # noqa: E402
     plan_voice_series,
     render_markup,
     save_full_text,
+    send_files,
     send_reply_text,
     send_voice_caption,
     voice_text,
@@ -383,6 +384,39 @@ class SendReplyInlineCodeTests(unittest.TestCase):
         kwargs = msg.reply_voice.call_args.kwargs
         self.assertEqual(kwargs["caption"], "точка 1, 2")
         self.assertEqual(len(kwargs["caption_entities"]), 1)
+
+
+class SendFilesTests(unittest.TestCase):
+    def _send(self, err: Exception | None) -> SimpleNamespace:
+        msg = SimpleNamespace(reply_document=AsyncMock(side_effect=err), reply_text=AsyncMock())
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "track.gpx"
+            f.write_text("x")
+            asyncio.run(send_files(SimpleNamespace(message=msg), [f]))
+        return msg
+
+    def test_long_timeouts(self) -> None:
+        msg = self._send(None)
+        kwargs = msg.reply_document.await_args.kwargs
+        self.assertGreaterEqual(kwargs["read_timeout"], 60)
+        self.assertGreaterEqual(kwargs["write_timeout"], 60)
+        msg.reply_text.assert_not_awaited()
+
+    def test_read_timeout_says_probably_delivered(self) -> None:
+        # Случай 25.10.2026: файл загружен, не пришло подтверждение.
+        err = TimedOut()
+        err.__cause__ = httpx.ReadTimeout("")
+        msg = self._send(err)
+        msg.reply_document.assert_awaited_once()  # без повтора: дубль файла
+        text = msg.reply_text.await_args.args[0]
+        self.assertIn("track.gpx", text)
+        self.assertIn("мог дойти", text)
+
+    def test_other_error_says_failed(self) -> None:
+        err = TimedOut()
+        err.__cause__ = httpx.WriteTimeout("")
+        text = self._send(err).reply_text.await_args.args[0]
+        self.assertIn("не удалось отправить файл track.gpx", text)
 
 
 class ComposeBufferTests(unittest.TestCase):
