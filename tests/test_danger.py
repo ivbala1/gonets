@@ -118,6 +118,14 @@ class ReviewFindingsTests(unittest.TestCase):
         self.assertEqual(level("cp ~/.ssh/config /tmp/config"), ORANGE)
         self.assertEqual(level("mv ~/.ssh/config /tmp/config"), RED)
 
+    def test_rtk_grep_is_rg(self) -> None:
+        # `rtk grep` это rg, `rtk proxy grep` это grep (ревью 25.10.2026).
+        for cmd in ("rtk grep --hidden foo src", "rtk grep -uu foo src"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(classify("Bash", {"command": cmd}).secret)
+        self.assertEqual(level("rtk grep --pre=sh x ."), ORANGE)
+        self.assertFalse(classify("Bash", {"command": "rtk proxy grep -n -E 'a|b' README.md"}).secret)
+
     def test_card_never_exceeds_telegram_limit(self) -> None:
         path = "/tmp/" + "/".join(["a" * 100] * 25)
         card = _format_tool_call("Write", {"file_path": path, "content": "<" * 2000}, "s")

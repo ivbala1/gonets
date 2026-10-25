@@ -650,17 +650,28 @@ async def send_cost_footer(
         log.exception("cost footer send failed")
 
 
+# Случай 25.10.2026: GPX 2 МБ загружен, но ответ Telegram не пришёл за 5 с
+# (умолчание read_timeout), бот написал «не удалось», а файл дошёл.
+_SEND_FILE_TIMEOUT = 120
+
+
 async def send_files(update: Update, files: list[Path]) -> None:
     msg = update.message
     for fpath in files:
         try:
             with fpath.open("rb") as fh:
-                await msg.reply_document(document=fh, filename=fpath.name)
+                await msg.reply_document(document=fh, filename=fpath.name,
+                                         read_timeout=_SEND_FILE_TIMEOUT, write_timeout=_SEND_FILE_TIMEOUT)
             log.info("SEND_FILE sent: %s (%d bytes)", fpath, fpath.stat().st_size)
-        except Exception:
+        except Exception as e:
             log.exception("SEND_FILE failed for %s", fpath)
+            # Тайм-аут чтения: файл обычно загружен, не пришло подтверждение (но не всегда).
+            if isinstance(e.__cause__, httpx.ReadTimeout):
+                text = _("⚠️ Telegram не подтвердил отправку файла {name}: он мог дойти, проверь чат выше")
+            else:
+                text = _("⚠️ не удалось отправить файл {name}")
             try:
-                await msg.reply_text(_("⚠️ не удалось отправить файл {name}").format(name=fpath.name))
+                await msg.reply_text(text.format(name=fpath.name))
             except Exception:
                 pass
 

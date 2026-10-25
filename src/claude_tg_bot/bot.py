@@ -62,7 +62,7 @@ from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_
 from .overrides import PersistentDict
 from .codex_runner import run_codex
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, events, handoff, limits, otklik, restart, tasks, transcripts, warm
+from . import bigfile, events, handoff, hangs, limits, otklik, restart, tasks, transcripts, warm
 from .skills.news_digest import backlog as news_backlog
 from .skills.news_digest import core as news
 from .replies import (
@@ -715,6 +715,34 @@ def _ask_button_label(n: int, option: str) -> str:
     """«1 · начало варианта…», не длиннее _ASK_BUTTON_CAP символов."""
     label = f"{n} · {option}"
     return label if len(label) <= _ASK_BUTTON_CAP else label[: _ASK_BUTTON_CAP - 1].rstrip() + "…"
+
+
+# Тот же вопрос с теми же вариантами, пока прежняя карточка ждёт ответа,
+# заново не шлётся (разбор недели W43, предложение 3: 38 повторов за 6 часов
+# на 173 вопроса; решение Ивана 25.10.2026).
+ASK_REPEAT_HOLD_SEC = 6 * 3600
+
+
+def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, list[str]], *,
+                 permission_mode: str, untrusted: bool) -> bool:
+    """Карточка этого вопроса с теми же вариантами в этом чате доставлена и
+    ждёт ответа: не нажата, та же сессия и тот же режим рана, моложе
+    ASK_REPEAT_HOLD_SEC. Нажатая карточка из реестра уходит, после рестарта
+    реестр пуст: тогда вопрос шлётся как обычно. Ответ словами карточку не
+    гасит: она по-прежнему нажимается, а повторы шли и после слов Ивана
+    (решение по предложению 3 разбора W43)."""
+    question, options = ask
+    pending: dict[str, dict] = ctx.application.bot_data.get("ask_options", {})
+    epoch = _session_epoch(ctx, chat_key)
+    cards: dict[str, list[dict]] = {}
+    for v in pending.values():
+        if (v.get("chat_key") == chat_key and v.get("question") == question and v.get("msg")
+                and v.get("epoch") == epoch and v.get("permission_mode") == permission_mode
+                and bool(v.get("untrusted")) == untrusted):
+            cards.setdefault(v.get("card"), []).append(v)
+    now = time.time()
+    return any([v.get("answer") for v in vs] == list(options)
+               and float(vs[0].get("at") or 0) > now - ASK_REPEAT_HOLD_SEC for vs in cards.values())
 
 
 async def _send_ask_card(
@@ -5678,21 +5706,43 @@ async def _dispatch_to_claude_impl(
         ws_question = _("Вопрос: {question} ({options})").format(question=ask[0], options="; ".join(ask[1]))
         reply = (reply.rstrip() + "\n\n" + ws_question).strip()
         ask = None
+    ask_held = ask is not None and _ask_waiting(ctx, chat_key, ask, permission_mode=permission_mode,
+                                                untrusted=untrusted)
+    if ask_held:
+        log.info("ask repeat skipped chat=%s", chat_key)
+        reply = (reply.rstrip() + "\n\n" + _("❓ Вопрос с кнопками выше ещё ждёт ответа.")).strip()
+        ask = None
+    hang_text = ""
+    if (not workshop and chat_key in getattr(cfg, "hangs_chat_keys", frozenset())
+            and getattr(cfg, "hangs_file", None)):
+        # Срочное последними строками ответа и у ответа из одного вопроса
+        # кнопками. Не в мастерской: её пересылка отрезает строку вопроса с
+        # конца ответа. Молчаливый ран сообщением не становится.
+        lines = hangs.hang_lines(cfg.hangs_file, datetime.now(local_zone()).date())
+        if lines and (reply.strip() or ask is not None):
+            reply = hangs.strip_model_lines(reply)
+            hang_text = "\n".join(lines)
+    full_reply = (reply.rstrip() + "\n\n" + hang_text).strip() if hang_text else reply
 
     if reply_sink is not None:
         # До отправки: сбой Telegram не теряет итог выполнения задачи (ревью
         # Codex 16.10).
-        reply_sink.append((reply, plan_snapshot, not result.is_error and not codex_fallback))
+        reply_sink.append((full_reply, plan_snapshot, not result.is_error and not codex_fallback))
     if workshop and (unattended or from_callback):
         # Наряд, поиск, ✅: Ивана в теме нет, итог тихо в личку, сбой со звуком.
         # До отправки в тему: её сбой итог не съест.
         await _workshop_forward(ctx, cfg, chat_key, thread_id,
                                 reply[:-len(ws_question)] if ws_question else reply, result.is_error, ws_question)
     voiced = False
-    if send_voice_reply and openai_client is not None:
+    if send_voice_reply and openai_client is not None and reply.strip():
         voiced = await _send_voice_series(cfg, ctx, update, chat_id, openai_client, reply)
+        if voiced and hang_text:
+            # Срочное текстом после голосовой серии, последним сообщением.
+            await send_reply_text(cfg, update, hang_text)
     if not voiced:
-        await send_reply_text(cfg, update, reply)
+        await send_reply_text(cfg, update, full_reply)
+    if hang_text:
+        log.info("hangs appended chat=%s n=%d", chat_key, hang_text.count("\n") + 1)
     if reply_sent is not None:
         reply_sent.append(True)
     await send_files(update, files_to_send)
@@ -5710,7 +5760,7 @@ async def _dispatch_to_claude_impl(
             ctx, update, chat_key, ask,
             permission_mode=permission_mode, unattended=unattended, untrusted=untrusted,
         )
-    elif permission_mode == "plan" and not result.is_error and reply.strip():
+    elif permission_mode == "plan" and not result.is_error and reply.strip() and not ask_held:
         if _task_for(cfg, chat_id, thread_id, ctx) is not None:
             pass  # в теме задачи проект решения под «Делай» ставит _task_thought
         elif codex_fallback:

@@ -43,6 +43,8 @@ class WrapperTests(_Base):
             "TZ=Europe/Berlin date '+%H:%M'",
             "git -C ~/.agent-memory/personal rev-parse --short HEAD",
             "git -C '/mnt/c/x y' log -1",
+            # rtk proxy grep это grep, а не rg: -E здесь регулярка (22.10.2026).
+            "rtk proxy grep -n -E 'a|b' README.md",
         )
 
     def test_card(self) -> None:
@@ -55,6 +57,7 @@ class WrapperTests(_Base):
             "rtk grep --pre=sh x .",
             # rg по каталогу (решение владельца 14.10.2026).
             "rtk grep -rn foo src",
+            "rtk proxy grep -rn foo src",
             "TZ=x rm a",
             "FOO=1 ls",
             "timeout 10 rm a",

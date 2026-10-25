@@ -788,6 +788,10 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
                 rest = rest[2:] if flag in value_flags else rest[1:]
             if prog == "rtk" and rest[:1] == ["proxy"]:
                 rest = rest[1:]
+            elif prog == "rtk" and rest[:1] == ["grep"]:
+                # `rtk grep` под капотом rg: его флаги (`--hidden`, `--pre`)
+                # оцениваются как у rg, иначе секрет не виден (ревью 25.10.2026).
+                rest = ["rg", *rest[1:]]
             if as_string:
                 if rest:
                     _classify_bash(" ".join(rest), v, depth + 1)

@@ -1322,11 +1322,13 @@ _XARGS_VALUE = frozenset({"-I", "-n", "-L", "-P", "-d", "-s", "-E"})
 def _unwrap_segment(segment: str) -> str | None:
     """Сегмент без обёрток из `_WRAPPER_RE`, без `git -C <каталог>` и без
     `xargs [флаги]`. None, если обёртку не разобрать. `rtk grep` под капотом
-    это rg, поэтому дальше он проверяется как rg (флаг `--pre` запрещён)."""
+    это rg, поэтому дальше он проверяется как rg (флаг `--pre` запрещён).
+    `rtk proxy grep` запускает настоящий grep и остаётся grep: у rg `-E` это
+    кодировка, и поиск по одному файлу выглядел бы поиском по каталогу."""
     s = segment
     while m := _WRAPPER_RE.match(s):
         rest = s[m.end():]
-        if m.group(0).startswith("rtk") and rest.startswith("grep "):
+        if m.group(0) == "rtk " and rest.startswith("grep "):
             rest = "rg " + rest[len("grep "):]
         s = rest
     if s == "xargs" or s.startswith("xargs "):
