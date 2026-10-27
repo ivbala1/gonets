@@ -22,11 +22,11 @@ transport for a proactive personal assistant.
 
 | | Gonets | Claude Code Channels | Remote Control | tmux-based bridges |
 |---|---|---|---|---|
-| What runs | a service that starts `claude -p` per message | events pushed into an interactive session you keep open | you drive a local session from the Claude app | a bot types into tmux windows |
-| Parallel sessions | one per chat and per forum topic | one session | one session | one per tmux window |
-| Tool approvals | inline cards with a risk estimate, audit log | permission relay (yes/no by id) | in the app | varies |
-| Unattended runs | scheduled prompts, external events, read-only mode for untrusted input | while the session is open | no | varies |
-| Voice, files, photos | in and out | text | yes | varies |
+| What runs | a service that starts `claude -p` per message | events pushed into an interactive session you keep open | you drive local sessions from the Claude app or claude.ai | a bot types into tmux windows |
+| Parallel sessions | one per chat and per forum topic | one per running `claude --channels` | many in server mode (`claude remote-control`, up to 32 by default) | one per tmux window |
+| Tool approvals | inline cards with a risk estimate, audit log | permission relay (yes/no by id) | in the app, with push notifications | varies |
+| Unattended runs | scheduled prompts, external events, read-only mode for untrusted input | while the session is open | sessions start when you connect | varies |
+| Voice, files, photos | in and out | text, photos and files | photos and files | varies |
 
 [Channels](https://code.claude.com/docs/en/channels) is the official
 Telegram/Discord bridge (research preview at the time of writing) and is the
