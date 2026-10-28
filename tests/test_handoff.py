@@ -21,6 +21,7 @@ from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 from claude_tg_bot import bot, handoff, screen_server  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 
 _REAL_PAGE_STATE = screen_server.page_state
@@ -50,12 +51,12 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(url, f"http://host.ts.net:8765/s/{rec['id']}#{token}")
         rows = handoff.buttons(rec, url)
         self.assertEqual(rows[0][0]["url"], url)
-        self.assertEqual([b["text"] for b in rows[1]], ["✅ Готово", "🙅 Не могу"])
+        self.assertEqual([b["text"] for b in rows[1]], [_("✅ Готово"), _("🙅 Не могу")])
         for b in rows[1]:
             self.assertEqual(handoff.parse_callback(b["data"])[0], rec["id"])
             self.assertLessEqual(len(b["data"].encode()), 64)
         markup = handoff.markup(rows)["inline_keyboard"]
-        self.assertEqual(markup[0][0], {"text": "🖥 Открыть экран", "url": url})
+        self.assertEqual(markup[0][0], {"text": _("🖥 Открыть экран"), "url": url})
         self.assertIn("callback_data", markup[1][0])
 
     def test_render_mentions_tailscale_and_status(self) -> None:
@@ -65,7 +66,7 @@ class RecordTests(unittest.TestCase):
         self.assertIn("капча после откликов", text)
         self.assertIn("Tailscale", text)
         handoff.set_status(rec, "cant", "button")
-        self.assertIn("не получилось", handoff.render(rec))
+        self.assertIn(_("🙅 не получилось, агент пропустит"), handoff.render(rec))
 
     def test_region_parse(self) -> None:
         self.assertEqual(handoff.parse_region("10,20.4,300,80"), [10, 20, 300, 80])
@@ -105,14 +106,15 @@ class RecordTests(unittest.TestCase):
             with patch.dict("os.environ", env), contextlib.redirect_stderr(err):
                 with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": ""}):
                     self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
-                for _ in range(3):
+                for _i in range(3):
                     _open_record(base, chat_key="5")
                 with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": "s2"}), \
                         patch.object(handoff, "stream_port", return_value=1), \
                         patch.object(handoff, "_bot_api") as api:
                     self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
                     api.assert_not_called()
-            self.assertIn("больше нельзя", err.getvalue())
+            self.assertIn(_("handoff: за час уже {n} передачи в этот чат, больше нельзя: остановись и скажи Ивану").format(
+                n=3), err.getvalue())
 
     def test_one_open_handoff_per_session(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -127,7 +129,7 @@ class RecordTests(unittest.TestCase):
                     patch.object(handoff, "_bot_api") as api:
                 self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
                 api.assert_not_called()
-            self.assertIn("уже открыта передача", err.getvalue())
+            self.assertIn(_("handoff: у этой сессии уже открыта передача, дождись её итога"), err.getvalue())
             self.assertFalse(handoff.session_busy(base, "s2"))
 
     def test_stream_port_sets_frame_sized_viewport_first(self) -> None:
@@ -191,7 +193,7 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(rec["status"], "expired")
         self.assertIn(("disable", "s1"), calls)
-        self.assertIn("по времени", calls[-1][1]["text"])
+        self.assertIn(_("⌛ экран закрыт по времени"), calls[-1][1]["text"])
 
     def test_short_timeout_expires_too(self) -> None:
         code, rec, _calls = self._wait(lambda base, rec: None, timeout=1.0)
@@ -267,7 +269,7 @@ class TextAnswerTests(unittest.TestCase):
             done = handoff.answer(base, rec["id"], "  x7K2\n")
             self.assertEqual((done["status"], done["answer"]), ("answered", "x7K2"))
             self.assertIsNone(handoff.answer(base, rec["id"], "again"))
-            self.assertIn("ответ передан", handoff.render(done))
+            self.assertIn(_("✍️ ответ передан агенту"), handoff.render(done))
 
     def test_unclaimed_answer_scrubbed_after_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -324,7 +326,7 @@ class TextAnswerTests(unittest.TestCase):
             self.assertEqual(handoff.load(base, rec2["id"])["answer"], "Ab3d")
             late = msg(10, "again")
             self.assertTrue(asyncio.run(bot._handoff_reply(ctx, late)))
-            self.assertIn("уже закрыт", late.reply_text.call_args.args[0])
+            self.assertEqual(_("Экран уже закрыт, ответ агенту не передан"), late.reply_text.call_args.args[0])
 
 
 class SanitizeTests(unittest.TestCase):

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .i18n import _
+from .i18n import _, plural
 
 log = logging.getLogger(__name__)
 
@@ -228,10 +228,12 @@ class Drain:
                 return
             if not asked and self.clock() - started >= self.ask_after_sec:
                 asked = True
+                minutes = int(self.ask_after_sec // 60)
                 await self.notify(
-                    _("⏳ Жду уже {minutes} минут, работы ещё {count}. "
+                    _("⏳ Жду уже {minutes} {unit}, работы ещё {count}. "
                       "Перезапустить сейчас (идущие раны прервутся), ждать дальше или отменить заявку?").format(
-                        minutes=int(self.ask_after_sec // 60), count=self.active()),
+                        minutes=minutes, unit=plural(minutes, ("минуту", "минуты", "минут"), ("minute", "minutes")),
+                        count=self.active()),
                     True,
                 )
             try:

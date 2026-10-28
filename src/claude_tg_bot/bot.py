@@ -62,12 +62,13 @@ from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_
 from .overrides import PersistentDict
 from .codex_runner import run_codex
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, events, handoff, hangs, limits, otklik, restart, tasks, transcripts, warm
+from . import bigfile, deals, events, handoff, hangs, limits, otklik, restart, tasks, transcripts, warm
 from .skills.news_digest import backlog as news_backlog
 from .skills.news_digest import core as news
 from .replies import (
     _send_retrying,
     extract_ask_marker,
+    extract_loud_marker,
     extract_send_file_markers,
     load_full_text,
     plan_voice_series,
@@ -172,6 +173,27 @@ def _bump_session_epoch(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
     epochs: dict[str, int] = ctx.application.bot_data.setdefault("session_epochs", {})
     epochs[chat_key] = epochs.get(chat_key, 0) + 1
     return epochs[chat_key]
+
+
+def _session_will_change(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
+                         expect_epoch: int) -> bool:
+    """Кнопка относится уже не к той сессии, что продолжит ран: эпоха
+    сменилась или сменится сбросом в этом же ране. Без записи: проверка
+    стоит до лимита и хода в теме задачи (проект шага 1, 2.2). Из сбросов
+    диспетчера кнопке грозят только простой и смена отпечатка скоупа: fresh
+    кнопки вопроса и плана не передают, а сброс по чужому тексту бывает
+    только у фонового рана вне плана."""
+    if _session_epoch(ctx, chat_key) != expect_epoch:
+        return True
+    store: SessionStore = ctx.application.bot_data["sessions"]
+    if not store.get(chat_key):
+        return False
+    ttl = getattr(cfg, "session_idle_ttl_sec", 0)
+    last = store.last_used(chat_key)
+    if ttl > 0 and last > 0 and time.time() - last > ttl:
+        return True
+    fps: SessionStore | None = ctx.application.bot_data.get("scope_fingerprints")
+    return fps is not None and (fps.get(chat_key) or "") != _memory_scope_hint(ctx, cfg, chat_key)
 
 
 # Сессии, в историю которых попал чужой текст (ран /event с untrusted):
@@ -724,16 +746,16 @@ ASK_REPEAT_HOLD_SEC = 6 * 3600
 
 
 def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, list[str]], *,
-                 permission_mode: str, untrusted: bool) -> bool:
+                 permission_mode: str, untrusted: bool, epoch: int) -> bool:
     """Карточка этого вопроса с теми же вариантами в этом чате доставлена и
     ждёт ответа: не нажата, та же сессия и тот же режим рана, моложе
     ASK_REPEAT_HOLD_SEC. Нажатая карточка из реестра уходит, после рестарта
     реестр пуст: тогда вопрос шлётся как обычно. Ответ словами карточку не
     гасит: она по-прежнему нажимается, а повторы шли и после слов Ивана
-    (решение по предложению 3 разбора W43)."""
+    (решение по предложению 3 разбора W43). epoch: эпоха сессии рана с
+    вопросом, снятая под замком темы."""
     question, options = ask
     pending: dict[str, dict] = ctx.application.bot_data.get("ask_options", {})
-    epoch = _session_epoch(ctx, chat_key)
     cards: dict[str, list[dict]] = {}
     for v in pending.values():
         if (v.get("chat_key") == chat_key and v.get("question") == question and v.get("msg")
@@ -747,7 +769,7 @@ def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, 
 
 async def _send_ask_card(
     ctx: ContextTypes.DEFAULT_TYPE, update: Update, chat_key: str,
-    ask: tuple[str, list[str]], *, permission_mode: str, unattended: bool,
+    ask: tuple[str, list[str]], *, permission_mode: str, epoch: int,
     untrusted: bool = False,
 ) -> None:
     """Уточняющий вопрос Claude кнопками. Выбор уходит следующим сообщением
@@ -757,7 +779,10 @@ async def _send_ask_card(
     заданный внутри /plan, продолжался бы уже в обычном режиме (мутации без
     решения по плану), а кнопка, нажатая после /reset, отвечала бы в чужую
     сессию. Вопрос из рана по чужому тексту (untrusted) продолжается тоже
-    только на чтение: вариант ответа сочинён по этому тексту.
+    только на чтение: вариант ответа сочинён по этому тексту. Фоновость рана
+    не запоминается: нажатие делает Иван (on_ask_pick). Эпоха снята под
+    замком темы в конце рана: карточка уходит после сетевых ожиданий, и
+    /reset за это время дал бы ей эпоху новой сессии (ревью /2mind 25.10.2026).
     """
     question, options = ask
     pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
@@ -777,9 +802,8 @@ async def _send_ask_card(
             "answer": opt,
             "question": question,
             "permission_mode": permission_mode,
-            "unattended": unattended,
             "untrusted": untrusted,
-            "epoch": _session_epoch(ctx, chat_key),
+            "epoch": epoch,
             "card": card_id,
             "at": time.time(),
         }
@@ -820,16 +844,56 @@ async def _send_ask_card(
 ASK_TTL_SEC = 12 * 3600
 
 
+def _card_msg_matches(picked: dict, message: Any) -> bool:
+    """Нажатие пришло под тем сообщением, куда ушла карточка. Токен живёт в
+    callback_data, и подставленный под другое сообщение разрешённого чата он
+    иначе сработал бы там (проект шага 1, 2.4). Карточка без запомненного
+    сообщения (не доставилась с message_id) не сверяется."""
+    where = picked.get("msg")
+    if not where:
+        return True
+    # chat.id, а не chat_id: у InaccessibleMessage (старше 48 ч) есть только chat.
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is None:
+        chat_id = getattr(message, "chat_id", None)
+    return message is not None and chat_id == where[0] and getattr(message, "message_id", None) == where[1]
+
+
+def _ask_pick_refusal(picked: dict) -> str:
+    """Отказ называет вопрос и ответ: «сессия сменилась» без них не давало
+    понять, какая кнопка не сработала (задача Ивана 23.10.2026)."""
+    text = _("⚠️ сессия темы сменилась, ответ «{answer}» на вопрос «{question}» не отправлен: "
+             "если он ещё нужен, напиши его текстом").format(
+        answer=picked.get("answer", ""), question=picked.get("question", ""))
+    if picked.get("dropped_plan"):
+        # Нажатие сняло проект сразу, как текст Ивана (on_ask_pick).
+        text += "\n" + _("Проект решения снят, как после твоего сообщения; ответь текстом.")
+    return text
+
+
+async def _dropped_plan_note(msg: Any, ask_ref: dict | None) -> None:
+    """Нажатие уже сняло проект темы задачи (on_ask_pick), а ход отвергнут
+    лимитом или входом: сказать, что проекта больше нет."""
+    if ask_ref is not None and ask_ref.get("dropped_plan"):
+        with contextlib.suppress(Exception):
+            await msg.reply_text(_("Проект решения снят, как после твоего сообщения; ответь текстом."))
+
+
 async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     query = update.callback_query
     if query is None:
         return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
+    # Чат проверяется, как у текста: кнопка из группы вне разрешённых не
+    # должна отвечать в сессию (проект шага 1, 2.4).
+    if not _is_allowed(cfg, update):
         return
     token = (query.data or "").split(":", 1)[-1]
     pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
+    if token in pending and not _card_msg_matches(pending[token], query.message):
+        # Чужое сообщение: вариант остаётся у своей карточки.
+        await _answer_quietly(query, _("Ответ не принят: кнопка не от этого вопроса."), show_alert=True)
+        return
     picked = pending.pop(token, None)
     if picked is not None and picked.get("at") is not None and time.time() - float(picked["at"]) > ASK_TTL_SEC:
         # Карточка пережила полдня (и сжатие сессии, эпоха при нём та же):
@@ -838,12 +902,20 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if v.get("card") == picked.get("card"):
                 pending.pop(t, None)
         picked = None
-    if picked is not None:
+    # Сверка эпохи одна на всё нажатие: /reset во время await ниже не должен
+    # дать снять проект, а потом отказать (ревью 25.10.2026).
+    same_session = picked is not None and picked.get("epoch") == _session_epoch(
+        ctx, str(picked.get("chat_key", "")))
+    if picked is not None and same_session:
         # Ответ кнопкой в теме задачи снимает проект сразу, до первого await:
         # иначе «Делай» успел бы выполнить снимаемое (ревью Codex 16.10).
+        # Кнопка сменившейся сессии ниже получит отказ и проект не трогает
+        # (ревью /2mind 25.10.2026).
         ask_chat, _sep, ask_thread = str(picked.get("chat_key", "")).partition(":")
         with contextlib.suppress(ValueError):
-            _task_touch_now(ctx, int(ask_chat), int(ask_thread) if ask_thread else None, None)
+            act, _was, _snap = _task_touch_now(ctx, int(ask_chat), int(ask_thread) if ask_thread else None, None)
+            if act in ("dropped", "cancelled"):
+                picked["dropped_plan"] = True
     if picked is None:
         # Реестр вариантов живёт в памяти: после рестарта бота кнопка молча
         # теряла ответ. Ответ на нажатие один, поэтому причина в нём, а не
@@ -869,13 +941,13 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if v.get("card") == picked.get("card"):
             pending.pop(t, None)
     card = query.message
-    if picked.get("epoch") != _session_epoch(ctx, chat_key):
+    if not same_session:
         # Между вопросом и тапом был /reset, /resume или idle-сброс: отвечать
-        # в другую сессию бессмысленно и вводит в заблуждение.
+        # в другую сессию бессмысленно и вводит в заблуждение. Новая сессия
+        # контекста вопроса не знает, а по его тексту роутер памяти мог бы
+        # закрепить её за другим заказчиком (ревью /2mind 25.10.2026).
         try:
-            await query.edit_message_text(
-                _("🗳 {text}\n\n⚠️ сессия сменилась, ответ «{answer}» не отправлен").format(text=card.text, answer=answer)
-            )
+            await query.edit_message_text(f"🗳 {card.text}\n\n{_ask_pick_refusal(picked)}")
         except Exception:
             pass
         return
@@ -900,12 +972,350 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Режим наследуется от рана, задавшего вопрос: уточнение внутри /plan
         # обязано остаться в plan-режиме, а не начать мутации.
         permission_mode=picked.get("permission_mode", "bypassPermissions"),
-        unattended=bool(picked.get("unattended")),
+        # Нажатие делает Иван, поэтому права как у его сообщения, даже если
+        # вопрос задал фоновый ран: сессия, где побывал чужой текст, не
+        # сбрасывается, как и после его текста (решение Ивана 25.10.2026;
+        # 23.10 сброс после сторожа выбросил ответ утреннему плану). Ответ на
+        # вопрос из рана по чужому тексту остаётся только на чтение.
+        unattended=False,
         from_callback=True,
         untrusted=untrusted,
         # Сессия могла смениться, пока ответ ждал замка темы.
         expect_epoch=picked.get("epoch"),
+        ask_ref=picked,
     )
+
+
+# ---- Дела: вопросы утреннего плана (опыт В1, docs/design-2026-10-26-v1.md) ----
+
+DEAL_FIRST_NOTE = N_(
+    "[Это дело: ответвление утреннего плана с момента вопроса ниже. Главный разговор "
+    "лички идёт отдельно и получит строку итога. Данные Домового могли измениться "
+    "после вопроса: перед правкой перечитай их.]\n\n")
+
+
+def _deals_base(app: Any) -> Path:
+    return deals.deals_dir(app.bot_data["cfg"].state_dir)
+
+
+def _deal_update(app: Any, deal_id: str, fn: Callable[[dict], Any]) -> Any:
+    """fn(запись дела) под замком реестра. None: дела нет или реестр не
+    читается (это в журнал: ответ тогда не принимается, а не теряется молча)."""
+    try:
+        with deals.locked(_deals_base(app)) as data:
+            deal = data.get(deal_id)
+            return None if deal is None else fn(deal)
+    except (OSError, ValueError):
+        log.exception("deal registry failed id=%s", deal_id)
+        return None
+
+
+async def _send_deal_card(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, deal: dict) -> bool:
+    """Карточка вопроса дела: ярлык первой строкой, варианты из реестра на
+    диске (кнопка живёт и после рестарта). Прежняя карточка дела гаснет."""
+    rows = [[InlineKeyboardButton(_ask_button_label(i, opt), callback_data=f"deal:{deal['id']}:{i}")]
+            for i, opt in enumerate(deal["options"], 1)]
+    listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(deal["options"], 1))
+    try:
+        sent = await msg.reply_text(f"{deals.head(deal)}\n❓ {deal['question']}\n\n{listing}",
+                                    reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        log.exception("deal card failed id=%s", deal["id"])
+        return False
+    mid = getattr(sent, "message_id", None)
+
+    def remember(d: dict) -> Any:
+        old = d.get("card_msg")
+        d["card_msg"] = mid
+        return old
+
+    old = _deal_update(ctx.application, deal["id"], remember)
+    if old and old != mid:
+        with contextlib.suppress(Exception):
+            await ctx.bot.edit_message_reply_markup(chat_id=deal["chat_id"], message_id=old, reply_markup=None)
+    log.info("deal card id=%s chat=%s", deal["id"], deal["chat_id"])
+    return True
+
+
+async def _deal_open(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, chat_id: int, thread_id: int | None,
+                     ask: tuple[str, list[str]], *, qsid: str, quuid: str, qepoch: int) -> bool:
+    """Вопрос рана с флагом утра становится делом. False: дел уже DEAL_CAP,
+    реестр не пишется или карточка не ушла; тогда вопрос идёт обычной карточкой."""
+    try:
+        with deals.locked(_deals_base(ctx.application)) as data:
+            # Вчерашние дела не занимают места новому утру (ревью 26.10).
+            deals.close_stale(data, chat_id, thread_id)
+            if any(d.get("chat_id") == chat_id and d.get("thread_id") == thread_id and d.get("state") == "asked"
+                   and d.get("question") == ask[0] and deals.is_open(d) for d in data.values()):
+                # Тот же вопрос уже ждёт в деле: второе дело не заводится (ревью 26.10).
+                log.info("deal skipped why=same chat=%s", chat_id)
+                return True
+            if deals.open_count(data, chat_id, thread_id) >= deals.DEAL_CAP:
+                log.info("deal skipped why=cap chat=%s", chat_id)
+                return False
+            deal = deals.new_deal(chat_id=chat_id, thread_id=thread_id, qsid=qsid, quuid=quuid,
+                                  question=ask[0], options=ask[1])
+            # Эпоха сессии вопроса: запасной путь, если ответвиться не вышло.
+            deal["qepoch"] = qepoch
+            data[deal["id"]] = deal
+    except (OSError, ValueError):
+        log.exception("deal registry failed, ordinary card chat=%s", chat_id)
+        return False
+    if await _send_deal_card(ctx, msg, deal):
+        return True
+    _deal_update(ctx.application, deal["id"], lambda d: d.update(state="closed", error="card"))
+    return False
+
+
+def _deal_finish(app: Any, deal: dict, result: ClaudeResult, reply: str,
+                 ask: tuple[str, list[str]] | None) -> dict | None:
+    """Итог хода дела в реестр: idle или failed, строка итога для главного
+    разговора, новый вопрос того же дела. Запись дела для карточки или None."""
+    def finish(d: dict) -> dict | None:
+        if d.get("state") != "running":
+            return None
+        now = time.time()
+        log.info("deal done id=%s ok=%d sec=%.0f", d["id"], 0 if result.is_error else 1,
+                 now - float(d.get("answered_at") or now))
+        if result.is_error:
+            d.update(state="failed", error=(result.text or "")[:200], last_at=now)
+            return None
+        deals.add_note(d, deals.note_text(d, str(d.get("answer") or ""), reply), now)
+        if ask is None:
+            d.update(state="idle", last_at=now)
+            return None
+        deals.ask_again(d, ask[0], ask[1], now)
+        return dict(d)
+
+    return _deal_update(app, deal["id"], finish)
+
+
+def _deal_reply_target(ctx: ContextTypes.DEFAULT_TYPE, msg: Any) -> str | None:
+    """Дело, на сообщение которого ответили свайпом: сообщение самого бота с
+    ярлыком «🧵 <id> · …» в первой строке, дело этого чата. Пересланное это
+    чужой текст, а не ответ Ивана."""
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is None or getattr(msg, "forward_origin", None) is not None:
+        return None
+    sender = getattr(reply, "from_user", None)
+    if sender is None or not getattr(sender, "is_bot", False):
+        return None
+    try:
+        if sender.id != ctx.bot.id:
+            return None
+    except Exception:
+        return None
+    did = deals.id_from_text(getattr(reply, "text", None) or getattr(reply, "caption", None))
+    if did is None:
+        return None
+    deal = deals.load(_deals_base(ctx.application)).get(did)
+    # Закрытое дело: обычный путь со склейкой и цитатой (ревью 26.10).
+    return did if (deal is not None and deal.get("chat_id") == getattr(msg, "chat_id", None)
+                   and deals.is_open(deal)) else None
+
+
+async def _deal_swipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: str, text: str) -> bool:
+    """Свайп-ответ в дело. False: дело закрыто, сообщение идёт обычным путём."""
+    msg = update.message
+    text = text.strip()
+    if text.startswith("!"):
+        # Поправка в деле это обычный ход дела: ран лички она не прерывает.
+        text = text[1:].strip()
+    if not text:
+        return True
+    seen: dict = {}
+
+    def take(d: dict) -> bool:
+        seen.update(state=d.get("state"), label=d.get("label"), card=d.get("card_msg"), chat=d.get("chat_id"))
+        return deals.accept(d, text, states=deals.SWIPE_STATES)
+
+    if not _deal_update(ctx.application, deal_id, take):
+        if seen.get("state") in ("accepted", "running"):
+            await msg.reply_text(_("🧵 дело «{label}» ещё отвечает: дождись ответа и ответь на него").format(
+                label=seen.get("label", "")))
+            return True
+        log.info("deal refused id=%s why=closed", deal_id)
+        await msg.reply_text(_("🧵 дело закрыто, пишу в главный разговор"))
+        return False
+    if seen.get("state") == "asked" and seen.get("card"):
+        # Ответ словами на вопрос дела: кнопки его карточки гаснут.
+        with contextlib.suppress(Exception):
+            await ctx.bot.edit_message_reply_markup(chat_id=seen["chat"], message_id=seen["card"], reply_markup=None)
+    log.info("deal pick id=%s via=swipe", deal_id)
+    await _deal_turn(update, ctx, deal_id, from_callback=False)
+    return True
+
+
+async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: str, *,
+                     from_callback: bool) -> None:
+    """Ход дела по принятому ответу (accepted). Первый ход идёт в ответвление
+    сессии вопроса с точки его ответа, следующие в сессию дела. Исход хода
+    всегда видим: ответ, отказ с причиной или «уйдёт после рестарта»."""
+    app = ctx.application
+    deal = deals.load(_deals_base(app)).get(deal_id)
+    if deal is None or deal.get("state") != "accepted":
+        return
+    answer = str(deal.get("answer") or "")
+    # Метка хода: тот же текст следующим свайпом это уже другой ход (ревью 26.10).
+    turn_at = deal.get("answered_at")
+    first = not deal.get("sid")
+    prompt = (_("[Ответ на вопрос «{question}»]: {answer}").format(question=deal.get("question", ""), answer=answer)
+              if deal.get("answering") else answer)
+    if first:
+        prompt = _(DEAL_FIRST_NOTE) + prompt
+    ref = {"id": deal_id, "sid": deal.get("sid"), "head": deals.head(deal),
+           "fork_at": (deal["qsid"], deal["quuid"]) if first else None, "fork_failed": False,
+           "started": False}
+    kind = "fork" if first else "resume" if from_callback else "reply"
+
+    def started() -> None:
+        # Процесс создан, промпт не подан: ошибка записи гасит его (run_claude).
+        if not _deal_update(app, deal_id, lambda d: d.get("answered_at") == turn_at and deals.start(d, answer)):
+            raise RuntimeError(f"deal {deal_id} changed before start")
+        ref["started"] = True
+        log.info("deal turn id=%s kind=%s", deal_id, kind)
+
+    refused: bool | None = None
+    crashed = True
+    try:
+        refused = await _dispatch_to_claude(
+            update, ctx, prompt, send_voice_reply=False, from_callback=from_callback, deal=ref,
+            on_run_start=started, allow_codex_fallback=False, deferred=True)
+        crashed = False
+    finally:
+        # Исход и при исключении или отмене посреди обработки: дело не
+        # остаётся «отвечает» до следующего рестарта (ревью 26.10).
+        if not ref["fork_failed"]:
+            await _deal_settle(app, update, deal_id, turn_at, answer, ref["head"],
+                               waits=not crashed and (refused is True or bool(app.bot_data.get("stopping"))))
+    if ref["fork_failed"]:
+        # Точки вопроса нет (сессию сжали или её файла нет): ответ на вопрос
+        # уходит по-старому, в главный разговор со сверкой эпохи вопроса.
+        _deal_update(app, deal_id, lambda d: d.update(state="closed", error="fork", last_at=time.time()))
+        log.info("deal refused id=%s why=fork", deal_id)
+        if deal.get("answering"):
+            await _dispatch_to_claude(
+                update, ctx, _("[Ответ на вопрос «{question}»]: {answer}").format(
+                    question=deal.get("question", ""), answer=answer),
+                # Запреты дела остаются: без GPT и переноса в /at (ревью 26.10).
+                send_voice_reply=False, from_callback=True, allow_codex_fallback=False,
+                expect_epoch=deal.get("qepoch"),
+                ask_ref={"question": deal.get("question", ""), "answer": answer})
+        else:
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(ref["head"] + "\n" + _(
+                    "⚠️ дело закрыто: его разговор не открылся (сессию сжали или её нет), ответ «{answer}» "
+                    "не выполнен; напиши его в главный разговор").format(answer=answer))
+
+
+async def _deal_settle(app: Any, update: Update, deal_id: str, turn_at: Any, answer: str, head: str, *,
+                       waits: bool) -> None:
+    """Ход кончился без итога в реестре: не начинался (лимит, вход, отказ) или
+    оборвался (исключение, отмена). Ожидание перезапуска оставляет accepted."""
+    def settle(d: dict) -> str | None:
+        if d.get("answered_at") != turn_at:
+            return None
+        if d.get("state") == "accepted":
+            if waits:
+                return "kept"
+            d.update(state="failed", error="not started", last_at=time.time())
+            return "not started"
+        if d.get("state") == "running":
+            d.update(state="failed", error="run aborted", last_at=time.time())
+            return "aborted"
+        return None
+
+    outcome = _deal_update(app, deal_id, settle)
+    if outcome in ("not started", "aborted"):
+        log.info("deal done id=%s ok=0 why=%s", deal_id, outcome.replace(" ", "-"))
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(
+                head + "\n" + (
+                    _("⚠️ ответ «{answer}» не выполнен (лимит, вход или сбой до старта); ответь здесь "
+                      "свайпом, когда будет можно") if outcome == "not started" else
+                    _("⚠️ ход по ответу «{answer}» оборвался, исход неизвестен; если нужно, ответь здесь "
+                      "свайпом")).format(answer=answer))
+
+
+async def on_deal_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка вопроса дела: вариант из реестра на диске, принимается один раз."""
+    cfg: Config = ctx.application.bot_data["cfg"]
+    query = update.callback_query
+    if query is None or not _is_allowed(cfg, update):
+        return
+    parts = (query.data or "").split(":")
+    try:
+        deal_id, n = parts[1], int(parts[2])
+    except (IndexError, ValueError):
+        await _answer_quietly(query, _("Кнопка не разобрана."), show_alert=True)
+        return
+    card = query.message
+    chat_id = getattr(getattr(card, "chat", None), "id", None)
+    mid = getattr(card, "message_id", None)
+    seen: dict = {}
+
+    def take(d: dict) -> bool:
+        opts = d.get("options") or []
+        seen.update(state=d.get("state"), asked_at=float(d.get("asked_at") or 0))
+        if d.get("chat_id") != chat_id or d.get("card_msg") != mid or not 1 <= n <= len(opts):
+            seen["why"] = "card"
+            return False
+        if time.time() - seen["asked_at"] > ASK_TTL_SEC:
+            seen["why"] = "old"
+            return False
+        seen["answer"] = opts[n - 1]
+        if not deals.accept(d, opts[n - 1]):
+            seen["why"] = "taken"
+            return False
+        return True
+
+    if not _deal_update(ctx.application, deal_id, take):
+        why = seen.get("why")
+        log.info("deal refused id=%s why=%s", deal_id, why or "missing")
+        await _answer_quietly(query, {
+            "card": _("Ответ не принят: кнопка не от этого вопроса."),
+            "old": _("Ответ не принят: вопросу больше 12 часов. Если нужно, ответь на него свайпом."),
+            "taken": _("На этот вопрос уже ответили или дело ещё отвечает."),
+        }.get(why or "", _("Ответ не принят: дело не найдено.")), show_alert=True)
+        if why in ("old", "taken", None):
+            with contextlib.suppress(Exception):
+                await query.edit_message_reply_markup(reply_markup=None)
+        return
+    with contextlib.suppress(Exception):
+        await query.answer()
+    with contextlib.suppress(Exception):
+        # Ярлык остаётся первой строкой: свайп на карточку тоже идёт в дело.
+        await query.edit_message_text(f"{card.text}\n\n🗳 → {seen['answer']}")
+    log.info("deal pick id=%s via=button wait=%.0fs", deal_id, time.time() - seen["asked_at"])
+    await _deal_turn(Update(update_id=update.update_id, message=card), ctx, deal_id, from_callback=True)
+
+
+async def _deals_resume(app: Application) -> None:
+    """После рестарта: принятый и не начатый ответ уходит, оборванный ход
+    называется в чате (без повтора: он мог успеть что-то сделать)."""
+    try:
+        with deals.locked(_deals_base(app)) as data:
+            wake, cut = deals.startup(data)
+    except (OSError, ValueError):
+        log.exception("deal registry scan failed")
+        return
+    for d in cut:
+        log.info("deal done id=%s ok=0 why=restart", d["id"])
+        with contextlib.suppress(Exception):
+            await app.bot.send_message(
+                d["chat_id"], deals.head(d) + "\n" + (_(
+                    "⚠️ ответ «{answer}» не выполнен: бот не работал больше суток; если нужно, ответь "
+                    "здесь свайпом") if d.get("error") == "expired" else _(
+                    "⚠️ ответ «{answer}» прерван перезапуском бота, исход неизвестен; если нужно, ответь "
+                    "здесь свайпом")).format(answer=d.get("answer", "")),
+                message_thread_id=d.get("thread_id"))
+    tasks_set: set[asyncio.Task] = app.bot_data.setdefault("deal_tasks", set())
+    for d in wake:
+        ctx = ContextTypes.DEFAULT_TYPE(application=app)
+        task = asyncio.create_task(_deal_turn(_synthetic_update(app.bot, d["chat_id"], d.get("thread_id")),
+                                              ctx, d["id"], from_callback=True))
+        tasks_set.add(task)
+        task.add_done_callback(tasks_set.discard)
 
 
 # ---- Утренняя подборка новостей (skills/news_digest) ----
@@ -1818,6 +2228,8 @@ def _task_exec_finish(cfg: Config, ref: dict, result: ClaudeResult, stopping: bo
     summary = tasks.exec_summary(result.texts or (() if result.is_error else (result.text,)))
     ok = summary is not None and not tasks.exec_failed(summary)
     text = summary or (result.text if result.is_error else _(tasks.EXEC_UNCONFIRMED))
+    # Итог хранится до доставки и может уйти отдельно: метка звука в нём лишняя.
+    text = extract_loud_marker(text)[1]
     try:
         with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
             current = data.get(ref["id"])
@@ -2707,11 +3119,14 @@ async def _send_plan_card(
         ],
     ]
     try:
-        await update.message.reply_text(
+        sent = await update.message.reply_text(
             _("План выше. Выполнять?"), reply_markup=InlineKeyboardMarkup(rows),
         )
     except Exception:
         log.exception("plan card failed")
+        return
+    if isinstance(getattr(sent, "message_id", None), int) and token in pending:
+        pending[token]["msg"] = (sent.chat_id, sent.message_id)
 
 
 async def on_plan_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2719,16 +3134,18 @@ async def on_plan_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
         return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
+    if not _is_allowed(cfg, update):
+        return
+    parts = (query.data or "").split(":")
+    token, decision = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
+    pending: dict[str, dict] = ctx.application.bot_data.setdefault("plan_options", {})
+    if token in pending and not _card_msg_matches(pending[token], query.message):
+        await _answer_quietly(query, _("Решение не принято: кнопка не от этого плана."), show_alert=True)
         return
     try:
         await query.answer()
     except Exception:
         log.debug("callback answer failed (ignored)", exc_info=True)
-    parts = (query.data or "").split(":")
-    token, decision = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
-    pending: dict[str, dict] = ctx.application.bot_data.setdefault("plan_options", {})
     picked = pending.pop(token, None)
     if picked is None:
         try:
@@ -2769,6 +3186,9 @@ async def on_plan_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _dispatch_to_claude(
         upd, ctx, _("План одобрен — выполняй его."), send_voice_reply=False,
         expect_epoch=picked["epoch"], expect_plan=picked.get("plan"),
+        # Это нажатие, а не текст: лимит не переносит его в /at, где пропали
+        # бы сверки эпохи и поколения плана (ревью Codex 26.10.2026).
+        from_callback=True,
     )
 
 
@@ -3426,9 +3846,11 @@ async def _at_fire_running(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
         store.remove(data["jid"])
         return
     token = _SILENT_RUN.set(bool(data.get("silent")))
+    deal_token = _DEAL_ASKS.set(data.get("deal_asks") is True)
     try:
         await _at_fire_dispatch(ctx, data, store, prompt)
     finally:
+        _DEAL_ASKS.reset(deal_token)
         _SILENT_RUN.reset(token)
 
 
@@ -3451,7 +3873,8 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
     rejected = False
     try:
         expires_at = data.get("expires_at")
-        ref = {k: data[k] for k in ("event_id", "expires_at", "silent") if data.get(k) is not None} or None
+        ref = {k: data[k] for k in ("event_id", "expires_at", "silent", "deal_asks")
+               if data.get(k) is not None} or None
         rejected = bool(await _dispatch_to_claude(
             update, ctx, prompt, send_voice_reply=False, unattended=True,
             on_run_start=lambda: store.remove(data["jid"]), deferred=True,
@@ -3546,6 +3969,9 @@ def _current_sid(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> str | None:
     """session_id темы: активный ран приоритетнее последней завершённой сессии."""
     active: dict[str, str] = ctx.application.bot_data.get("active_sessions") or {}
     store: SessionStore = ctx.application.bot_data["sessions"]
+    if ctx.application.bot_data.get("foreign_running", {}).get(chat_key):
+        # Идёт ран сторожа в своей сессии: /export и /handback про сессию темы.
+        return store.get(chat_key)
     return active.get(chat_key) or store.get(chat_key)
 
 
@@ -4318,11 +4744,19 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     registry: ApprovalRegistry = ctx.application.bot_data["registry"]
     chat_key, _unused, _unused = _chat_key(update)
     # Приоритет у live active sid — для fresh session store пуст до JSON-ответа.
-    sid = active_sessions.get(chat_key) or store.get(chat_key)
+    # Во время рана сторожа (своя сессия) здесь сессия темы (_current_sid).
+    sid = _current_sid(ctx, chat_key)
     proc = procs.get(chat_key)
     proc_line = "idle"
     if proc is not None and proc.returncode is None:
         proc_line = f"running pid={proc.pid}"
+        side = ctx.application.bot_data.get("foreign_running", {}).get(chat_key)
+        if isinstance(side, str) and side.startswith("deal:"):
+            proc_line += _(" · ход дела {deal} в его сессии {sid}").format(
+                deal=side[5:], sid=(active_sessions.get(chat_key) or "")[:8])
+        elif side:
+            proc_line += _(" · ран по чужому тексту в своей сессии {sid}").format(
+                sid=(active_sessions.get(chat_key) or "")[:8])
     uptime = int(time.time() - started)
     pending_count = registry.pending_count
     openai_ok = ctx.application.bot_data.get("openai") is not None
@@ -5104,10 +5538,17 @@ async def _dispatch_to_claude(
         return True
     app.bot_data["active_work"] = app.bot_data.get("active_work", 0) + 1
     think_marks: list[tuple[str, int]] = []
+    warm_after: list[str] = []
     try:
         return await _dispatch_to_claude_impl(update, ctx, prompt_text, admitted=admitted,
-                                              think_marks=think_marks, **kwargs)
+                                              think_marks=think_marks, warm_after=warm_after, **kwargs)
     finally:
+        for warm_key in warm_after:
+            # После рана по чужому тексту этого вызова, замок темы уже отпущен:
+            # пинг не упрётся в него (ревью Codex 26.10.2026).
+            if warm_key in app.bot_data.get("warm", {}):
+                with contextlib.suppress(Exception):
+                    _warm_schedule(app, warm_key)
         # Отметка «обдумывание идёт» снимается, когда обработка кончилась вся,
         # с отправкой ответа; осталась только после аварии бота (ревью Codex 19.10).
         for tid, rev in think_marks:
@@ -5206,6 +5647,7 @@ async def _dispatch_to_claude_impl(
     reply_sink: list | None = None,
     reply_sent: list | None = None,
     think_marks: list | None = None,
+    warm_after: list | None = None,
     admitted: bool = False,
     deferred: bool = False,
     allow_codex_fallback: bool = True,
@@ -5214,6 +5656,8 @@ async def _dispatch_to_claude_impl(
     limit_retry: int = 0,
     still_wanted: Callable[[], bool] | None = None,
     event_ref: dict | None = None,
+    ask_ref: dict | None = None,
+    deal: dict | None = None,
 ) -> bool | None:
     """unattended=True — запуск без человека за клавиатурой (/at, /event, /plan-режим):
     ручной триггер «gpt:» игнорируется (Codex не проходит через approve-hook и
@@ -5245,7 +5689,15 @@ async def _dispatch_to_claude_impl(
     still_wanted: зовётся под замком темы до проверки лимита; False значит
     дело уже сделано, пока запрос ждал замка, ран не уходит (разбор 22.10).
     event_ref: пробуждение с диска (events.py); при переносе лимитом в /at
-    задание получает его id, срок и тишину."""
+    задание получает его id, срок и тишину.
+    ask_ref: вариант кнопки вопроса (on_ask_pick); отказ по смене сессии
+    называет вопрос и ответ.
+    warm_after: сюда ключ чата после рана по чужому тексту; прогрев темы
+    _dispatch_to_claude назначает, когда замок уже отпущен.
+    deal: ход дела (опыт В1, _deal_turn): id, sid дела или точка вопроса
+    fork_at, ярлык head. Ран идёт в сессии дела (deal_sessions), как ран по
+    чужому тексту в своей: сессию темы не трогает; без GPT и переноса в /at;
+    ответ текстом с ярлыком на каждом куске. Сюда же fork_failed."""
     cfg: Config = ctx.application.bot_data["cfg"]
     store: SessionStore = ctx.application.bot_data["sessions"]
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
@@ -5272,6 +5724,8 @@ async def _dispatch_to_claude_impl(
     forced_codex = (
         not unattended
         and not from_callback
+        # В деле «gpt:» остаётся текстом: ход дела идёт только в его сессии.
+        and deal is None
         and bool(cfg.codex_bin)
         and prompt_text.lstrip().lower().startswith(prefix.lower())
     )
@@ -5316,17 +5770,25 @@ async def _dispatch_to_claude_impl(
             log.info("request skipped under lock: no longer wanted chat=%s", chat_key)
             return
         task = _task_for(cfg, chat_id, thread_id, ctx)
+        if expect_epoch is not None and _session_will_change(ctx, cfg, chat_key, expect_epoch):
+            # Кнопка сменившейся сессии отвергается до лимита и до любых
+            # изменений: отказ называет вопрос, а не лимит (проект шага 1, 2.2).
+            # Поздняя сверка ниже остаётся: /reset force эпоху меняет без замка.
+            await msg.reply_text(_ask_pick_refusal(ask_ref) if ask_ref is not None else
+                                 _("⚠️ сессия темы сменилась, ответ в новую сессию не отправлен"))
+            return
         try:
             held = not forced_codex and await _limit_hold(
                 ctx, cfg, msg, chat_key, chat_id, thread_id, prompt_text,
                 unattended=unattended, untrusted=untrusted,
-                movable=_limit_movable(task, exec_task, from_callback, permission_mode),
+                movable=_limit_movable(task, exec_task, from_callback, permission_mode) and deal is None,
                 limit_retry=limit_retry, event_ref=event_ref)
         except Exception:
             # Учёт лимита вспомогательный: его сбой не останавливает сообщение.
             log.exception("limit: reserve check failed chat=%s", chat_key)
             held = False
         if held:
+            await _dropped_plan_note(msg, ask_ref)
             return
         if task is not None and task.get("status") not in tasks.OPEN_STATUSES:
             # Запрос ждал замка, а задачу тем временем закрыли (ревью Codex 13.10).
@@ -5339,13 +5801,23 @@ async def _dispatch_to_claude_impl(
             # уходит и сессию обдумывания не сбрасывает (ревью Codex 14.10).
             log.info("task exec %s skipped: task is %s", exec_task["id"], task.get("status") if task else None)
             return
+        login_manager = ctx.application.bot_data.get("login_manager")
+        if login_manager is not None and login_manager.session is not None:
+            # До хода в теме задачи: отказ не снимает проект (проект шага 1, 2.2).
+            await msg.reply_text(_("Идёт восстановление входа. Повтори запрос после его завершения."))
+            await _dropped_plan_note(msg, ask_ref)
+            return
         if task is not None and exec_task is None:
             # В теме задачи всё, кроме выполнения одобренного проекта, идёт
             # обдумыванием, то есть только чтением: до одобрения там бывает
             # чужой текст источника (ревью Codex 13.10), а после выполнения
             # новая просьба снова требует «Делай» (переделка 16.10.2026).
             permission_mode, forced_codex = "plan", False
-            if task.get("id") and not background:
+            if expect_epoch is not None and _session_epoch(ctx, chat_key) != expect_epoch:
+                # Кнопка прежней сессии: отказ ниже, проект и очередь задачи
+                # не трогаются (ревью /2mind 25.10.2026).
+                pass
+            elif task.get("id") and not background:
                 # Ход Ивана (сообщение, команда, /plan, кнопка вопроса, первое
                 # обдумывание): прежний проект, очередь и не начатое одобрение
                 # снимаются; ответ может стать проектом под «Делай», если Иван
@@ -5360,12 +5832,12 @@ async def _dispatch_to_claude_impl(
             # нет. Всегда только чтение и без fresh: сессия задачи не
             # обрывается чужим запросом (проект шага 3, 1.8).
             permission_mode, forced_codex, fresh = "plan", False, False
-        login_manager = ctx.application.bot_data.get("login_manager")
-        if login_manager is not None and login_manager.session is not None:
-            await msg.reply_text(_("Идёт восстановление входа. Повтори запрос после его завершения."))
-            return
         agent_context = _persona_for(ctx, cfg, chat_key)
         memory_scope_hint = _memory_scope_hint(ctx, cfg, chat_key)
+        # Эпоха сессии, которую продолжит ран: для карточки вопроса из его
+        # ответа. Под замком и до рана: /reset force посреди рана (эпоха без
+        # замка) иначе дал бы вопросу эпоху новой сессии (проект шага 1, 2.3).
+        run_epoch = _session_epoch(ctx, chat_key)
         model_note = ""
         codex_fallback = False
         claude_texts: tuple[str, ...] = ()
@@ -5387,7 +5859,28 @@ async def _dispatch_to_claude_impl(
             # Idle-TTL: если в теме давно не писали — стартуем свежую сессию вместо
             # --resume (не тащим всю историю в холодный prompt-cache). Скоуп проекта
             # при этом сохраняется — он привязан к имени темы, не к session_id.
-            if fresh() if callable(fresh) else fresh:
+            # Ран по чужому тексту (сторож, слушатель) идёт в своей сессии,
+            # каждый раз свежей: в переписку темы чужой текст не попадает, и
+            # сессию темы, её эпоху и модель он не трогает (проект шага 1, 2.5).
+            foreign: SessionStore | None = ctx.application.bot_data.get("foreign_sessions") if untrusted else None
+            # Ход дела тоже не в сессии темы: своя сессия дела (опыт В1).
+            deal_store: SessionStore | None = (ctx.application.bot_data.get("deal_sessions")
+                                               if deal is not None and not untrusted else None)
+            if deal is not None and deal_store is None:
+                log.error("deal %s: no deal_sessions store, turn refused", deal.get("id"))
+                await msg.reply_text(_("⚠️ дело не запущено: нет хранилища сессий дел, смотри журнал бота"))
+                return
+            side = foreign if foreign is not None else deal_store
+            run_store = side if side is not None else store
+            if foreign is not None:
+                foreign.remove(chat_key)
+            if deal_store is not None:
+                # Сессия именно этого дела; остаток другого затирается.
+                if deal.get("sid"):
+                    deal_store.set(chat_key, deal["sid"])
+                else:
+                    deal_store.remove(chat_key)
+            if side is None and (fresh() if callable(fresh) else fresh):
                 # Свежая сессия по просьбе отправителя события (/event fresh):
                 # строго внутри замка чата, иначе параллельный ран вернул бы
                 # старый session_id через store.set() и утро продолжило бы
@@ -5402,7 +5895,7 @@ async def _dispatch_to_claude_impl(
                 # фонового рана) не продолжает сессию, где был чужой текст.
                 # Сообщения человека и plan-раны (там карточки) продолжают.
                 _drop_untrusted_session(ctx, store, chat_key)
-            if cfg.session_idle_ttl_sec > 0 and store.get(chat_key):
+            if side is None and cfg.session_idle_ttl_sec > 0 and store.get(chat_key):
                 last = store.last_used(chat_key)
                 if last > 0 and (time.time() - last) > cfg.session_idle_ttl_sec:
                     ended_model = ctx.application.bot_data.get("model_by_session", {}).get(chat_key, "")
@@ -5420,19 +5913,21 @@ async def _dispatch_to_claude_impl(
             # переименования (занятый чат, рестарт): эпоха поднимается здесь,
             # чтобы кнопки старой сессии не ответили в новую (ревью 12.10.2026).
             fps: SessionStore | None = ctx.application.bot_data.get("scope_fingerprints")
-            if fps is not None and store.get(chat_key) and (fps.get(chat_key) or "") != memory_scope_hint:
+            if (side is None and fps is not None and store.get(chat_key)
+                    and (fps.get(chat_key) or "") != memory_scope_hint):
                 _bump_session_epoch(ctx, chat_key)
             if expect_epoch is not None and _session_epoch(ctx, chat_key) != expect_epoch:
                 # Ответ кнопкой сочинён под прежнюю сессию, а она сменилась,
                 # пока он ждал замка темы (ревью 12.10.2026).
-                await msg.reply_text(_("⚠️ сессия темы сменилась, ответ в новую сессию не отправлен"))
+                await msg.reply_text(_ask_pick_refusal(ask_ref) if ask_ref is not None else
+                                     _("⚠️ сессия темы сменилась, ответ в новую сессию не отправлен"))
                 return
             if expect_plan is not None and _plan_generation(ctx, chat_key) != expect_plan:
                 # Пока кнопка ждала замка, в теме начался новый /plan: одобрение
                 # старого плана выполнило бы новый (ревью 11.10.2026).
                 await msg.reply_text(_("⚠️ в теме начат новый /plan, решение по прежнему плану не отправлено"))
                 return
-            if permission_mode == "plan":
+            if permission_mode == "plan" and side is None:
                 # Новый план гасит карточки прежних (ревью 11.10.2026).
                 _bump_plan_generation(ctx, chat_key)
 
@@ -5464,12 +5959,14 @@ async def _dispatch_to_claude_impl(
                     exec_run_sids.append(sid)
                 _note_session_scope(ctx, sid, memory_scope_hint)
 
-            _activate_pending_model(ctx, chat_key)
+            if side is None:
+                # Выбор модели «до конца сессии» относится к сессии темы.
+                _activate_pending_model(ctx, chat_key)
             # Параметры этого рана для прогрева: пинг идёт, только пока они те
             # же (смена модели, effort или скоупа переписала бы кэш).
             warm_sig = (_warm_signature(ctx, cfg, chat_key)
                         if chat_key in getattr(cfg, "warm_chats", frozenset()) else ())
-            if permission_mode == "plan":
+            if permission_mode == "plan" and side is None:
                 # Ран plan идёт с другим набором инструментов, но продолжает
                 # сессию: прежняя отметка устарела. Снять до рана, чтобы и
                 # исключение посреди него её не оставило (ревью Codex 19.10).
@@ -5494,6 +5991,33 @@ async def _dispatch_to_claude_impl(
                 with contextlib.suppress(OSError, ValueError):
                     if _task_update(cfg, task["id"], think_open=think_rev) is not None and think_marks is not None:
                         think_marks.append((task["id"], think_rev))
+            run_epoch = _session_epoch(ctx, chat_key)  # после сбросов выше
+            foreign_running: dict[str, Any] = ctx.application.bot_data.setdefault("foreign_running", {})
+            if side is not None:
+                # До процесса: «!»-поправка узнаёт по метке, что убивает ран
+                # сторожа или дела, и его sid в сессию темы не кладёт (проект
+                # шага 1, 2.5). Значение для /status: чей это ран.
+                foreign_running[chat_key] = f"deal:{deal['id']}" if deal_store is not None else True
+            run_start_cb = on_run_start
+            notes_taken: list[tuple[str, float, str]] = []
+            if (side is None and not unattended and permission_mode != "plan" and task is None
+                    and getattr(cfg, "state_dir", None) is not None and deals.deals_dir(cfg.state_dir).is_dir()):
+                # Итоги дел утреннего плана: только в человеческий ход главной
+                # сессии; снимаются стартом этого рана, отказ до старта их не
+                # теряет (проект В1, 2.7).
+                notes_taken = deals.pending_notes(deals.load(deals.deals_dir(cfg.state_dir)), chat_id, thread_id)
+                if notes_taken:
+                    # В ограждении: имя заказчика в итоге дела иначе закрепило бы
+                    # память свежей сессии за ним (роутер Свода ограждённое не считает).
+                    prompt_text = _("[Тем временем в делах утреннего плана:\n{lines}\n]\n\n").format(
+                        lines=tasks.fence("\n".join(f"- {t}" for _d, _a, t in notes_taken))) + prompt_text
+
+                    def run_start_cb() -> None:
+                        if on_run_start is not None:
+                            on_run_start()
+                        with contextlib.suppress(OSError, ValueError):
+                            with deals.locked(deals.deals_dir(cfg.state_dir)) as data:
+                                deals.drop_notes(data, notes_taken)
             try:
                 result = await run_claude(
                     cfg.claude_bin,
@@ -5501,7 +6025,7 @@ async def _dispatch_to_claude_impl(
                     chat_id,
                     thread_id,
                     prompt_text,
-                    store,
+                    run_store,
                     cwd=cfg.claude_cwd,
                     hook_settings=cfg.hook_settings_path,
                     persona=agent_context,
@@ -5516,7 +6040,7 @@ async def _dispatch_to_claude_impl(
                     process_registry=procs,
                     session_registry=active_sessions,
                     session_targets=session_targets,
-                    scope_store=ctx.application.bot_data.get("scope_fingerprints"),
+                    scope_store=None if side is not None else ctx.application.bot_data.get("scope_fingerprints"),
                     cost_totals=ctx.application.bot_data.get("cost_totals"),
                     autocompact=_autocompact_for(cfg, chat_key),
                     progress_cb=status.on_tool,
@@ -5533,9 +6057,12 @@ async def _dispatch_to_claude_impl(
                     ),
                     show_chat_key=str(cfg.primary_chat_id) if _is_workshop(cfg, chat_key) else "",
                     on_session_start=_session_started,
-                    on_run_start=on_run_start,
+                    on_run_start=run_start_cb,
                     should_stop=lambda: bool(ctx.application.bot_data.get("stopping")),
                     unexited=unexited,
+                    fork_at=deal.get("fork_at") if deal is not None else None,
+                    fresh_retry=deal is None,
+                    deal_id=deal["id"] if deal is not None else "",
                 )
             except Exception:
                 log.exception("claude run failed")
@@ -5546,6 +6073,15 @@ async def _dispatch_to_claude_impl(
                 await msg.reply_text(_("⚠️ внутренняя ошибка — смотри логи бота"))
                 return
             finally:
+                if side is not None:
+                    # Первым делом: отмена на await ниже не оставит метку навсегда.
+                    foreign_running.pop(chat_key, None)
+                    # Прогрев темы, отложенный занятым замком, сам не продолжится:
+                    # этот ран отметку не двигает. Назначает его _dispatch_to_claude,
+                    # когда замок уже свободен, и при исключении рана тоже (проект
+                    # шага 1, 2.5; ревью Codex 26.10.2026).
+                    if warm_after is not None:
+                        warm_after.append(chat_key)
                 # Под замком темы: следующий ран этого чата не начался, его
                 # попытки отправки откликов мертвы (ревью Codex 22.10.2026).
                 # До finish: отмена на его await не пропустит закрытие.
@@ -5560,8 +6096,19 @@ async def _dispatch_to_claude_impl(
                     ctx.application.bot_data.setdefault("task_exec_sids", set()).discard(run_sid)
                 if untrusted:
                     # Чужой текст теперь в истории этой сессии.
-                    _mark_untrusted_session(ctx, chat_key, store.get(chat_key))
-            if permission_mode != "plan":
+                    _mark_untrusted_session(ctx, chat_key, run_store.get(chat_key))
+            if deal is not None:
+                # Сессия дела в его запись ещё под замком темы: следующий ран
+                # этого чата deal_sessions уже перепишет (проект В1, 2.5).
+                deal_sid = deal_store.get(chat_key)
+                if deal_sid:
+                    deal["sid"] = deal_sid
+                    _deal_update(ctx.application, deal["id"], lambda d: d.update(sid=deal_sid))
+                if result.fork_failed:
+                    # Точки вопроса нет: ответ уйдёт по-старому (_deal_turn).
+                    deal["fork_failed"] = True
+                    return
+            if side is None and permission_mode != "plan":
                 _warm_after_run(ctx, cfg, chat_key, result, warm_sig)
             # Расход задачи сразу после рана, до запасного пути через GPT: его
             # ответ заменит результат, и сумма Claude пропала бы (проект шага 3, 1.6).
@@ -5582,7 +6129,7 @@ async def _dispatch_to_claude_impl(
                 result, codex_fallback, claude_texts = await _limit_handle(
                     ctx, cfg, result, chat_key, chat_id, thread_id, prompt_text,
                     unattended=unattended, untrusted=untrusted, limit_retry=limit_retry,
-                    movable=_limit_movable(task, exec_task, from_callback, permission_mode),
+                    movable=_limit_movable(task, exec_task, from_callback, permission_mode) and deal is None,
                     agent_context=agent_context, procs=procs, unexited=unexited, event_ref=event_ref)
             # Авто-фоллбэк: claude недоступен (401/429/5xx) — отвечаем через codex.
             elif (
@@ -5619,14 +6166,18 @@ async def _dispatch_to_claude_impl(
                         cfg, prompt_text,
                         header=_("⚠️ claude недоступен ({reason}) → ответ через GPT (codex)").format(reason=reason),
                         agent_context=agent_context,
-                        # План только читает и у GPT (ревью Codex 13.10).
-                        sandbox="read-only" if permission_mode == "plan" else cfg.codex_fallback_sandbox,
+                        # План только читает и у GPT (ревью Codex 13.10). Песочница
+                        # из настройки только у текста Ивана: фон и кнопки (вопрос,
+                        # план, отклик) всегда на чтение (проект шага 1, 2.1).
+                        sandbox=(cfg.codex_fallback_sandbox
+                                 if permission_mode != "plan" and not unattended and not from_callback
+                                 and expect_epoch is None and expect_plan is None else "read-only"),
                         chat_key=chat_key, process_registry=procs,
                         should_stop=lambda: bool(ctx.application.bot_data.get("stopping")),
                         unexited=unexited)
                     codex_fallback = True
             elif (result.is_error and not allow_codex_fallback and _is_claude_unavailable(result)
-                  and not ctx.application.bot_data.get("stopping")):
+                  and deal is None and not ctx.application.bot_data.get("stopping")):
                 # Одобренный план в GPT не уходит: там нет карточек, а песочница
                 # с записью (проект шага 3, 1.8). Выполнение стоит, Иван решает сам.
                 # Прежняя ✅ уже не действует: в тексте путь повтора (ревью 14.10).
@@ -5653,12 +6204,16 @@ async def _dispatch_to_claude_impl(
         # Ран оборвала остановка бота (SIGTERM от stop() или systemd), а не
         # /cancel: «отменено (signal -15)» сбивало с толку (ревью 12.10.2026).
         reply = _("♻️ Бот перезапускается, ран прерван. Повтори запрос после рестарта.")
+        if deal is not None and not deal.get("started"):
+            # Ход дела не начался: ответ остаётся принятым и уйдёт сам (_deals_resume).
+            reply = _("♻️ Бот перезапускается: ответ уйдёт в дело после рестарта.")
         if exec_task is not None:
             # Прежнее одобрение уже не действует: путь повтора, как при
             # недоступном claude (ревью 14.10).
             reply = _("♻️ Бот перезапускается, выполнение прервано. Проверь, что успело сделаться; "
                       "повторить: напиши здесь, что дальше, и «делай» под новым проектом")
-    if result.session_lost:
+    if result.session_lost and not untrusted and deal is None:
+        # Ран по чужому тексту и так каждый раз свежий: сессию темы он не терял.
         await msg.reply_text(_("⚠️ не удалось закрепить session_id — следующее сообщение начнёт новый разговор."))
 
     # Маркер проекта решения в теме задачи (tasks.extract_do): Иван его не
@@ -5674,7 +6229,7 @@ async def _dispatch_to_claude_impl(
         earlier = list(texts)
         if not codex_fallback and earlier[-1] == result.text:
             earlier.pop()
-        earlier = [extract_ask_marker(tasks.extract_do(t)[1])[1] for t in earlier]
+        earlier = [extract_loud_marker(extract_ask_marker(tasks.extract_do(t)[1])[1])[1] for t in earlier]
         reply = tasks.run_reply(earlier + [reply], reply)
     if think_rev is not None:
         do_skill, reply = tasks.extract_do(reply)
@@ -5693,6 +6248,7 @@ async def _dispatch_to_claude_impl(
     )
     # ASK-маркер: вопрос с вариантами уедет кнопками после основного ответа.
     ask, reply = extract_ask_marker(reply)
+    loud, reply = extract_loud_marker(reply)
     # Тире на дефис здесь, а не хуком: строка «Исправлено» хука подменяла
     # ответ, ведь в чат уходит только последний текст рана (решение 22.10.2026).
     reply = soften_dashes(reply)
@@ -5700,14 +6256,22 @@ async def _dispatch_to_claude_impl(
         ask = (soften_dashes(ask[0]), [soften_dashes(o) for o in ask[1]])
     workshop = _is_workshop(cfg, chat_key)
     ws_question = ""
-    if workshop and ask is not None:
+    if (workshop or untrusted) and ask is not None:
         # Тема мастерской заглушена, кнопки там никто не увидит: вопрос текстом
         # в ответ, ответ пересылается в личку (проект Домового 22.10.2026).
+        # Ран по чужому тексту тоже без кнопок: его свежая сессия только
+        # читает, отвечать на вопрос Иван будет Домовому (проект шага 1, 2.5).
         ws_question = _("Вопрос: {question} ({options})").format(question=ask[0], options="; ".join(ask[1]))
         reply = (reply.rstrip() + "\n\n" + ws_question).strip()
         ask = None
+    deal_card: dict | None = None
+    if deal is not None:
+        # Итог хода дела на диск до отправки: сбой Telegram ход не повторит.
+        # Новый вопрос внутри дела остаётся в деле (проект В1, 2.5).
+        deal_card = _deal_finish(ctx.application, deal, result, reply, ask)
+        ask = None
     ask_held = ask is not None and _ask_waiting(ctx, chat_key, ask, permission_mode=permission_mode,
-                                                untrusted=untrusted)
+                                                untrusted=untrusted, epoch=run_epoch)
     if ask_held:
         log.info("ask repeat skipped chat=%s", chat_key)
         reply = (reply.rstrip() + "\n\n" + _("❓ Вопрос с кнопками выше ещё ждёт ответа.")).strip()
@@ -5734,13 +6298,25 @@ async def _dispatch_to_claude_impl(
         await _workshop_forward(ctx, cfg, chat_key, thread_id,
                                 reply[:-len(ws_question)] if ws_question else reply, result.is_error, ws_question)
     voiced = False
-    if send_voice_reply and openai_client is not None and reply.strip():
-        voiced = await _send_voice_series(cfg, ctx, update, chat_id, openai_client, reply)
-        if voiced and hang_text:
-            # Срочное текстом после голосовой серии, последним сообщением.
-            await send_reply_text(cfg, update, hang_text)
-    if not voiced:
-        await send_reply_text(cfg, update, full_reply)
+    # Метка звука: в тихом ране со звуком только сам ответ, файлы, футер и
+    # кнопки остаются тихими (replies.extract_loud_marker).
+    loud_token = _SILENT_RUN.set(False) if loud and _SILENT_RUN.get() else None
+    if loud_token is not None:
+        log.info("loud reply in silent run chat=%s", chat_key)
+    try:
+        if send_voice_reply and openai_client is not None and reply.strip():
+            voiced = await _send_voice_series(cfg, ctx, update, chat_id, openai_client, reply)
+            if voiced and hang_text:
+                # Срочное текстом после голосовой серии, последним сообщением.
+                await send_reply_text(cfg, update, hang_text)
+        if deal is not None:
+            # Ярлык на каждом куске: свайп на любой из них продолжает дело.
+            await send_text_to(cfg, msg, full_reply, head=deal["head"])
+        elif not voiced:
+            await send_reply_text(cfg, update, full_reply)
+    finally:
+        if loud_token is not None:
+            _SILENT_RUN.reset(loud_token)
     if hang_text:
         log.info("hangs appended chat=%s n=%d", chat_key, hang_text.count("\n") + 1)
     if reply_sent is not None:
@@ -5755,10 +6331,19 @@ async def _dispatch_to_claude_impl(
         await _task_cost_seen(ctx, *task_cost)
     if do_skill is not None and reply.strip():
         await _task_thought(ctx, update, task, think_rev, reply, do_skill)
+    if deal_card is not None:
+        await _send_deal_card(ctx, msg, deal_card)
+    if (ask is not None and _DEAL_ASKS.get() and not untrusted and permission_mode == "bypassPermissions"
+            and task is None and not codex_fallback and not result.is_error
+            and result.session_id and result.last_uuid
+            and await _deal_open(ctx, msg, chat_id, thread_id, ask, qsid=result.session_id,
+                                 quuid=result.last_uuid, qepoch=run_epoch)):
+        # Вопрос утреннего плана стал делом (проект В1, 2.1).
+        ask = None
     if ask is not None:
         await _send_ask_card(
             ctx, update, chat_key, ask,
-            permission_mode=permission_mode, unattended=unattended, untrusted=untrusted,
+            permission_mode=permission_mode, untrusted=untrusted, epoch=run_epoch,
         )
     elif permission_mode == "plan" and not result.is_error and reply.strip() and not ask_held:
         if _task_for(cfg, chat_id, thread_id, ctx) is not None:
@@ -5999,6 +6584,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # обсуждения темы, где его написали (проект шага 3, 1.4).
         await _task_command(update, ctx, (msg.text or "").strip())
         return
+    deal_id = _deal_reply_target(ctx, msg)
+    if deal_id is not None and await _deal_swipe(update, ctx, deal_id, msg.text or ""):
+        # Свайп на сообщение дела: ход дела до «!», склейки и /compose, с
+        # главным разговором не склеивается (проект В1, 2.6).
+        return
     if await _task_touch(ctx, update, msg.text):
         # «Делай» под проектом в теме задачи: одобрение, в Claude не идёт.
         return
@@ -6034,6 +6624,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             store_: SessionStore = ctx.application.bot_data["sessions"]
             sid = active_sessions.get(chat_key)
             epoch_at_start = _session_epoch(ctx, chat_key)
+            # Ран по чужому тексту в своей сессии: его sid в сессию темы не
+            # кладётся. Метка читается до ожидания: потом её уже снимет
+            # конец рана (проект шага 1, 2.5).
+            foreign_kill = bool(ctx.application.bot_data.get("foreign_running", {}).get(chat_key))
             queued = _queued_count(ctx, chat_key)
             note = _("⏹ прерываю текущий ран, поправка уйдёт следом…")
             if queued:
@@ -6045,6 +6639,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             # молча откатится). Эпоха ловит это, per-chat lock — нет.
             if (
                 sid
+                and not foreign_kill
                 and not store_.get(chat_key)
                 and _session_epoch(ctx, chat_key) == epoch_at_start
             ):
@@ -6595,8 +7190,10 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Слот в compose-буфере занимаем ДО скачивания и STT: иначе /go, нажатый
     # за эти секунды, уехал бы без этого голосового.
     chat_key, _unused, _unused = _chat_key(update)
-    slot = None if ask else _compose_reserve(ctx, chat_key)
-    gslot = None if ask else _gather_reserve(update, ctx, chat_key)  # см. on_photo
+    # Голосовое свайпом на сообщение дела идёт в дело, мимо склейки (проект В1, 2.6).
+    deal_id = None if ask else _deal_reply_target(ctx, msg)
+    slot = None if ask or deal_id else _compose_reserve(ctx, chat_key)
+    gslot = None if ask or deal_id else _gather_reserve(update, ctx, chat_key)  # см. on_photo
     # Индикатор после резерва: пока он ждал сеть, следующий текст или /go
     # занимали место первыми и переворачивали порядок (ревью 12.10.2026).
     try:
@@ -6661,6 +7258,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("voice transcript echo failed")
     if ask:
         await _task_command(update, ctx, heard)
+        return
+    if deal_id is not None and await _deal_swipe(update, ctx, deal_id, heard):
         return
     if await _task_touch(ctx, update, heard, seen_sha=seen_sha):
         _compose_release(ctx, chat_key, slot)
@@ -6899,9 +7498,13 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
     async def _event_wake(
         chat_id: int, thread_id: int | None, prompt: str, fresh: bool = False,
         untrusted: bool = False, silent: bool = False, event_id: str | None = None,
+        deal_asks: bool = False,
     ) -> None:
         if untrusted:
-            prompt = _(UNTRUSTED_PROMPT_NOTE) + prompt
+            # Текст события в ограждении: ран идёт свежей своей сессией, и её
+            # первое сообщение иначе закрепило бы память за заказчиком из
+            # чужого письма (ограждённое роутер Свода не считает).
+            prompt = _(UNTRUSTED_PROMPT_NOTE) + tasks.fence(prompt)
         store = events.event_dir(cfg.state_dir)
         seen = {"started": False, "expired": False}
 
@@ -6923,6 +7526,7 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
         # handle_event запускает пробуждение отдельной задачей, флаг живёт в её
         # копии контекста; reset нужен, только если позвать без своей задачи.
         token = _SILENT_RUN.set(silent)
+        deal_token = _DEAL_ASKS.set(deal_asks and not untrusted)
         outcome = None
         try:
             update = _synthetic_update(app.bot, chat_id, thread_id)
@@ -6933,7 +7537,7 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
                 untrusted=untrusted, admitted=True,
                 on_run_start=run_started if event_id else None,
                 still_wanted=still_live if event_id else None, deferred=event_id is not None,
-                event_ref=_event_ref(store, event_id, silent),
+                event_ref=_event_ref(store, event_id, silent, deal_asks),
             )
             # Отказ остановкой до старта: файл остаётся принятым, после
             # рестарта пробуждение уйдёт само. Иначе событие отработано, в
@@ -6947,6 +7551,7 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
             log.exception("event wake failed chat=%s", chat_id)
             outcome = "error"
         finally:
+            _DEAL_ASKS.reset(deal_token)
             _SILENT_RUN.reset(token)
         if event_id and outcome:
             if outcome == "expired":
@@ -6977,14 +7582,16 @@ def _event_mark(store: Path, event_id: str | None, **fields: Any) -> bool:
         return False
 
 
-def _event_ref(store: Path, event_id: str | None, silent: bool) -> dict | None:
+def _event_ref(store: Path, event_id: str | None, silent: bool, deal_asks: bool = False) -> dict | None:
     """Что событие передаёт отложенному запуску при лимите: сам id (после
     рестарта событие с заданием /at не будится второй раз), срок и тишину
     (ревью Codex 22.10.2026)."""
     if not event_id:
         return None
     rec = events.load(store, event_id)
-    return {"event_id": event_id, "expires_at": rec.get("expires_at") if rec else None, "silent": silent}
+    # deal_asks только истиной: задание /at без поля шлёт обычные карточки.
+    return {"event_id": event_id, "expires_at": rec.get("expires_at") if rec else None, "silent": silent,
+            "deal_asks": True if deal_asks else None}
 
 
 def _event_show_target(app: Application, rec: dict) -> tuple[int, int | None, str]:
@@ -7063,7 +7670,8 @@ async def _events_resume(app: Application) -> None:
                 app.bot_data["admitted_events"] = app.bot_data.get("admitted_events", 0) + 1
                 task = asyncio.create_task(wake_fn(
                     rec["chat_id"], rec.get("thread_id"), note + str(rec.get("prompt") or ""),
-                    fresh, untrusted=untrusted, silent=silent, event_id=eid))
+                    fresh, untrusted=untrusted, silent=silent, event_id=eid,
+                    deal_asks=rec.get("deal_asks") is True))
                 tasks_set.add(task)
                 task.add_done_callback(tasks_set.discard)
 
@@ -7202,6 +7810,11 @@ async def _on_post_init(app: Application) -> None:
         await _events_resume(app)
     except Exception:
         log.exception("event resume failed")
+    # Принятые и не начатые ответы дел уходят, оборванные называются (проект В1, 2.8).
+    try:
+        await _deals_resume(app)
+    except Exception:
+        log.exception("deal resume failed")
 
 
 def _parse_chat_key(chat_key: str) -> tuple[int, int | None]:
@@ -7615,6 +8228,9 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # чат не шлёт: ранние ветки handle_approve (untrusted, автоаппрув чата,
 # _unattended_auto_allowed) отвечают раньше карточки и уведомлений.
 _SILENT_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar("silent_run", default=False)
+# Ран пробуждения с флагом "asks": "deal" (утро Домового): его вопросы
+# становятся делами (опыт В1, docs/design-2026-10-26-v1.md).
+_DEAL_ASKS: contextvars.ContextVar[bool] = contextvars.ContextVar("deal_asks", default=False)
 
 
 class _SilentAwareBot(ExtBot):
@@ -7653,6 +8269,11 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(MessageHandler(filters.ALL, on_auth_update), group=-10)
     app.add_handler(CallbackQueryHandler(on_login_callback, pattern=r"^login:(claude|codex)$"))
     app.bot_data["sessions"] = SessionStore(cfg.state_dir / "sessions.json")
+    # Сессии ранов по чужому тексту (сторож, слушатель): свои, свежие на
+    # каждый ран, переписку темы они не продолжают (проект шага 1, 2.5).
+    app.bot_data["foreign_sessions"] = SessionStore(cfg.state_dir / "foreign_sessions.json")
+    # Сессия хода дела на время рана; постоянная копия в реестре дел (проект В1, 2.5).
+    app.bot_data["deal_sessions"] = SessionStore(cfg.state_dir / "deal_sessions.json")
     # Персист-кэш имён forum-тем (chat_key -> name) для авто-скоупинга проектов.
     # Наполняется из forum_topic_created/edited; переживает рестарт.
     app.bot_data["topic_names"] = SessionStore(cfg.state_dir / "topic_names.json")
@@ -7735,6 +8356,7 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_voice_full_text, pattern=r"^vtext:"))
     app.add_handler(CallbackQueryHandler(on_resume_pick, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(on_ask_pick, pattern=r"^ask:"))
+    app.add_handler(CallbackQueryHandler(on_deal_pick, pattern=r"^deal:[0-9a-f]{8}:\d+$"))
     app.add_handler(CallbackQueryHandler(on_run_watch_pick, pattern=r"^runwatch:"))
     app.add_handler(CallbackQueryHandler(on_news_pick, pattern=r"^news:"))
     app.add_handler(CallbackQueryHandler(on_restart_pick, pattern=r"^rst:"))

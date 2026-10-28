@@ -22,8 +22,35 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import bot as botmod  # noqa: E402
 from claude_tg_bot import claude_runner  # noqa: E402
+from claude_tg_bot.i18n import _, plural  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 USER = 7
+
+
+def status_line(desc: str, steps: int, total: int, silence: int | None = None) -> str:
+    """Строка живого статуса, как её собирает _RunStatus._fmt (секунды до минуты)."""
+    parts = [f"🔧 {desc}", _("шаг {steps}").format(steps=steps),
+             _("всего {dur}").format(dur=_("{s}с").format(s=total))]
+    if silence is not None:
+        parts.append(_("тишина {dur}").format(dur=_("{s}с").format(s=silence)))
+    return " · ".join(parts)
+
+
+def silence_alert(mins: int, last: str | None = None) -> str:
+    """Тревога тишины; last None: действий ещё не было."""
+    return _("⏳ {mins} {unit} тишины: "
+             "последнее действие {last}. Похоже, завис или долгая команда.").format(
+        mins=mins, unit=plural(mins, ("минута", "минуты", "минут"), ("minute", "minutes")),
+        last=last if last is not None else _("ещё не было"))
+
+
+def progress_note(mins: int, steps: int, last: str | None = None) -> str:
+    """Заметка «Работаю N минут»; last None: действий ещё не было."""
+    return _("Работаю {mins} {unit}, "
+             "шагов {steps}, сейчас: {last}").format(
+        mins=mins, unit=plural(mins, ("минуту", "минуты", "минут"), ("minute", "minutes")),
+        steps=steps, last=last if last is not None else _("ещё не было"))
 CHAT = -100
 THREAD = 5
 
@@ -89,11 +116,11 @@ class StatusTextTests(_Base):
         self.assertEqual(len(self.wire.sent), 1)  # второе в окне троттлинга 3 с
         self.assertTrue(self.wire.sent[0]["disable_notification"])
         self.assertEqual(self.wire.sent[0]["message_thread_id"], THREAD)
-        self.assertEqual(self.wire.sent[0]["text"], "🔧 Edit: prompt.md · шаг 1 · всего 0с")
+        self.assertEqual(self.wire.sent[0]["text"], status_line("Edit: prompt.md", 1, 0))
         await self.at(2 + 29)
-        self.assertEqual(self.wire.edits[-1]["text"], "🔧 Bash: ls · шаг 2 · всего 31с")
+        self.assertEqual(self.wire.edits[-1]["text"], status_line("Bash: ls", 2, 31))
         await self.at(2 + 40)
-        self.assertEqual(self.wire.edits[-1]["text"], "🔧 Bash: ls · шаг 2 · всего 42с · тишина 40с")
+        self.assertEqual(self.wire.edits[-1]["text"], status_line("Bash: ls", 2, 42, 40))
 
     async def test_tick_redraws_without_events_but_respects_throttle(self) -> None:
         await self.status.on_tool("Bash: make")
@@ -102,7 +129,7 @@ class StatusTextTests(_Base):
         await self.at(25)
         await self.at(50)
         self.assertEqual(len(self.wire.edits), 2)
-        self.assertIn("тишина 50с", self.wire.edits[-1]["text"])
+        self.assertEqual(self.wire.edits[-1]["text"], status_line("Bash: make", 1, 50, 50))
 
     async def test_no_status_message_before_first_tool(self) -> None:
         await self.at(60)
@@ -121,13 +148,10 @@ class SilenceAlertTests(_Base):
         self.assertEqual(self.alerts(), [])
         await self.at(600)
         (alert,) = self.alerts()
-        self.assertEqual(
-            alert["text"],
-            "⏳ 10 минут тишины: последнее действие Bash: pytest. Похоже, завис или долгая команда.",
-        )
+        self.assertEqual(alert["text"], silence_alert(10, "Bash: pytest"))
         self.assertEqual(alert["message_thread_id"], THREAD)
         buttons = alert["reply_markup"].inline_keyboard[0]
-        self.assertEqual([b.text for b in buttons], ["Ждать", "Прервать"])
+        self.assertEqual([b.text for b in buttons], [_("Ждать"), _("Прервать")])
         rid = self.status.run_id
         self.assertEqual([b.callback_data for b in buttons],
                          [f"runwatch:wait:{rid}", f"runwatch:stop:{rid}"])
@@ -138,7 +162,7 @@ class SilenceAlertTests(_Base):
     async def test_new_event_resets_episode(self) -> None:
         await self.at(600)
         self.assertEqual(len(self.alerts()), 1)
-        self.assertIn("последнее действие ещё не было", self.alerts()[0]["text"])
+        self.assertEqual(self.alerts()[0]["text"], silence_alert(10))
         self.clock.t = 1000.0 + 700
         self.status.on_event()  # любое событие stream-json, не только tool_use
         await self.at(1299)
@@ -155,7 +179,7 @@ class SilenceAlertTests(_Base):
         self.assertEqual(len(self.alerts()), 1)
         await self.at(1250)
         self.assertEqual(len(self.alerts()), 2)
-        self.assertTrue(self.alerts()[1]["text"].startswith("⏳ 20 минут тишины"))
+        self.assertEqual(self.alerts()[1]["text"], silence_alert(20))
 
     async def test_pending_approval_is_not_silence(self) -> None:
         self.waiting = True
@@ -172,13 +196,13 @@ class SilenceAlertTests(_Base):
         await self.status.on_tool("Bash: deploy")
         self.waiting = True
         await self.at(300)
-        self.assertNotIn("тишина", self.wire.edits[-1]["text"])
+        self.assertNotRegex(self.wire.edits[-1]["text"], msg_re("тишина {dur}"))
         self.waiting = False
         await self.at(340)
-        self.assertTrue(self.wire.edits[-1]["text"].endswith("тишина 40с"))
+        self.assertTrue(self.wire.edits[-1]["text"].endswith(_("тишина {dur}").format(dur=_("{s}с").format(s=40))))
         await self.at(900)
         (alert,) = self.alerts()
-        self.assertTrue(alert["text"].startswith("⏳ 10 минут тишины"))
+        self.assertEqual(alert["text"], silence_alert(10, "Bash: deploy"))
 
     async def test_disabled_by_zero(self) -> None:
         self.status._silence_alert_sec = 0
@@ -198,7 +222,7 @@ class ProgressNoteTests(_Base):
         self.assertEqual(self.wire.loud(), [])
         await self.at(900)
         (note,) = self.wire.loud()
-        self.assertEqual(note["text"], "Работаю 15 минут, шагов 3, сейчас: Read: f2.py")
+        self.assertEqual(note["text"], progress_note(15, 3, "Read: f2.py"))
         self.assertIsNone(note["reply_markup"])
         await self.at(1000)
         self.assertEqual(len(self.wire.loud()), 1)
@@ -250,7 +274,7 @@ class DeliveryFailureTests(_Base):
         self.assertEqual(self.alerts(), [])
         await self.at(650)
         (alert,) = self.alerts()
-        self.assertTrue(alert["text"].startswith("⏳ 10 минут тишины"))
+        self.assertEqual(alert["text"], silence_alert(10))
         await self.at(700)
         self.assertEqual(len(self.alerts()), 1)
 
@@ -262,7 +286,7 @@ class DeliveryFailureTests(_Base):
         self.assertEqual(self.wire.loud(), [])
         await self.at(925)
         (note,) = self.wire.loud()
-        self.assertTrue(note["text"].startswith("Работаю 15 минут"))
+        self.assertEqual(note["text"], progress_note(15, 0))
         await self.at(950)
         self.assertEqual(len(self.wire.loud()), 1)
 
@@ -501,7 +525,7 @@ class ButtonTests(_Base):
             await botmod.on_run_watch_pick(update, self.ctx)
         cancel.assert_not_awaited()
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
-        self.assertIn("закончился", query.answer.await_args.args[0])
+        self.assertEqual(_("Ран уже закончился"), query.answer.await_args.args[0])
 
     async def test_stranger_ignored(self) -> None:
         cancel = AsyncMock()

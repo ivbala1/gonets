@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import approval, bot  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 
 class OutboundCardTests(unittest.TestCase):
@@ -106,7 +107,7 @@ class OutboundCardTextTests(unittest.TestCase):
             "mcp__telegram__send_file",
             {"chat_id": "@hr_example", "file_path": "/home/u/r.pdf", "caption": "Резюме <b>"},
             None)
-        self.assertIn("отправка от твоего имени", body)
+        self.assertIn(_("📤 <b>отправка от твоего имени</b>"), body)
         self.assertIn("@hr_example", body)
         self.assertIn("/home/u/r.pdf", body)
         self.assertIn("Резюме &lt;b&gt;", body)
@@ -129,10 +130,10 @@ class OutboundCardTextTests(unittest.TestCase):
         self.assertIn("plain", body)
         self.assertIn("&lt;p&gt;other", body)
         self.assertIn("work", body)
-        self.assertNotIn("длиннее карточки", body)
+        self.assertNotIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), body)
         long = approval._format_tool_body(
             "mcp__telegram__send_message", {"chat_id": "@x", "message": "a" * 3000}, None)
-        self.assertIn("длиннее карточки", long)
+        self.assertIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), long)
 
     def test_full_view_hides_attachment_content(self) -> None:
         text = approval.full_view_text(

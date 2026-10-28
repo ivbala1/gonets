@@ -21,8 +21,12 @@ from telegram.error import BadRequest  # noqa: E402
 
 from claude_tg_bot import bigfile  # noqa: E402
 from claude_tg_bot import bot as botmod  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 from test_review_bot_main import GROUP, _Base, _msg, _update  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
+
+TOO_BIG = "⚠️ файл слишком большой ({got:.1f} MB), лимит {max:.1f} MB"
 
 MB = 1024 * 1024
 
@@ -125,22 +129,25 @@ class BotMTProtoTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", repr(client))
 
     async def test_message_gone(self) -> None:
-        with self.assertRaisesRegex(bigfile.FetchError, "удалено или изменено"):
+        with self.assertRaisesRegex(bigfile.FetchError, _("⚠️ сообщение с файлом удалено или изменено, пока шла загрузка")):
             await self._download(self._client(_FakeTelethon(msg_present=False)))
 
     async def test_real_size_checked_against_limit(self) -> None:
-        with self.assertRaisesRegex(bigfile.FetchError, "слишком большой"):
+        with self.assertRaisesRegex(bigfile.FetchError, msg_re(TOO_BIG)):
             await self._download(self._client(_FakeTelethon(size=2000)), max_bytes=1000)
         self.assertFalse(self.target.exists())
 
     async def test_not_enough_disk(self) -> None:
         usage = SimpleNamespace(free=100)
         with patch.object(bigfile.shutil, "disk_usage", return_value=usage), \
-                self.assertRaisesRegex(bigfile.FetchError, "не хватает места"):
+                self.assertRaisesRegex(bigfile.FetchError, msg_re(
+                    "⚠️ не хватает места на диске: файлу нужно {need}, свободно {free}, "
+                    "запас {reserve} оставляю системе")):
             await self._download(self._client(_FakeTelethon(size=30)), min_free=80)
 
     async def test_incomplete_file_removed(self) -> None:
-        with self.assertRaisesRegex(bigfile.FetchError, "не целиком"):
+        with self.assertRaisesRegex(bigfile.FetchError, msg_re(
+                "⚠️ файл скачался не целиком ({got} из {total}), пришли его ещё раз")):
             await self._download(self._client(_FakeTelethon(size=30, write=10)))
         self.assertEqual([p.name for p in self.dir.iterdir()], ["telethon-bot.session"])
 
@@ -148,13 +155,16 @@ class BotMTProtoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._download(self._client(_FakeTelethon(drops=1))), 30)
 
     async def test_two_drops_fail_in_words(self) -> None:
-        with self.assertRaisesRegex(bigfile.FetchError, "связь с Telegram оборвалась"):
+        with self.assertRaisesRegex(bigfile.FetchError, msg_re(
+                "⚠️ связь с Telegram оборвалась на {pct}%, пришли файл ещё раз")):
             await self._download(self._client(_FakeTelethon(drops=2)))
         self.assertFalse(self.target.with_name(self.target.name + ".part").exists())
 
     async def test_foreign_session_refused(self) -> None:
         for fake in (_FakeTelethon(bot=False), _FakeTelethon(me_id=7)):
-            with self.assertRaisesRegex(bigfile.FetchError, "не этому боту"):
+            with self.assertRaisesRegex(bigfile.FetchError, msg_re(
+                    "⚠️ сессия MTProto принадлежит не этому боту: удали {path}, "
+                    "бот войдёт заново")):
                 await self._download(self._client(fake))
             self.assertFalse(fake.connected)
 
@@ -165,7 +175,8 @@ class BotMTProtoTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(10)
 
         fake.download_media = hang
-        with self.assertRaisesRegex(bigfile.FetchError, "не уложилась"):
+        with self.assertRaisesRegex(bigfile.FetchError, msg_re(
+                "⚠️ загрузка не уложилась в {min} мин (скачано {pct}%), пришли файл ещё раз")):
             await self._download(self._client(fake, timeout=0.05))
 
 
@@ -243,7 +254,7 @@ class HandlerTests(_Base):
         self.dispatch.assert_awaited_once()
         self.assertTrue(self.dispatch.await_args.kwargs["admitted"])
         self.assertEqual(self.bot_data.get("active_work", 0), 0)
-        self.assertIn("✅ скачал", self._texts(msg)[-1])
+        self.assertRegex(self._texts(msg)[-1], msg_re("✅ скачал «{name}», {size} за {sec} с"))
 
     async def test_unknown_size_falls_back_on_too_big(self) -> None:
         msg = self._doc_msg(None, get_file=AsyncMock(side_effect=BadRequest("File is too big")))
@@ -255,7 +266,7 @@ class HandlerTests(_Base):
         msg = self._doc_msg(600 * MB)
         await botmod.on_file(_update(msg), self.ctx)
         self.assertEqual(self.loader.calls, [])
-        self.assertIn("слишком большой", self._texts(msg)[0])
+        self.assertRegex(self._texts(msg)[0], msg_re(TOO_BIG))
 
     async def test_failure_shown_in_words_and_slots_released(self) -> None:
         ck = str(GROUP)
@@ -274,7 +285,8 @@ class HandlerTests(_Base):
         self.loader.error = RuntimeError("boom")
         msg = self._doc_msg(30 * MB)
         await botmod.on_file(_update(msg), self.ctx)
-        self.assertIn("не удалось скачать «call.m4a»: RuntimeError", self._texts(msg)[-1])
+        self.assertIn(_("⚠️ не удалось скачать «{name}»: {err}").format(name="call.m4a", err="RuntimeError"),
+                      self._texts(msg)[-1])
         self.assertEqual(self.bot_data.get("active_work", 0), 0)
 
     async def test_no_keys_refused(self) -> None:
@@ -289,7 +301,8 @@ class HandlerTests(_Base):
         msg = self._doc_msg(30 * MB)
         await botmod.on_file(_update(msg), self.ctx)
         self.assertEqual(self.loader.calls, [])
-        self.assertIn("перезапуску", self._texts(msg)[0])
+        self.assertEqual(_("♻️ бот готовится к перезапуску: большой файл не скачиваю, "
+                           "пришли его после рестарта"), self._texts(msg)[0])
 
     async def test_restart_sees_download_and_cancel_stops_it(self) -> None:
         self.loader.gate = asyncio.Event()
@@ -301,8 +314,8 @@ class HandlerTests(_Base):
         await botmod.on_cancel(_update(cancel_msg), self.ctx)
         await asyncio.wait_for(t, 2)
         self.dispatch.assert_not_awaited()
-        self.assertIn("загрузка файла отменена", cancel_msg.reply_text.await_args.args[0])
-        self.assertIn("отменена", self._texts(msg)[-1])
+        self.assertEqual(_("🗑 загрузка файла отменена"), cancel_msg.reply_text.await_args.args[0])
+        self.assertRegex(self._texts(msg)[-1], msg_re("🗑 загрузка «{name}» отменена"))
         self.assertEqual(botmod._restart_active(self.ctx.application), 0)
 
     async def test_progress_edit_failure_does_not_break_download(self) -> None:

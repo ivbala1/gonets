@@ -35,6 +35,7 @@ import httpx
 
 from ... import tasks
 from ...config import load_config
+from ...i18n import _
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.open:
         cfg = load_config(skip_hook_validation=True)
         opened = tasks.open_tasks(tasks.load(tasks.registry_dir(cfg.state_dir)))
-        print(tasks.open_list(opened, with_id=True) if opened else "открытых задач нет")
+        print(tasks.open_list(opened, with_id=True) if opened else _("открытых задач нет"))
         return 0
     words = " ".join(args.words).strip()
     if not words:

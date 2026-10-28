@@ -114,7 +114,7 @@ def fingerprint(chat_id: int, thread_id: int | None, untrusted: bool) -> str:
 def new_record(*, key: str | None, chat_id: int, thread_id: int | None, prompt: str,
                fresh: bool, untrusted: bool, silent: bool, source: str, title: str,
                ttl: int | None, now: float | None = None, expires_at: float | None = None,
-               receiving: bool = False, boot: str | None = None) -> dict[str, Any]:
+               receiving: bool = False, boot: str | None = None, deal_asks: bool = False) -> dict[str, Any]:
     """receiving: уведомление в Telegram ещё уходит, ответа 200 не было;
     повтор с тем же ключом ждёт (503), обрыв здесь событие не принимает."""
     now = time.time() if now is None else now
@@ -125,6 +125,8 @@ def new_record(*, key: str | None, chat_id: int, thread_id: int | None, prompt: 
         "expires_at": expires_at if expires_at is not None else now + (ttl or DEFAULT_TTL_SEC),
         "status": "receiving" if receiving else "accepted", "boot": boot,
         "fp": fingerprint(chat_id, thread_id, untrusted),
+        # Вопросы рана делами (опыт В1); после рестарта тоже.
+        "deal_asks": deal_asks,
     }
 
 

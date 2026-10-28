@@ -15,9 +15,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 from claude_tg_bot.skills.news_digest import __main__ as skill  # noqa: E402
 from claude_tg_bot.skills.news_digest import backlog as news_backlog  # noqa: E402
 from claude_tg_bot.skills.news_digest.core import (  # noqa: E402
+    FEEDBACK_LABELS,
+    INSTALL_RULE,
     Candidate,
     Item,
     State,
@@ -107,16 +111,16 @@ class PageTests(unittest.TestCase):
         state = State()
         html1 = "<p>October 1, 2026 first feature that is long enough</p><p>short</p>"
         cand, snap = page_candidate(html1, self.SRC, state, is_html=True)
-        self.assertIn("первое чтение", cand.title)
+        self.assertIn(_("первое чтение страницы, новыми считать только записи после границы"), cand.title)
         self.assertIn("first feature", cand.body)
         self.assertNotIn("short", cand.body)
         state.snapshots["p"] = snap
 
-        same, _ = page_candidate(html1, self.SRC, state, is_html=True)
+        same, _snap = page_candidate(html1, self.SRC, state, is_html=True)
         self.assertIsNone(same)
 
         html2 = "<p>October 7, 2026 brand new feature line here</p>" + html1
-        cand2, _ = page_candidate(html2, self.SRC, state, is_html=True)
+        cand2, _snap = page_candidate(html2, self.SRC, state, is_html=True)
         self.assertEqual(cand2.body, "October 7, 2026 brand new feature line here")
         self.assertNotEqual(cand.id, cand2.id)
 
@@ -182,9 +186,12 @@ class AnswerTests(unittest.TestCase):
 
     def test_feedback_goes_into_prompt(self):
         prompt = build_prompt("профиль", "", [_cand(1)], NOW, "2026-10-08", ["- мимо: Скучное (hn)"])
-        self.assertIn("Отзывы владельца", prompt)
+        taste = _("## Отзывы владельца на прошлые подборки (свежие сверху)\n"
+                  "«мимо» значит не нужно, «в список» значит отложил поставить. Это примеры вкуса: "
+                  "не бери похожее на «мимо», ищи похожее на «в список», но не делай выводов по одному случаю.\n")
+        self.assertIn(taste, prompt)
         self.assertIn("- мимо: Скучное (hn)", prompt)
-        self.assertNotIn("Отзывы владельца", build_prompt("профиль", "", [_cand(1)], NOW, "2026-10-08"))
+        self.assertNotIn(taste, build_prompt("профиль", "", [_cand(1)], NOW, "2026-10-08"))
 
     def test_task_name_is_short_and_cut_by_word(self):
         # имя темы 1-3 слова до 24 знаков (решение Ивана 14.10.2026): длинное
@@ -204,7 +211,16 @@ class AnswerTests(unittest.TestCase):
 
     def test_prompt_asks_short_task_name(self):
         prompt = build_prompt("профиль", "", [_cand(1)], NOW, "2026-10-08")
-        self.assertIn("1-3 слова, до 24 знаков", prompt)
+        self.assertIn(_("Ответь только JSON без пояснений вокруг:\n"
+                        '{"items": [{"kind": "tools" или "try", "refs": ["c1"], "title": "что это, до 60 знаков", '
+                        '"text": "что появилось, до 200 знаков", "how": "как применить у владельца, до 150 знаков", '
+                        '"detail": "необязательно: подробности, до 300 знаков", '
+                        '"task": "имя задачи внедрения у владельца для названия темы, 1-3 слова, до 24 знаков, по-русски, '
+                        'понятно без контекста, например «Секреты с телефона»"}]}\n'
+                        "Лимиты длины жёсткие: читают с телефона. В how не пересказывай text, в detail не повторяй ни то, ни другое: "
+                        "там то, что нужно для решения (версия, где включается, чем ставится, оговорки), или пусто.\n"
+                        'kind "tools": новое в том, чем он уже пользуется; "try": репозиторий, плагин, мод, который стоит поставить. '
+                        'Порядок пунктов: сначала самое полезное. Полезного нет: {"items": []}.\n\n'), prompt)
         self.assertNotIn("до 40 знаков", prompt)
 
     def test_empty(self):
@@ -223,15 +239,15 @@ class MessageTests(unittest.TestCase):
         html_text = render_item(self.ITEM)
         self.assertTrue(html_text.startswith('🔧 <b><a href="https://e.x/1?a=1&amp;b=2">Claude Code &lt;2.1.292&gt;</a></b>'))
         self.assertIn("Подагенты &amp; уровень.", html_text)
-        self.assertIn("<b>У тебя:</b> разведчики дешевле.", html_text)
+        self.assertIn(_("<b>У тебя:</b> {how}").format(how="разведчики дешевле."), html_text)
         self.assertIn("<blockquote expandable>Флаг effort в описании агента.</blockquote>", html_text)
         self.assertNotIn("\u2014", html_text)
 
     def test_render_states(self):
-        self.assertTrue(render_item(self.ITEM, "saved", "Свод").endswith("📌 в бэклоге: Свод"))
-        self.assertTrue(render_item(self.ITEM, "busy").endswith("📌 выбираю бэклог…"))
+        self.assertTrue(render_item(self.ITEM, "saved", "Свод").endswith(_("📌 в бэклоге: {where}").format(where="Свод")))
+        self.assertTrue(render_item(self.ITEM, "busy").endswith(_("📌 выбираю бэклог…")))
         self.assertTrue(render_item(self.ITEM, "work", "https://t.me/c/1/2?a&b").endswith(
-            '🛠 в работе: <a href="https://t.me/c/1/2?a&amp;b">тема задачи</a>'))
+            _('🛠 в работе: <a href="{link}">тема задачи</a>').format(link="https://t.me/c/1/2?a&amp;b")))
         self.assertTrue(render_item(self.ITEM, "work", "задача закрыта: <сделано>").endswith(
             "🛠 задача закрыта: &lt;сделано&gt;"))
         self.assertEqual(render_item(self.ITEM, "skipped"), "✖ <s>Claude Code &lt;2.1.292&gt;</s>")
@@ -240,7 +256,7 @@ class MessageTests(unittest.TestCase):
 
     def test_buttons_by_state_and_callback(self):
         (row,) = item_buttons(self.ITEM, "202610080900")
-        self.assertEqual([b["text"] for b in row], ["📌 В список", "🛠 В работу", "✖ Мимо"])
+        self.assertEqual([b["text"] for b in row], [_("📌 В список"), _("🛠 В работу"), _("✖ Мимо")])
         for b in row:
             self.assertLessEqual(len(b["data"].encode()), 64)
         self.assertEqual(parse_callback(row[0]["data"]), ("202610080900", 1, "p"))
@@ -281,13 +297,15 @@ class MessageTests(unittest.TestCase):
             write_last(base, "202610080900", [self.ITEM], [_cand(3)], [other])
             last = (base / "last.md").read_text()
             self.assertIn("08.10.2026 09:00", last)
-            self.assertLess(last.index("Claude Code"), last.index("Не дошло"))
-            self.assertLess(last.index("Не дошло"), last.index("Второй"))
-            self.assertIn("https://e.x/3", last.split("Отсеяно")[1])
+            unsent = _("## Не дошло, повторю в следующем прогоне\n\n{items}").format(items="")
+            dropped = _("## Отсеяно (смотрел, но не взял)\n\n{items}").format(items="")
+            self.assertLess(last.index("Claude Code"), last.index(unsent))
+            self.assertLess(last.index(unsent), last.index("Второй"))
+            self.assertIn("https://e.x/3", last.split(dropped)[1])
             write_last(base, "202610090900", [], [])
             last = (base / "last.md").read_text()
-            self.assertIn("## Отправлено\n\nничего", last)
-            self.assertNotIn("Не дошло", last)
+            self.assertIn(_("## Отправлено\n\n{items}").format(items=_("ничего")), last)
+            self.assertNotIn(unsent, last)
 
     def test_backlog_same_page_url_different_items(self):
         # у новостей со страницы адрес общий: дубль это пара «заголовок и адрес»
@@ -336,7 +354,7 @@ class MessageTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "add", "other.txt"], check=True)
             # пустой сервер: своей ветки на нём нет, отправлять не с чем сверить
             filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", locks)
-            self.assertEqual((filed.status, filed.note), ("added", "закоммичено, не отправлено"))
+            self.assertEqual((filed.status, filed.note), ("added", _("закоммичено, не отправлено")))
             text = (repo / "BACKLOG.md").read_text()
             self.assertTrue(text.startswith("# Проект: бэклог\n\n**Разобрать в приоритете:**"))
             log = subprocess.run(["git", "-C", str(repo), "show", "--stat", "--format=", "HEAD"],
@@ -350,7 +368,7 @@ class MessageTests(unittest.TestCase):
             other = Item(2, "try", "Мод", "", "как", "https://e.x/2", "gh")
             filed = news_backlog.write_and_commit(repo, "Проект", other, "2026-10-09", locks)
             self.assertEqual(filed.status, "added")
-            self.assertIn("чужие правки", filed.note)
+            self.assertEqual(filed.note, _("не закоммичено: в BACKLOG.md были чужие правки"))
             self.assertIn("ручная строка", (repo / "BACKLOG.md").read_text())
 
     def test_backlog_does_not_push_foreign_commit(self):
@@ -377,7 +395,7 @@ class MessageTests(unittest.TestCase):
             (repo / "a.txt").write_text("2\n")
             git(repo, "commit", "-qam", "чужой неотправленный")
             filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", locks)
-            self.assertEqual((filed.status, filed.note), ("added", "закоммичено, не отправлено"))
+            self.assertEqual((filed.status, filed.note), ("added", _("закоммичено, не отправлено")))
             self.assertIn("Бэклог:", git(repo, "log", "-1", "--format=%s"))
             self.assertEqual(git(origin, "rev-parse", branch), server)
             git(repo, "push", "-q")  # чужой ушёл, дальше свой коммит один
@@ -420,7 +438,7 @@ class MessageTests(unittest.TestCase):
             git(repo, "checkout", "-q", branch)
             git(repo, "merge", "-q", "--ff-only", "feature")
             filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", Path(d) / "locks")
-            self.assertEqual((filed.status, filed.note), ("added", "закоммичено, не отправлено"))
+            self.assertEqual((filed.status, filed.note), ("added", _("закоммичено, не отправлено")))
             self.assertEqual(git(origin, "rev-parse", branch), server)
 
     def test_backlog_pushes_only_checked_commit(self):
@@ -462,7 +480,7 @@ class MessageTests(unittest.TestCase):
 
             with patch.object(news_backlog, "_git", racing):
                 filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", Path(d) / "locks")
-            self.assertEqual((filed.status, filed.note), ("added", "закоммичено, не отправлено"))
+            self.assertEqual((filed.status, filed.note), ("added", _("закоммичено, не отправлено")))
             self.assertEqual(git(origin, "log", "-1", "--format=%s", branch), "Бэклог: Claude Code <2.1.292> (из новостей)")
             self.assertEqual(git(origin, "rev-parse", branch), git(repo, "rev-parse", "HEAD~1"))
 
@@ -510,7 +528,7 @@ class MessageTests(unittest.TestCase):
 
             with patch.object(news_backlog, "_git", racing):
                 filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", Path(d) / "locks")
-            self.assertEqual((filed.status, filed.note), ("added", "git commit не прошёл, файл записан"))
+            self.assertEqual((filed.status, filed.note), ("added", _("git commit не прошёл, файл записан")))
             self.assertEqual(git(repo, "log", "-1", "--format=%s", branch), "чужой коммит соседней сессии")
             self.assertIn(self.ITEM.title, (repo / "BACKLOG.md").read_text(encoding="utf-8"))
             self.assertEqual(git(origin, "rev-parse", branch), server)
@@ -532,7 +550,7 @@ class MessageTests(unittest.TestCase):
 
             with patch.object(news_backlog, "_git", refusing):
                 filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", Path(d) / "locks")
-            self.assertEqual((filed.status, filed.note), ("added", "git commit не прошёл, файл записан"))
+            self.assertEqual((filed.status, filed.note), ("added", _("git commit не прошёл, файл записан")))
             self.assertEqual(git(repo, "diff", "--cached", "--name-only"), "a.txt")
             self.assertIn(self.ITEM.title, (repo / "BACKLOG.md").read_text(encoding="utf-8"))
 
@@ -587,7 +605,7 @@ class MessageTests(unittest.TestCase):
             item = replace(self.ITEM, title="Другой пункт", text="другой текст")
             with patch.object(news_backlog, "_commit", owner_stages), patch.object(news_backlog, "_git", refusing):
                 filed = news_backlog.write_and_commit(repo, "Проект", item, "2026-10-09", Path(d) / "locks")
-            self.assertEqual(filed.note, "git commit не прошёл, файл записан")
+            self.assertEqual(filed.note, _("git commit не прошёл, файл записан"))
             staged = git(repo, "ls-files", "-s", "--", "BACKLOG.md").split()[1]
             self.assertEqual(staged, git(repo, "hash-object", "own.md"))
 
@@ -622,12 +640,12 @@ class MessageTests(unittest.TestCase):
         # Рабочая копия на чужой ветке под PR: строка в файле, но ни коммита
         # в эту ветку, ни отправки (ревью 14.10)
         with tempfile.TemporaryDirectory() as d:
-            repo, origin, git, _ = self._pushed_repo(d)
+            repo, origin, git, _git = self._pushed_repo(d)
             git(repo, "checkout", "-qb", "agent/fix")
             git(repo, "push", "-q", "-u", "origin", "agent/fix")
             server = git(origin, "rev-parse", "agent/fix")
             filed = news_backlog.write_and_commit(repo, "Проект", self.ITEM, "2026-10-08", Path(d) / "locks")
-            self.assertEqual((filed.status, filed.note), ("added", "не закоммичено: репозиторий не на main"))
+            self.assertEqual((filed.status, filed.note), ("added", _("не закоммичено: репозиторий не на {branch}").format(branch="main")))
             self.assertIn(self.ITEM.title, (repo / "BACKLOG.md").read_text(encoding="utf-8"))
             self.assertEqual(git(repo, "rev-parse", "HEAD"), server)
             self.assertEqual(git(origin, "rev-parse", "agent/fix"), server)
@@ -638,7 +656,7 @@ class MessageTests(unittest.TestCase):
             append_feedback(base, "202610080900", self.ITEM, "w", NOW)
             append_feedback(base, "202610080900", self.ITEM, "task:drop", NOW)
             self.assertEqual(len(recent_feedback(base)), 1)
-            self.assertTrue(recent_feedback(base)[0].startswith("- в работу:"))
+            self.assertTrue(recent_feedback(base)[0].startswith(f"- {_(FEEDBACK_LABELS['w'])}:"))
 
     def test_feedback_last_press_wins_and_undo_cancels(self):
         with tempfile.TemporaryDirectory() as d:
@@ -647,17 +665,18 @@ class MessageTests(unittest.TestCase):
             append_feedback(base, "202610080900", self.ITEM, "x", NOW)
             append_feedback(base, "202610080900", other, "p", NOW)
             append_feedback(base, "202610080900", self.ITEM, "u", NOW)
-            self.assertEqual(recent_feedback(base), ["- в список: Второй (gh)"])
+            pin, skip = _(FEEDBACK_LABELS["p"]), _(FEEDBACK_LABELS["x"])
+            self.assertEqual(recent_feedback(base), [f"- {pin}: Второй (gh)"])
             append_feedback(base, "202610080900", self.ITEM, "x", NOW)
             self.assertEqual(recent_feedback(base),
-                             ["- мимо: Claude Code <2.1.292> (claude-code)", "- в список: Второй (gh)"])
+                             [f"- {skip}: Claude Code <2.1.292> (claude-code)", f"- {pin}: Второй (gh)"])
             self.assertEqual(len(recent_feedback(base, limit=1)), 1)
             self.assertEqual(recent_feedback(Path(d) / "нет"), [])
 
     def test_notes_for_topic_agent(self):
         note = topic_note(Path("/s/news_digest"))
         self.assertIn("/s/news_digest/last.md", note)
-        self.assertIn("по инструкции автора", note)
+        self.assertIn(_(INSTALL_RULE), note)
         self.assertIn("https://e.x/1?a=1&b=2", reply_note(self.ITEM))
 
 
@@ -713,7 +732,7 @@ class MainTests(unittest.TestCase):
         first = sender.call_args_list[0]
         self.assertIn('<a href="https://e.x/1">Один</a>', first.args[2])
         self.assertTrue(first.kwargs["html"])
-        self.assertEqual(first.args[3][0][0]["text"], "📌 В список")
+        self.assertEqual(first.args[3][0][0]["text"], _("📌 В список"))
         self.assertEqual(set(self._state().seen), {"s:1", "s:2", "s:3"})  # отсеянное тоже виденное
         self.assertEqual(find_item_by_message(self._base(), 102)[1].title, "Два")
         self.assertIn("T3", (self._base() / "last.md").read_text())
@@ -723,7 +742,9 @@ class MainTests(unittest.TestCase):
                                     {"kind": "try", "refs": ["c2"], "title": "Два"}]})
         rc, sender = self._run(ans, send=(101, None, None), k=3)
         self.assertEqual(rc, 1)
-        self.assertIn("Новости не собрались: дошло 1 из 2", sender.call_args_list[-1].args[2])
+        self.assertIn(_("Новости не собрались: {reason}").format(
+            reason=_("дошло {delivered} из {count}, остальное пришлю завтра.").format(delivered=1, count=2)),
+            sender.call_args_list[-1].args[2])
         self.assertEqual(set(self._state().seen), {"s:1", "s:3"})
 
     def test_preview_sends_but_does_not_mark_seen(self):
@@ -773,14 +794,15 @@ class MainTests(unittest.TestCase):
              patch.object(skill, "_send", return_value=1) as send:
             rc = skill.main([])
         self.assertEqual(rc, 1)
-        self.assertIn("Новости не собрались", send.call_args.args[2])
+        self.assertIn(_("Новости не собрались: {reason}").format(reason="claude exit 1: лимит или доступ"),
+                      send.call_args.args[2])
         self.assertTrue(self._state().first_run)
 
     def test_empty_day_writes_last_md_with_dropped(self):
-        rc, _ = self._run('{"items": []}', k=2)
+        rc, _sender = self._run('{"items": []}', k=2)
         self.assertEqual(rc, 0)
         last = (self._base() / "last.md").read_text()
-        self.assertIn("T1", last.split("Отсеяно")[1])
+        self.assertIn("T1", last.split(_("## Отсеяно (смотрел, но не взял)\n\n{items}").format(items=""))[1])
 
     def test_page_over_budget_keeps_old_snapshot(self):
         big = [Candidate(f"s:{i}", "s", "focus", f"T{i}", f"https://e.x/{i}", "x" * 500, datetime.now(timezone.utc))
@@ -831,14 +853,16 @@ class BotNewsContextTests(unittest.TestCase):
 
     def test_topic_note_and_reply_source(self):
         out = self.bot._news_context(self.cfg, self._msg(reply_id=501), "вопрос")
-        self.assertIn("Тема «Новости»", out)
+        self.assertRegex(out, msg_re("[Тема «Новости»: утренняя подборка полезного. Последний выпуск и отсеянное в {last}, "
+                                   "все выпуски за месяц в {digests}. {rule}]"))
         self.assertIn("https://e.x/1", out)
         self.assertTrue(out.endswith("\n\nвопрос"))
 
     def test_root_reply_in_topic_has_no_item(self):
         out = self.bot._news_context(self.cfg, self._msg(reply_id=7), "вопрос")
-        self.assertIn("Тема «Новости»", out)
-        self.assertNotIn("Это пункт подборки", out)
+        self.assertRegex(out, msg_re("[Тема «Новости»: утренняя подборка полезного. Последний выпуск и отсеянное в {last}, "
+                                   "все выпуски за месяц в {digests}. {rule}]"))
+        self.assertNotRegex(out, msg_re("[Это пункт подборки «{title}», источник: {url}. Сначала прочитай источник.]"))
 
     def test_other_topic_and_gpt_prefix_untouched(self):
         self.assertEqual(self.bot._news_context(self.cfg, self._msg(thread=8), "вопрос"), "вопрос")

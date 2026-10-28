@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_tg_bot import bot as botmod  # noqa: E402
 from claude_tg_bot import hangs, notify  # noqa: E402
 from test_review_bot_main import GROUP, _Base, _msg  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 TODAY = date(2026, 10, 25)
 SRO = ("# Срочное\n\nСтрока `- ГГГГ-ММ-ДД ЧЧ:ММ | что | закреп N`.\n\n"
@@ -143,7 +145,7 @@ class AskRepeatTests(_Base):
         await self.dispatch("a")
         await self.dispatch("b")
         self.assertEqual(len(self.cards), 1)
-        self.assertIn("ждёт ответа", self.send_reply_text.await_args.args[2])
+        self.assertIn(_("❓ Вопрос с кнопками выше ещё ждёт ответа."), self.send_reply_text.await_args.args[2])
 
     async def test_other_options_or_answered_or_old_sent_again(self) -> None:
         self.answer = "<<ASK: Отправлять? | да | нет>>"
@@ -190,7 +192,7 @@ class DailyPinTests(unittest.TestCase):
         rc, mid, out, err, calls = self._send("--silent", "--pin", "Вопрос дня: другой")
         self.assertEqual((rc, mid, calls), (1, 701, 0))
         self.assertIn("message_id: 701", out)
-        self.assertIn("уже отправлен", err)
+        self.assertRegex(err, msg_re("notify: «{prefix}» за {day} уже отправлен и закреплён, второй не шлю"))
 
     def test_other_pins_and_failed_send_not_counted(self) -> None:
         self.assertEqual(self._send("--pin", "⚠️ Срочно: x")[0], 0)

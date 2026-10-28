@@ -15,6 +15,33 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from claude_tg_bot import bot as botmod
 from claude_tg_bot import limits
 from claude_tg_bot.claude_runner import ClaudeResult, SessionStore, run_claude
+from tests.texts import msg_re
+
+# Тексты бота целиком, как в исходнике: сверка через перевод (tests/texts.py).
+DEFERRED = ": запрос отложен до {when} и уйдёт сам фоновым раном."
+NOT_MOVED = ": запрос не ушёл в Claude, повтори после {when}."
+WILL_CONTINUE = "продолжу сам в {when}"
+RETRY_AFTER = "повтори после {when}"
+RETRIES_USED = "повторы исчерпаны, продолжи сам после {when}"
+RETRY_NOT_SET = "повтор не поставлен, повтори сам после {when}"
+RETRY_WRAP = ("{head} Лимит Claude сбросился. Прошлый запуск по этому запросу оборвался на исчерпании "
+              "лимита: сначала проверь, что уже сделано, и продолжи, не повторяя сделанного.\n\n"
+              "Запрос:\n{prompt}")
+TODO_LATER = "⏸ поручения из сообщения Claude выполнит сам в {when}"
+TODO_RETRIES_USED = "⏸ повторы исчерпаны: поручения из сообщения повтори сам после {when}"
+TODO_NOT_SET = "⏸ задание не поставлено: поручения из сообщения повтори сам после {when}"
+TODO_TASK = ("Лимит Claude сбросился. Пока его не было, на сообщение Ивана ответил Codex только "
+             "разговором, без действий. Заново на сообщение не отвечай. До исчерпания Claude мог "
+             "успеть часть поручений: сначала проверь журнал, дневник и прочие следы, что уже "
+             "сделано, и не повторяй сделанного. Оставшиеся поручения выполни и коротко отчитайся.\n\n"
+             "Сообщение Ивана:\n{prompt}\n\nЧто Claude успел ответить до исчерпания:\n{done}"
+             "\n\nОтвет Codex:\n{body}")
+TALK = ("Claude сейчас недоступен: лимит подписки исчерпан до {when}. Ты отвечаешь Ивану вместо "
+        "Домового только разговором: памяти и инструментов Домового у тебя нет, ничего не меняй и "
+        "не записывай. Если в сообщении есть поручение (записать, отправить, изменить, напомнить), "
+        "не выполняй его, а скажи, что Claude выполнит его после сброса лимита, и последней строкой "
+        "ответа напиши ровно {mark}. Без поручения эту строку не пиши.\n\n"
+        "Сообщение Ивана:\n{prompt}")
 
 NOW = 1_792_500_000.0
 # Событие из живого прогона `claude -p --output-format stream-json` 20.10.2026.
@@ -235,7 +262,7 @@ class HoldTests(_HoldBase):
         payload = json.loads(next(iter(self.ctx.at.data.values()))["v"])
         self.assertEqual(payload["prompt"], "сделай")
         self.assertAlmostEqual(payload["fire_at"], now + 1800 + limits.GRACE_SEC, delta=1)
-        self.assertIn("отложен", self.msg.reply_text.call_args.args[0])
+        self.assertRegex(self.msg.reply_text.call_args.args[0], msg_re(DEFERRED))
 
     async def test_domovoy_background_yields_too(self) -> None:
         now = time.time()
@@ -257,20 +284,20 @@ class HoldTests(_HoldBase):
         limits.record(windows(99, 40, five_reset=now + 1800), observed_at=now)
         self.assertTrue(await self.hold(movable=False))
         self.assertEqual(self.ctx.jobs, [])
-        self.assertIn("повтори после", self.msg.reply_text.call_args.args[0])
+        self.assertRegex(self.msg.reply_text.call_args.args[0], msg_re(NOT_MOVED))
 
     def test_retry_after_error_counts_attempts(self) -> None:
         failed = ClaudeResult(text="⚠️ claude error", is_error=True, limit_hit=True, limit_reset=time.time() + 600)
         first = botmod._limit_after_error(self.ctx, failed, "200", 200, None, "сделай",
                                           unattended=False, untrusted=False, movable=True, limit_retry=0)
-        self.assertIn("продолжу сам", first.text)
+        self.assertRegex(first.text, msg_re(WILL_CONTINUE))
         payload = json.loads(next(iter(self.ctx.at.data.values()))["v"])
         self.assertEqual(payload["limit_retry"], 1)
-        self.assertIn("проверь, что уже сделано", payload["prompt"])
+        self.assertRegex(payload["prompt"], msg_re(RETRY_WRAP))
         last = botmod._limit_after_error(self.ctx, failed, "200", 200, None, "сделай",
                                          unattended=False, untrusted=False, movable=True,
                                          limit_retry=limits.MAX_RETRIES)
-        self.assertIn("повторы исчерпаны", last.text)
+        self.assertRegex(last.text, msg_re(RETRIES_USED))
         self.assertEqual(len(self.ctx.jobs), 1)
 
     def test_codex_answer_leaves_requests_for_claude_after_reset(self) -> None:
@@ -278,11 +305,10 @@ class HoldTests(_HoldBase):
         answer = ClaudeResult(text=f"GPT: запишу после сброса\n{botmod.LIMIT_TODO_MARK}")
         out = botmod._limit_follow_up(self.ctx, answer, failed, "100", 100, None, "запиши в дневник",
                                       limit_retry=0)
-        self.assertIn("Claude выполнит сам", out.text)
+        self.assertRegex(out.text, msg_re(TODO_LATER))
         self.assertNotIn(botmod.LIMIT_TODO_MARK, out.text)
         payload = json.loads(next(iter(self.ctx.at.data.values()))["v"])
-        self.assertIn("Заново на сообщение не отвечай", payload["prompt"])
-        self.assertIn("проверь журнал", payload["prompt"])
+        self.assertRegex(payload["prompt"], msg_re(TODO_TASK))
         self.assertIn("запиши в дневник", payload["prompt"])
         self.assertEqual(payload["limit_retry"], 1)
 
@@ -298,7 +324,7 @@ class HoldTests(_HoldBase):
         answer = ClaudeResult(text=f"GPT\n{botmod.LIMIT_TODO_MARK}")
         out = botmod._limit_follow_up(self.ctx, answer, failed, "100", 100, None, "запиши",
                                       limit_retry=limits.MAX_RETRIES)
-        self.assertIn("повторы исчерпаны", out.text)
+        self.assertRegex(out.text, msg_re(TODO_RETRIES_USED))
         self.assertEqual(self.ctx.jobs, [])
 
     async def test_hold_deferral_is_counted(self) -> None:
@@ -322,7 +348,7 @@ class HoldTests(_HoldBase):
 
     def test_talk_prompt_forbids_actions(self) -> None:
         text = botmod._limit_talk_prompt("запиши в дневник", time.time() + 600)
-        self.assertIn("ничего не меняй", text)
+        self.assertRegex(text, msg_re(TALK))
         self.assertIn("запиши в дневник", text)
 
 
@@ -351,7 +377,7 @@ class DispatchTests(_Base):
         msg = await self.dispatch("сделай")
         self.assertEqual(self.runs, [])
         self.assertEqual(self.jobs[0]["prompt"], "сделай")
-        self.assertIn("отложен", msg.reply_text.await_args.args[0])
+        self.assertRegex(msg.reply_text.await_args.args[0], msg_re(DEFERRED))
 
     async def test_reserve_chat_owner_message_still_runs(self) -> None:
         now = time.time()
@@ -378,9 +404,9 @@ class DispatchTests(_Base):
                                  text=f"GPT: запишу потом\n{botmod.LIMIT_TODO_MARK}"))) as codex:
             await self.dispatch("запиши в дневник")
         self.assertEqual(codex.await_args.kwargs["sandbox"], "read-only")
-        self.assertIn("ничего не меняй", codex.await_args.args[1])
-        self.assertIn("Заново на сообщение не отвечай", self.jobs[0]["prompt"])
-        self.assertIn("Claude выполнит сам", self.send_reply_text.await_args.args[2])
+        self.assertRegex(codex.await_args.args[1], msg_re(TALK))
+        self.assertRegex(self.jobs[0]["prompt"], msg_re(TODO_TASK))
+        self.assertRegex(self.send_reply_text.await_args.args[2], msg_re(TODO_LATER))
 
     async def test_limit_hit_without_codex_is_retried_after_reset(self) -> None:
         reset = time.time() + 900
@@ -393,7 +419,7 @@ class DispatchTests(_Base):
         with patch.object(botmod, "run_claude", failed):
             await self.dispatch("сделай")
         self.assertEqual(self.jobs[0]["limit_retry"], 1)
-        self.assertIn("продолжу сам", self.send_reply_text.await_args.args[2])
+        self.assertRegex(self.send_reply_text.await_args.args[2], msg_re(WILL_CONTINUE))
 
     async def test_plan_after_limit_is_not_moved_or_sent_to_codex(self) -> None:
         self.cfg.codex_bin = "codex"
@@ -409,7 +435,7 @@ class DispatchTests(_Base):
             await self.dispatch("план", permission_mode="plan")
         codex.assert_not_awaited()
         self.assertEqual(self.jobs, [])
-        self.assertIn("повтори после", self.send_reply_text.await_args.args[2])
+        self.assertRegex(self.send_reply_text.await_args.args[2], msg_re(RETRY_AFTER))
 
     async def test_other_chat_limit_talks_read_only_never_with_write_sandbox(self) -> None:
         self.cfg.codex_bin = "codex"
@@ -427,6 +453,26 @@ class DispatchTests(_Base):
             await self.dispatch("сделай")
         self.assertEqual(codex.await_args.kwargs["sandbox"], "read-only")
         self.assertEqual(self.jobs, [])
+
+    async def test_fallback_write_sandbox_only_for_ivan_text(self) -> None:
+        # Запасной путь с записью только у текста Ивана; фон, кнопки и план
+        # на чтение, что бы ни стояло в настройке (проект шага 1, 2.1).
+        self.cfg.codex_bin = "codex"
+        self.cfg.codex_fallback = True
+        self.cfg.codex_fallback_sandbox = "workspace-write"
+
+        async def down(_bin, chat_key, _cid, _tid, prompt, store, **kw):
+            return ClaudeResult(text="⚠️ claude error", session_id="s", is_error=True, api_error_status=503)
+
+        cases = [({}, "workspace-write"), ({"unattended": True}, "read-only"),
+                 ({"from_callback": True}, "read-only"), ({"expect_epoch": 0}, "read-only"),
+                 ({"expect_plan": 0}, "read-only"), ({"permission_mode": "plan"}, "read-only")]
+        for kw, want in cases:
+            with self.subTest(kw=kw), patch.object(botmod, "run_claude", down), \
+                    patch.object(botmod, "_codex_as_claude_result",
+                                 AsyncMock(return_value=ClaudeResult(text="GPT"))) as codex:
+                await self.dispatch("сделай", **kw)
+                self.assertEqual(codex.await_args.kwargs["sandbox"], want)
 
     async def test_broken_reserve_check_does_not_block_the_message(self) -> None:
         with patch.object(botmod.limits, "reserve", side_effect=RuntimeError("x")):
@@ -457,7 +503,7 @@ class SecondRoundTests(_HoldBase):
                                   unattended=True, untrusted=False, movable=True, limit_retry=1)
         first = json.loads(next(iter(self.ctx.at.data.values()))["v"])["prompt"]
         self.assertTrue(first.startswith(botmod.LIMIT_RETRY_HEAD))
-        self.assertIn("проверь, что уже сделано", first)
+        self.assertRegex(first, msg_re(RETRY_WRAP))
         self.ctx.at.data.clear()
         botmod._limit_after_error(self.ctx, failed, "200", 200, None, first,
                                   unattended=True, untrusted=False, movable=True, limit_retry=2)
@@ -469,11 +515,11 @@ class SecondRoundTests(_HoldBase):
         self.ctx.application.job_queue.run_once = MagicMock(side_effect=OSError("disk full"))
         out = botmod._limit_follow_up(self.ctx, ClaudeResult(text=f"GPT\n{botmod.LIMIT_TODO_MARK}"),
                                       failed, "100", 100, None, "запиши", limit_retry=0)
-        self.assertIn("задание не поставлено", out.text)
+        self.assertRegex(out.text, msg_re(TODO_NOT_SET))
         self.assertEqual(self.ctx.at.data, {})
         err = botmod._limit_after_error(self.ctx, failed, "200", 200, None, "сделай",
                                         unattended=False, untrusted=False, movable=True, limit_retry=0)
-        self.assertIn("повтор не поставлен", err.text)
+        self.assertRegex(err.text, msg_re(RETRY_NOT_SET))
 
     def test_warm_yields_in_reserve_even_in_domovoy_chat(self) -> None:
         now = time.time()

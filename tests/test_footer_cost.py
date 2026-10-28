@@ -16,6 +16,15 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import claude_runner as cr  # noqa: E402
 from claude_tg_bot import replies  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
+
+
+def _cost(cost: float, session: float) -> str:
+    return _("💸 ${cost:.2f} (сессия ${session:.2f})").format(cost=cost, session=session)
+
+
+def _ctx(tokens: int) -> str:
+    return _("🧠 контекст {tokens}k").format(tokens=tokens)
 
 
 def _assistant(inp: int, read: int, create: int, parent: str | None = None) -> dict:
@@ -84,29 +93,29 @@ class FooterTests(unittest.IsolatedAsyncioTestCase):
     async def test_answer_session_and_context(self) -> None:
         text = await self._footer(cr.ClaudeResult(
             text="", cost_usd=0.47, session_cost_usd=35.91, context_tokens=292_000, context_max=300_000))
-        self.assertEqual(text, "💸 $0.47 (сессия $35.91) · 🧠 контекст 292k\n"
-                               "⚠️ контекст большой: /reset удешевит и ускорит следующие ответы")
+        self.assertEqual(text, _cost(0.47, 35.91) + " · " + _ctx(292)
+                         + _("\n⚠️ контекст большой: /reset удешевит и ускорит следующие ответы"))
 
     async def test_max_shown_when_notably_larger(self) -> None:
         text = await self._footer(cr.ClaudeResult(
             text="", cost_usd=0.1, session_cost_usd=1.0, context_tokens=50_000, context_max=120_000))
-        self.assertEqual(text, "💸 $0.10 (сессия $1.00) · 🧠 контекст 50k (макс 120k)")
+        self.assertEqual(text, _cost(0.1, 1.0) + " · " + _ctx(50) + _(" (макс {max}k)").format(max=120))
 
     async def test_unknown_answer_cost_and_compacted(self) -> None:
         text = await self._footer(cr.ClaudeResult(
             text="", cost_usd=None, session_cost_usd=3.0, context_tokens=0, compacted=True))
-        self.assertEqual(text, "💸 сессия $3.00 · 🧠 контекст сжат")
+        self.assertEqual(text, _("💸 сессия ${session:.2f}").format(session=3.0) + " · " + _("🧠 контекст сжат"))
         text = await self._footer(cr.ClaudeResult(
             text="", cost_usd=0.2, session_cost_usd=3.0, context_tokens=0, context_max=300_000,
             compacted=True))
-        self.assertEqual(text, "💸 $0.20 (сессия $3.00) · 🧠 контекст сжат (макс 300k)")
+        self.assertEqual(text, _cost(0.2, 3.0) + " · " + _("🧠 контекст сжат") + _(" (макс {max}k)").format(max=300))
 
     async def test_no_reset_hint_with_autocompact(self) -> None:
         cfg = SimpleNamespace(show_cost_footer=True, context_warn_tokens=200_000)
         msg = SimpleNamespace(reply_text=AsyncMock())
         await replies.send_cost_footer(cfg, SimpleNamespace(message=msg), cr.ClaudeResult(
             text="", cost_usd=0.1, session_cost_usd=2.0, context_tokens=250_000), warn_reset=False)
-        self.assertEqual(msg.reply_text.call_args.args[0], "💸 $0.10 (сессия $2.00) · 🧠 контекст 250k")
+        self.assertEqual(msg.reply_text.call_args.args[0], _cost(0.1, 2.0) + " · " + _ctx(250))
 
     async def test_no_spend_no_footer(self) -> None:
         self.assertIsNone(await self._footer(cr.ClaudeResult(text="", cost_usd=0.0)))
@@ -139,7 +148,7 @@ class CompactionFooterTests(unittest.IsolatedAsyncioTestCase):
             text="", cost_usd=0.5, session_cost_usd=2.0, context_tokens=220_000,
             context_max=230_000, compacted=2))
         self.assertEqual(msg.reply_text.call_args.args[0],
-                         "💸 $0.50 (сессия $2.00) · 🧠 контекст 220k, сжатий 2")
+                         _cost(0.5, 2.0) + " · " + _ctx(220) + _(", сжатий {count}").format(count=2))
 
 
 if __name__ == "__main__":

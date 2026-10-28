@@ -29,6 +29,7 @@ from claude_tg_bot import approval  # noqa: E402
 from claude_tg_bot import bot as botmod  # noqa: E402
 from claude_tg_bot import claude_runner  # noqa: E402
 from claude_tg_bot import tasks  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult, SessionStore  # noqa: E402
 from claude_tg_bot.skills.news_digest.core import Item  # noqa: E402
 from telegram import Chat, Message, MessageEntity, MessageOriginUser, Update, User  # noqa: E402
@@ -38,6 +39,7 @@ from telegram.ext import CommandHandler  # noqa: E402
 # Настоящий роутер Свода и разметка ограждений: помощники из test_tasks.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_tasks import _fenced, _resolve_pin  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 USER = 7
 GROUP = -100
@@ -270,6 +272,17 @@ def _buttons(markup) -> list[str]:
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
+def _busy_note(name: str) -> str:
+    """Ответ «занято», пока выполняется задача name."""
+    return _("⏳ Сейчас выполняется {who}. Когда закончится, нажми «Делай» ещё раз или напиши «делай».").format(
+        who=_("«{name}»").format(name=name))
+
+
+def _task_words_head() -> str:
+    """Начало задания рана по новой задаче, до слов владельца."""
+    return _("Владелец поставил задачу. Его слова:\n{words}{extra}\n\nЭто тема задачи.\n{rules}").partition("{words}")[0]
+
+
 class ThinkTests(_TaskBase):
     """Обдумывание: только чтение, проект под «Делай» лишь у ответа с
     маркером и только если Иван не писал, пока ответ писался."""
@@ -288,7 +301,8 @@ class ThinkTests(_TaskBase):
         sent = botmod.send_reply_text.await_args.args[2]
         self.assertNotIn("<<DO", sent)
         self.assertEqual(self.do_markups(msg), [[f"nt:t7-5:do:{SHA}"]])
-        self.assertIn("Проект решения готов", self.card_texts()[-1])
+        self.assertIn(_("Проект решения готов: «▶️ Делай» под ним или напиши «делай». Другое сообщение продолжит обдумывание."),
+                      self.card_texts()[-1])
 
     async def test_marker_only_from_last_answer(self) -> None:
         # Проект с маркером, потом ответ по уведомлению без маркера: проект
@@ -383,7 +397,7 @@ class DoTests(_TaskBase):
         # итог в теме, в личку ничего до закрытия (решение Ивана 19.10.2026)
         self.assertIn("проверил рендер", botmod.send_reply_text.await_args.args[2])
         self.assertEqual(self.personal(), [])
-        self.assertIn(tasks.STAGE_LINES["done"], self.card_texts()[-1])
+        self.assertIn(_(tasks.STAGE_LINES["done"]), self.card_texts()[-1])
 
     async def test_summary_kept_when_agent_answers_notification_after_it(self) -> None:
         # Разбор задач 19.10.2026: после сводки пришло уведомление фоновой
@@ -406,7 +420,7 @@ class DoTests(_TaskBase):
         await self.press(f"nt:t7-5:do:{SHA}")
         task = self.task("t7-5")
         self.assertEqual((task["status"], task["result_ok"]), ("failed", False))
-        self.assertEqual(task["result"], tasks.EXEC_UNCONFIRMED)
+        self.assertEqual(task["result"], _(tasks.EXEC_UNCONFIRMED))
 
     async def test_news_exec_in_fresh_session(self) -> None:
         self.put_task()
@@ -424,7 +438,7 @@ class DoTests(_TaskBase):
         self.assertNotIn("Да, делай", self.runs[0]["prompt"])
         self.assertIn("прочитать README", self.runs[0]["prompt"])
         self.assertEqual(self.task("t7-5")["status"], "done")
-        self.assertIn("▶️ Выполняю", self.topic_texts(msg))
+        self.assertIn(_("▶️ Выполняю"), self.topic_texts(msg))
 
     async def test_bare_yes_is_not_approval(self) -> None:
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
@@ -434,7 +448,8 @@ class DoTests(_TaskBase):
         self.assertEqual(self.task("t7-5")["status"], "thinking")
         # старая кнопка после этого не выполняет
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("уже не действует", query.answer.call_args.args[0])
+        self.assertEqual(_("Этот проект уже не действует: под последним проектом своя кнопка"),
+                         query.answer.call_args.args[0])
         self.assertEqual(len(self.runs), 1)
 
     async def test_correction_then_old_button_stale_new_button_runs(self) -> None:
@@ -445,7 +460,8 @@ class DoTests(_TaskBase):
         new_sha = tasks.plan_sha(new_plan)
         self.assertEqual(self.task("t7-5")["plan_sha"], new_sha)
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("уже не действует", query.answer.call_args.args[0])
+        self.assertEqual(_("Этот проект уже не действует: под последним проектом своя кнопка"),
+                         query.answer.call_args.args[0])
         self.assertEqual(len(self.runs), 1)
         await self.press(f"nt:t7-5:do:{new_sha}")
         self.assertIn("оба файла", self.runs[-1]["prompt"])
@@ -457,9 +473,9 @@ class DoTests(_TaskBase):
         while not self.runs:
             await asyncio.sleep(0)
         again = await self.press(f"nt:t7-5:do:{SHA}", press_id="q-1")
-        self.assertIn("уже принято", again.answer.call_args.args[0])
+        self.assertIn(_("Это нажатие уже принято"), again.answer.call_args.args[0])
         other = await self.press(f"nt:t7-5:do:{SHA}", press_id="q-2")
-        self.assertIn("уже одобрен", other.answer.call_args.args[0])
+        self.assertIn(_("Этот проект уже одобрен"), other.answer.call_args.args[0])
         msg = _msg()
         msg.text = "делай"
         self.assertTrue(await botmod._task_touch(self.ctx, _update(msg), "делай") is False)
@@ -536,7 +552,9 @@ class DoTests(_TaskBase):
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
         await self.press(f"nt:t7-5:do:{SHA}")
         self.codex.assert_not_awaited()
-        self.assertTrue(any("в GPT не передаю" in t for t in self.topic_texts()))
+        self.assertTrue(any(_("⚠️ claude недоступен, выполнение в GPT не передаю. Проверь, что успело сделаться; "
+                               "повторить: напиши здесь, что дальше, и «делай» под новым проектом") in t
+                             for t in self.topic_texts()))
         self.assertEqual(self.task("t7-5")["status"], "failed")
 
     async def test_message_after_done_thinks_again(self) -> None:
@@ -562,7 +580,8 @@ class SkillMarkerTests(_TaskBase):
         task = self.task("t7-5")
         self.assertEqual((task["status"], task["skill"]), ("proposed", "immich-upgrade"))
         self.assertEqual(len(self.do_markups(msg)), 1)
-        self.assertTrue(any("по скиллу «immich-upgrade»" in t for t in self.topic_texts(msg)))
+        self.assertTrue(any(_(" (по скиллу «{skill}»)").format(skill="immich-upgrade") in t
+                            for t in self.topic_texts(msg)))
 
 
 class QueueTests(_TaskBase):
@@ -577,7 +596,7 @@ class QueueTests(_TaskBase):
         while not self.runs:
             await asyncio.sleep(0)
         query = await self.press(f"nt:t7-6:do:{SHA}", press_id="q-busy")
-        self.assertIn("Сейчас выполняется «1 README»", query.answer.call_args.args[0])
+        self.assertIn(_busy_note("1 README"), query.answer.call_args.args[0])
         self.assertEqual(self.task("t7-6")["status"], "proposed")
         query.edit_message_reply_markup.assert_not_awaited()  # кнопка остаётся
         self.gate.set()
@@ -594,7 +613,7 @@ class QueueTests(_TaskBase):
                          exec_started="2026-10-19T10:00:00+04:00", name="1 README")
         self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA)
         msg = await self.say("делай", thread=79)
-        self.assertTrue(any("Сейчас выполняется «1 README»" in t for t in self.topic_texts(msg)))
+        self.assertTrue(any(_busy_note("1 README") in t for t in self.topic_texts(msg)))
         self.assertEqual(self.task("t7-6")["status"], "proposed")
         self.assertEqual(self.runs, [])
 
@@ -608,7 +627,9 @@ class QueueTests(_TaskBase):
         msg.text = "стоп, не трогай CHANGELOG"
         later = asyncio.ensure_future(botmod.on_text(_update(msg), self.ctx))
         await asyncio.sleep(0.05)
-        self.assertTrue(any("ещё работает" in t for t in self.topic_texts(msg)))
+        self.assertTrue(any(_("⏳ claude ещё работает над прошлым запросом, этот встанет в очередь. "
+                               "/cancel прервёт текущий, «!текст» прервёт его и сразу отправит поправку") in t
+                             for t in self.topic_texts(msg)))
         self.gate.set()
         await first
         await later
@@ -650,7 +671,8 @@ class QueueTests(_TaskBase):
         msg.text = "стоп, не выполняй, сначала покажи diff"
         later = asyncio.ensure_future(botmod.on_text(_update(msg), self.ctx))
         await asyncio.sleep(0.05)
-        self.assertTrue(any("одобрение снял" in t for t in self.topic_texts(msg)))
+        self.assertTrue(any(_("Выполнение ещё не началось, одобрение снял: обдумываем дальше, "
+                               "выполнение после нового «Делай».") in t for t in self.topic_texts(msg)))
         lock.release()
         await later
         await self.settle()
@@ -687,7 +709,18 @@ class QueueTests(_TaskBase):
                                          send_voice_reply=False, from_callback=True)
         self.assertEqual(self.task("t7-5")["status"], "thinking")
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("уже не действует", query.answer.call_args.args[0])
+        self.assertEqual(_("Этот проект уже не действует: под последним проектом своя кнопка"),
+                         query.answer.call_args.args[0])
+
+    async def test_login_refusal_keeps_proposal(self) -> None:
+        # Отказ восстановлением входа стоит до хода в теме задачи: проект под
+        # «Делай» не снимается (проект шага 1, 2.2).
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        self.bot_data["login_manager"] = SimpleNamespace(session=object())
+        await botmod._dispatch_to_claude(_update(_msg()), self.ctx, "ещё подумай",
+                                         send_voice_reply=False)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.task("t7-5")["status"], "proposed")
 
     async def test_not_started_waits_for_do_again(self) -> None:
         # Восстановление входа: ран не стартовал, проект снова ждёт «Делай»,
@@ -697,7 +730,8 @@ class QueueTests(_TaskBase):
         await self.press(f"nt:t7-5:do:{SHA}", press_id="q-login")
         self.assertEqual(self.runs, [])
         self.assertEqual(self.task("t7-5")["status"], "proposed")
-        self.assertTrue(any("не запустилось" in c.args[1] for c in self.bot.send_message.await_args_list))
+        self.assertTrue(any(_("Выполнение не запустилось. Делать по проекту выше?") in c.args[1]
+                            for c in self.bot.send_message.await_args_list))
         self.bot_data["login_manager"] = None
         await self.press(f"nt:t7-5:do:{SHA}")
         self.assertEqual(len(self.runs), 1)
@@ -718,7 +752,8 @@ class QueueTests(_TaskBase):
             await self.press(f"nt:t7-5:do:{SHA}")
         self.assertEqual(self.runs, [])
         self.assertEqual(self.task("t7-5")["status"], "proposed")
-        self.assertTrue(any("из-за рестарта" in t for t in self.card_texts()))
+        self.assertTrue(any(_("Выполнение не запустилось из-за рестарта: после него скажи «делай» ещё раз.") in t
+                            for t in self.card_texts()))
         self.bot_data["draining"] = False
         with patch.dict(os.environ, {"NEWS_TG_CHAT_ID": ""}):
             await botmod._tasks_startup(self.ctx)
@@ -731,7 +766,7 @@ class QueueTests(_TaskBase):
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
         self.bot_data["draining"] = True
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("после рестарта", query.answer.call_args.args[0])
+        self.assertIn(_("♻️ бот готовится к перезапуску: скажи «делай» после рестарта"), query.answer.call_args.args[0])
         self.assertEqual(self.task("t7-5")["status"], "proposed")
 
 
@@ -813,10 +848,47 @@ class RaceTests(_TaskBase):
         query = SimpleNamespace(data="ask:tok", answer=AsyncMock(side_effect=answer), message=card,
                                 edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
         await botmod.on_ask_pick(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=USER),
-                                                 update_id=3), self.ctx)
+                                                 effective_chat=card.chat, update_id=3), self.ctx)
         await self.settle()
         self.assertEqual(statuses, ["thinking"])
         self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+
+    async def test_stale_ask_button_keeps_proposal(self) -> None:
+        # Кнопка прежней сессии получает отказ и проект под «Делай» не снимает
+        # (ревью /2mind 25.10.2026).
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        key = f"{GROUP}:{THREAD}"
+        self.bot_data["ask_options"] = {"tok": {"chat_key": key, "answer": "на ПК", "question": "Где?",
+                                                "card": 1, "epoch": botmod._session_epoch(self.ctx, key),
+                                                "permission_mode": "plan"}}
+        botmod._bump_session_epoch(self.ctx, key)
+        card = _msg()
+        card.text = "Где?"
+        card.chat = SimpleNamespace(id=GROUP, type="supergroup")
+        query = SimpleNamespace(data="ask:tok", answer=AsyncMock(), message=card,
+                                edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
+        await botmod.on_ask_pick(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=USER),
+                                                 effective_chat=card.chat, update_id=3), self.ctx)
+        await self.settle()
+        self.assertEqual(self.task("t7-5")["status"], "proposed")
+        self.assertEqual(self.runs, [])
+        self.assertIn(botmod._ask_pick_refusal({"question": "Где?", "answer": "на ПК"}),
+                      query.edit_message_text.await_args.args[0])
+
+    async def test_stale_ask_button_under_lock_keeps_proposal(self) -> None:
+        # Сессия сменилась, пока ответ ждал замка: _task_turn не зовётся.
+        self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
+        key = f"{GROUP}:{THREAD}"
+        epoch = botmod._session_epoch(self.ctx, key)
+        botmod._bump_session_epoch(self.ctx, key)
+        msg = _msg()
+        await botmod._dispatch_to_claude(SimpleNamespace(message=msg, effective_chat=SimpleNamespace(id=GROUP),
+                                                         update_id=4), self.ctx, "ответ",
+                                         send_voice_reply=False, permission_mode="plan", from_callback=True,
+                                         expect_epoch=epoch, ask_ref={"question": "Где?", "answer": "на ПК"})
+        await self.settle()
+        self.assertEqual(self.task("t7-5")["status"], "proposed")
+        self.assertEqual(self.runs, [])
 
     async def test_message_while_exec_result_goes_out(self) -> None:
         # Замок темы уже свободен, итог выполнения ещё отправляется: новое
@@ -851,7 +923,7 @@ class RaceTests(_TaskBase):
         await botmod._tasks_housekeeping(self.ctx)
         notes = [c for c in self.bot.send_message.await_args_list if c.args and c.args[0] == USER]
         self.assertEqual(len(notes), 1)
-        self.assertEqual(notes[0].args[1], "✅ Задача «1 README»: обновил README")
+        self.assertEqual(notes[0].args[1], _("✅ Задача «{name}»").format(name="1 README") + ": обновил README")
         self.assertEqual(notes[0].kwargs["reply_parameters"].message_id, 41)
         task = self.task("t7-3")
         self.assertEqual(task["status"], "closed")
@@ -887,7 +959,7 @@ class RaceTests(_TaskBase):
         await botmod._tasks_housekeeping(self.ctx)
         self.assertIsNone(self.task("t7-3")["note_due"])
         sent = [c.args[1] for c in self.bot.send_message.await_args_list if c.args and c.args[0] == USER]
-        self.assertEqual(sent[-1], "❌ Задача «1 README»: упал")
+        self.assertEqual(sent[-1], _("❌ Задача «{name}»").format(name="1 README") + ": упал")
 
     async def test_close_note_claimed_by_one_sender(self) -> None:
         # Уборка, пока строка уже отправляется кнопкой, её второй раз не шлёт
@@ -955,13 +1027,14 @@ class RecoverTests(_TaskBase):
         await botmod._tasks_recover(self.ctx)
         a, b = self.task("t7-5"), self.task("t7-6")
         self.assertEqual((a["status"], a["result_ok"]), ("failed", False))
-        self.assertIn("прервал рестарт", a["result"])
+        self.assertIn(_("Выполнение прервал рестарт бота: проверь, что успело сделаться."), a["result"])
         self.assertEqual(self.personal(), [])
         # не стартовавшее снова ждёт «Делай» с новой кнопкой, повтора вслепую
         # нет (ревью Codex 15.10)
         self.assertEqual(b["status"], "proposed")
         self.assertEqual(self.runs, [])
-        self.assertTrue(any("не запустилось" in c.args[1] for c in self.bot.send_message.await_args_list))
+        self.assertTrue(any(_("Выполнение не запустилось. Делать по проекту выше?") in c.args[1]
+                            for c in self.bot.send_message.await_args_list))
 
     async def test_thinking_cut_by_crash_is_reported(self) -> None:
         # Разбор 19.10.2026: OOM оборвал обдумывание, тема молчала 7,5 часа
@@ -969,8 +1042,8 @@ class RecoverTests(_TaskBase):
         self.put_command("t7-6", thread=79, status="thinking")
         await botmod._tasks_recover(self.ctx)
         said = [(c.kwargs.get("message_thread_id"), c.args[1]) for c in self.bot.send_message.await_args_list]
-        self.assertIn((THREAD, tasks.THINK_INTERRUPTED), said)
-        self.assertNotIn((79, tasks.THINK_INTERRUPTED), said)
+        self.assertIn((THREAD, _(tasks.THINK_INTERRUPTED)), said)
+        self.assertNotIn((79, _(tasks.THINK_INTERRUPTED)), said)
         self.assertIsNone(self.task("t7-5").get("think_open"))
 
     async def test_cut_thinking_notice_kept_until_sent(self) -> None:
@@ -1073,23 +1146,23 @@ class HousekeepingTests(_TaskBase):
         await self.press("nt:t7-5:close")
         self.assertEqual(self.task("t7-5")["status"], "closed")
         self.bot.close_forum_topic.assert_awaited_once_with(GROUP, THREAD)
-        self.assertIn("Задача закрыта", self.card_texts()[-1])
+        self.assertIn(_("Задача закрыта. Тема удалится завтра утром."), self.card_texts()[-1])
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("устарела", query.answer.call_args.args[0])
+        self.assertEqual(query.answer.call_args.args[0], _("Кнопка устарела или задача уже закрыта"))
         self.assertEqual(self.runs, [])
 
     async def test_old_buttons_say_outdated(self) -> None:
         self.put_task(status="thinking")
         for data in (f"nt:{TID}:ok:{SHA}:bot", f"nt:{TID}:plan", f"nt:{TID}:done"):
             query = await self.press(data)
-            self.assertIn("устарела", query.answer.call_args.args[0])
+            self.assertEqual(query.answer.call_args.args[0], _("Кнопка устарела или задача уже закрыта"))
         self.assertEqual(self.task()["status"], "thinking")
 
     async def test_unreadable_registry_keeps_buttons(self) -> None:
         self.put_task()
         tasks.tasks_path(tasks.registry_dir(self.state)).write_text("{битый", encoding="utf-8")
         query = await self.press(DO)
-        self.assertIn("Реестр задач не читается", query.answer.call_args.args[0])
+        self.assertEqual(query.answer.call_args.args[0], _("Реестр задач не читается, см. журнал"))
         query.edit_message_reply_markup.assert_not_awaited()
         with self.assertLogs(botmod.log, "ERROR"):
             await botmod._tasks_housekeeping(self.ctx)
@@ -1167,7 +1240,7 @@ class CommandTests(_TaskBase):
         self.bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=500))
         # обдумывание идёт в новую тему
         self.topic = _msg(NEW_THREAD)
-        self.ask = SimpleNamespace(from_user=SimpleNamespace(id=BOT_ID, is_bot=True), text=tasks.ASK)
+        self.ask = SimpleNamespace(from_user=SimpleNamespace(id=BOT_ID, is_bot=True), text=_(tasks.ASK))
 
     def command(self, text: str, *, chat_id: int = GROUP, thread: int | None = 55, message_id: int = 31,
                 reply_to=None, forward=None) -> SimpleNamespace:
@@ -1204,13 +1277,14 @@ class CommandTests(_TaskBase):
                          ("command", True, NEW_THREAD, "thinking"))
         self.assertEqual(task["origin"], {"chat_id": USER, "thread_id": None, "ask_id": 31, "message_id": 900})
         key = f"{GROUP}:{NEW_THREAD}"
-        self.assertEqual(self.bot_data["scopes"].get(key), tasks.SCOPE_NOTE)
+        self.assertEqual(self.bot_data["scopes"].get(key), _(tasks.SCOPE_NOTE))
         edit = next(c for c in self.bot.edit_message_text.await_args_list if c.kwargs.get("message_id") == 900)
-        self.assertEqual(edit.args[0], f"Задача «1 поправь README бота»: {tasks.topic_link(GROUP, NEW_THREAD)}")
+        self.assertEqual(edit.args[0], _("Задача «{short}»: {link}").format(
+            short="1 поправь README бота", link=tasks.topic_link(GROUP, NEW_THREAD)))
         # обдумывание сразу, только чтение, ни одной кнопки кроме «Закрыть»
         self.assertEqual(len(self.runs), 1)
         self.assertEqual(self.runs[0]["kw"]["permission_mode"], "plan")
-        self.assertTrue(self.runs[0]["prompt"].startswith("Владелец поставил задачу. Его слова:\nпоправь README бота"))
+        self.assertTrue(self.runs[0]["prompt"].startswith(_task_words_head() + "поправь README бота"))
         card = self.bot.send_message.await_args_list[0]
         self.assertEqual(_buttons(card.kwargs["reply_markup"]), [f"nt:t{USER}-31:close"])
         self.assertEqual(self.do_markups(), [])
@@ -1238,14 +1312,14 @@ class CommandTests(_TaskBase):
         await botmod.on_task(upd, self.ctx)
         self.bot.create_forum_topic.assert_not_awaited()
         text = self.bot.edit_message_text.await_args.args[0]
-        self.assertIn(f"Открыто {tasks.MAX_OPEN} задач", text)
+        self.assertIn(_("Открыто {count} задач, сначала закрой одну:\n").format(count=tasks.MAX_OPEN), text)
         for stage in ("обдумывание", "ждёт «Делай»", "выполняется", "тема заводится", "не вышло"):
-            self.assertIn(stage, text)
+            self.assertIn(_(stage), text)
 
     async def test_empty_task_asks_and_text_answer_creates(self) -> None:
         upd = self.command("/task")
         await botmod.on_task(upd, self.ctx)
-        self.assertEqual(upd.message.reply_text.await_args.args[0], tasks.ASK)
+        self.assertEqual(upd.message.reply_text.await_args.args[0], _(tasks.ASK))
         answer = self.command("почисти логи", reply_to=self.ask)
         await botmod.on_text(answer, self.ctx)
         await self.settle()
@@ -1266,17 +1340,18 @@ class CommandTests(_TaskBase):
         resp = await approval.handle_task(request)
         await self.settle()
         body = json.loads(resp.text)
-        self.assertEqual(body["text"], f"Задача «1 обнови Immich»: {tasks.topic_link(GROUP, NEW_THREAD)}")
+        self.assertEqual(body["text"], _("Задача «{short}»: {link}").format(
+            short="1 обнови Immich", link=tasks.topic_link(GROUP, NEW_THREAD)))
         task = self.task("hk1")
         self.assertEqual((task["source"], task["trusted"], task["context"]), ("command", True, "Иван за рулём"))
         # строка итога после закрытия ответит на сообщение Ивана 77 в личке
         self.assertEqual(task["origin"], {"chat_id": USER, "thread_id": None, "ask_id": 77})
         self.assertEqual(tasks.note_target(task, USER), (USER, 77))
         prompt = self.runs[0]["prompt"]
-        self.assertTrue(prompt.startswith("Владелец поставил задачу. Его слова:\nобнови Immich"))
+        self.assertTrue(prompt.startswith(_task_words_head() + "обнови Immich"))
         self.assertIn("Иван за рулём", prompt)
         again = json.loads((await approval.handle_task(request)).text)
-        self.assertIn("уже заведена", again["text"])
+        self.assertRegex(again["text"], msg_re("Задача уже заведена: {link}"))
         self.bot.create_forum_topic.assert_awaited_once()
         request.json = AsyncMock(return_value={"words": "  "})
         self.assertEqual((await approval.handle_task(request)).status, 400)
@@ -1299,7 +1374,7 @@ class ReviewFixTests(_TaskBase):
         await botmod.on_task_pick(SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=USER),
                                                   update_id=9), self.ctx)
         await self.settle()
-        self.assertIn("не из темы", query.answer.call_args.args[0])
+        self.assertEqual(query.answer.call_args.args[0], _("Кнопка не из темы этой задачи"))
         self.assertEqual(self.runs, [])
 
     async def test_no_proposal_while_ivan_messages_gather(self) -> None:
@@ -1316,7 +1391,7 @@ class ReviewFixTests(_TaskBase):
         self.put_command(status="done", result="✅ Готово", result_ok=True)
         await botmod._dispatch_to_claude(_update(_msg()), self.ctx, "а ещё X", send_voice_reply=False)
         await self.settle()
-        self.assertTrue(any(tasks.STAGE_LINES["thinking"] in t for t in self.card_texts()))
+        self.assertTrue(any(_(tasks.STAGE_LINES["thinking"]) in t for t in self.card_texts()))
 
 
 class AdditionTests(_TaskBase):
@@ -1339,13 +1414,15 @@ class AdditionTests(_TaskBase):
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
         self.replies = ["Понял так: сначала бэкап; проверю по списку файлов"]
         text = await self.add("t7-5", "сначала сделай бэкап", "Иван за рулём")
-        self.assertEqual(text, f"Добавил в задачу «1 README»: {tasks.topic_link(GROUP, THREAD)}")
-        self.assertEqual(self.echoes(), ["📨 Через Домового: сначала сделай бэкап"])
+        self.assertEqual(text, _("Добавил в задачу «{name}»: {link}").format(
+            name="1 README", link=tasks.topic_link(GROUP, THREAD)))
+        self.assertEqual(self.echoes(), [_("📨 Через Домового: {words}").format(words="сначала сделай бэкап")])
         self.assertEqual(len(self.runs), 1)
         run = self.runs[0]
         self.assertEqual((run["kw"]["permission_mode"], run["chat_key"]), ("plan", f"{GROUP}:{THREAD}"))
-        self.assertTrue(run["prompt"].startswith("Владелец пишет в эту задачу через Домового. Его слова:\n"
-                                                 "сначала сделай бэкап"))
+        self.assertTrue(run["prompt"].startswith(
+            _("Владелец пишет в эту задачу через Домового. Его слова:\n{words}{extra}").format(
+                words="сначала сделай бэкап", extra="")))
         self.assertIn("Иван за рулём", run["prompt"])
         # проект снят: добавка это ход обдумывания
         self.assertEqual(self.task("t7-5")["status"], "thinking")
@@ -1357,7 +1434,8 @@ class AdditionTests(_TaskBase):
         self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
         self.assertNotEqual(self.task("t7-5")["status"], "running")
         query = await self.press(f"nt:t7-5:do:{SHA}")
-        self.assertIn("уже не действует", query.answer.call_args.args[0])
+        self.assertEqual(_("Этот проект уже не действует: под последним проектом своя кнопка"),
+                         query.answer.call_args.args[0])
 
     async def test_addition_waits_for_running_exec(self) -> None:
         self.put_command(status="running", plan=PLAN, plan_sha=SHA, exec_gen=1,
@@ -1365,7 +1443,8 @@ class AdditionTests(_TaskBase):
         lock = botmod._chat_lock(self.ctx, f"{GROUP}:{THREAD}")
         await lock.acquire()
         text = await botmod._task_from_http(self.ctx, "и CHANGELOG", "", "", chat_key=str(USER), to="t7-5")
-        self.assertIn("после идущего выполнения", text)
+        self.assertEqual(text, _("Добавил в задачу «{name}», агент ответит после идущего выполнения: {link}").format(
+            name="1 README", link=tasks.topic_link(GROUP, THREAD)))
         await asyncio.sleep(0.05)
         self.assertEqual(self.runs, [])
         with tasks.locked(tasks.registry_dir(self.state)) as data:
@@ -1377,9 +1456,11 @@ class AdditionTests(_TaskBase):
     async def test_closed_unknown_and_creating_refused(self) -> None:
         self.put_command("t7-5", status="closed", name="1 README")
         self.put_command("t7-6", thread=None, status="creating")
-        self.assertIn("закрыта: заведи новую", await self.add("t7-5", "ещё"))
-        self.assertIn("Задачи t7-9 нет", await self.add("t7-9", "ещё"))
-        self.assertIn("ещё заводится", await self.add("t7-6", "ещё"))
+        self.assertEqual(await self.add("t7-5", "ещё"),
+                         _("Задача «{name}» закрыта: заведи новую и в пояснении сошлись на неё").format(name="1 README"))
+        self.assertEqual(await self.add("t7-9", "ещё"),
+                         _("Задачи {tid} нет: открытые показывает task_new --open").format(tid="t7-9"))
+        self.assertEqual(await self.add("t7-6", "ещё"), _("Тема задачи ещё заводится: повтори через минуту"))
         self.assertEqual(self.echoes(), [])
         self.assertEqual(self.runs, [])
 
@@ -1387,7 +1468,7 @@ class AdditionTests(_TaskBase):
         self.put_command(name="1 README")
         await self.add("t7-5", "и CHANGELOG", key="k1")
         again = await self.add("t7-5", "и CHANGELOG", key="k1")
-        self.assertIn("Уже добавлено", again)
+        self.assertRegex(again, msg_re("Уже добавлено в задачу «{name}»: {link}"))
         self.assertEqual(len(self.echoes()), 1)
         self.assertEqual(len(self.runs), 1)
 
@@ -1438,7 +1519,7 @@ class AdditionTests(_TaskBase):
         self.assertEqual(self.task("t7-5")["think_open"], botmod.ADD_PENDING)
         await botmod._tasks_recover(self.ctx)
         said = [c.args[1] for c in self.bot.send_message.await_args_list if c.kwargs.get("message_thread_id") == THREAD]
-        self.assertIn(tasks.THINK_INTERRUPTED, said)
+        self.assertIn(_(tasks.THINK_INTERRUPTED), said)
 
     async def test_mark_cleared_after_addition_turn(self) -> None:
         self.put_command()
@@ -1450,15 +1531,15 @@ class AdditionTests(_TaskBase):
         self.put_command(name="1 README")
         await self.add("t7-5", "A", key="kA")
         await self.add("t7-5", "B", key="kB")
-        self.assertIn("Уже добавлено", await self.add("t7-5", "A", key="kA"))
+        self.assertRegex(await self.add("t7-5", "A", key="kA"), msg_re("Уже добавлено в задачу «{name}»: {link}"))
         self.assertEqual(len(self.echoes()), 2)
 
     async def test_only_from_private_chat(self) -> None:
         self.put_command()
         text = await botmod._task_from_http(self.ctx, "ещё", "", "", chat_key=f"{GROUP}:55", to="t7-5")
-        self.assertIn("только из личного чата", text)
+        self.assertEqual(text, _("Добавить в задачу можно только из личного чата с ботом"))
         text = await botmod._task_from_http(self.ctx, "ещё", "", "", to="t7-5")
-        self.assertIn("только из личного чата", text)
+        self.assertEqual(text, _("Добавить в задачу можно только из личного чата с ботом"))
         self.assertEqual(self.echoes(), [])
 
     async def test_http_to_validated(self) -> None:
@@ -1474,7 +1555,8 @@ class AdditionTests(_TaskBase):
         request.json = AsyncMock(return_value={"words": "и CHANGELOG", "to": "t7-5", "chat_key": str(USER)})
         body = json.loads((await approval.handle_task(request)).text)
         await self.settle()
-        self.assertIn("Добавил в задачу «1 README»", body["text"])
+        self.assertRegex(body["text"], msg_re("Добавил в задачу «{name}»: {link}"))
+        self.assertIn("1 README", body["text"])
         self.assertEqual(len(self.task_ids()), 1)  # новой задачи нет
 
 
@@ -1512,8 +1594,8 @@ class CostTests(_TaskBase):
         await self.talk("sid-talk", 0.5)
         await self.talk("sid-talk", 0.8)
         self.assertEqual(self.task()["cost"], {"sid-talk": 0.8})
-        self.assertEqual(self.footer_notes()[-1], "задача ≈$0.80")
-        self.assertTrue(self.card_texts()[-1].endswith("💸 расход около $0.80"))
+        self.assertEqual(self.footer_notes()[-1], _("задача ≈${total:.2f}").format(total=0.8))
+        self.assertTrue(self.card_texts()[-1].endswith(_("💸 расход около ${total:.2f}").format(total=0.8)))
         edits = len(self.card_texts())
         await self.talk("sid-talk", 0.8)
         self.assertEqual((self.task()["cost"], len(self.card_texts())), ({"sid-talk": 0.8}, edits))
@@ -1524,7 +1606,7 @@ class CostTests(_TaskBase):
         await self.press(DO)
         task = self.task()
         self.assertEqual((task["status"], task["cost"]), ("done", {"sid-talk": 0.8, "sid-exec": 0.3}))
-        self.assertEqual(self.footer_notes()[-1], "задача ≈$1.10")
+        self.assertEqual(self.footer_notes()[-1], _("задача ≈${total:.2f}").format(total=1.1))
         # вне темы задачи расход никуда не пишется
         await self.talk("sid-other", 2.0, thread=78)
         self.assertEqual(self.task()["cost"], {"sid-talk": 0.8, "sid-exec": 0.3})
@@ -1535,7 +1617,7 @@ class CostTests(_TaskBase):
         self.put_task(status="thinking")
         await self.talk("sid-1", 5.2)
         self.assertEqual([c for c in self.bot.send_message.await_args_list if "$5" in str(c.args)], [])
-        self.assertIn("около $5.20", self.card_texts()[-1])
+        self.assertIn(_("💸 расход около ${total:.2f}").format(total=5.2), self.card_texts()[-1])
 
 class CardTests(_TaskBase):
     async def test_card_edit_waits_out_flood_control(self) -> None:
@@ -1567,7 +1649,7 @@ class CardTests(_TaskBase):
         self.put_task(status="creating", thread=None)
         query = SimpleNamespace(answer=AsyncMock(), message=_msg(thread=None))
         await botmod._task_start(query, self.cfg, self.ctx, "202610131008", ITEM, datetime.now().astimezone())
-        self.assertIn("уже заводится", query.answer.call_args.args[0])
+        self.assertEqual(query.answer.call_args.args[0], _("Тема задачи по этому пункту уже заводится"))
 
 
 class _RunnerStdin:
