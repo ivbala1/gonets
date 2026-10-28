@@ -25,6 +25,8 @@ from claude_tg_bot.bot import (  # noqa: E402
 )
 from claude_tg_bot.config import DEFAULT_MODEL_CHOICES, load_config  # noqa: E402
 from claude_tg_bot import tasks  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 
 class ModelChoicesConfigTests(unittest.TestCase):
@@ -132,7 +134,7 @@ class ModelButtonsTests(unittest.TestCase):
         markup = bot.sent[0]["reply_markup"]
         labels = [b.text for row in markup.inline_keyboard for b in row]
         self.assertEqual(labels[:2], ["opus (claude-opus-6)", "✅ sonnet"])
-        self.assertIn("алиасы семейств", bot.sent[0]["text"])
+        self.assertIn(_("алиасы семейств, свежую модель подставляет CLI"), bot.sent[0]["text"])
         # Кнопка сохраняет алиас, а не id из подписи: иначе выбор устареет.
         picked = sorted(v[1] for v in ctx.application.bot_data["model_options"].values())
         self.assertEqual(picked, ["", "opus", "sonnet"])
@@ -161,8 +163,8 @@ class ModelButtonsTests(unittest.TestCase):
         # Кнопка ставит модель до конца сессии, а не закрепляет за темой.
         self.assertEqual(_model_for(ctx, ctx.application.bot_data["cfg"], "555"), "m-beta")
         self.assertFalse(ctx.application.bot_data.get("model_by_target"))
-        self.assertIn("m-beta", bot.edited[-1]["text"])
-        self.assertIn("до конца сессии", bot.edited[-1]["text"])
+        self.assertIn(_("🤖 модель в этой ветке: {model}, до конца сессии (со следующего сообщения).").format(
+            model="m-beta"), bot.edited[-1]["text"])
         # Повторный /model: у текущей модели галочка, клик по сбросу снимает override.
         asyncio.run(on_model(_cmd_update(bot), ctx))
         options = ctx.application.bot_data["model_options"]
@@ -177,7 +179,7 @@ class ModelButtonsTests(unittest.TestCase):
         bot = FakeBot()
         ctx = _ctx(_cfg())
         asyncio.run(on_model_pick(_cb_update(bot, "model:deadbeef"), ctx))
-        self.assertIn("устарел", bot.edited[-1]["text"])
+        self.assertIn(_("⚠️ выбор устарел, повтори /model"), bot.edited[-1]["text"])
         self.assertFalse(ctx.application.bot_data.get("model_by_target"))
 
     def test_second_click_on_same_button_is_stale(self) -> None:
@@ -189,7 +191,7 @@ class ModelButtonsTests(unittest.TestCase):
         asyncio.run(on_model_pick(_cb_update(bot, f"model:{tok}"), ctx))
         ctx.application.bot_data["model_by_target"]["555"] = "manual"
         asyncio.run(on_model_pick(_cb_update(bot, f"model:{tok}"), ctx))
-        self.assertIn("устарел", bot.edited[-1]["text"])
+        self.assertIn(_("⚠️ выбор устарел, повтори /model"), bot.edited[-1]["text"])
         self.assertEqual(ctx.application.bot_data["model_by_target"]["555"], "manual")
 
     def test_keyboard_from_other_topic_is_dropped_not_misapplied(self) -> None:
@@ -203,7 +205,7 @@ class ModelButtonsTests(unittest.TestCase):
         )
         asyncio.run(on_model(_cmd_update(bot, chat_id=555), ctx))
         asyncio.run(on_model_pick(_cb_update(bot, f"model:{tok_topic}"), ctx))
-        self.assertIn("устарел", bot.edited[-1]["text"])
+        self.assertIn(_("⚠️ выбор устарел, повтори /model"), bot.edited[-1]["text"])
         self.assertFalse(ctx.application.bot_data.get("model_by_target"))
 
     def test_override_is_per_thread(self) -> None:
@@ -271,9 +273,9 @@ class SessionModelTests(unittest.TestCase):
         ctx.application.bot_data["model_by_target"] = {"555": "m-alpha"}
         self._pick(bot, ctx, "m-beta")
         _activate_pending_model(ctx, "555")
-        self.assertEqual(_model_label(ctx, cfg, "555"), "m-beta ⏳ до конца сессии")
+        self.assertEqual(_model_label(ctx, cfg, "555"), _("{name} ⏳ до конца сессии").format(name="m-beta"))
         _bump_session_epoch(ctx, "555")
-        self.assertEqual(_model_label(ctx, cfg, "555"), "m-alpha 📌 закреплена за темой")
+        self.assertEqual(_model_label(ctx, cfg, "555"), _("{name} 📌 закреплена за темой").format(name="m-alpha"))
 
     def test_pin_button_after_pick_makes_choice_permanent(self) -> None:
         bot, cfg = FakeBot(), _cfg()
@@ -288,21 +290,21 @@ class SessionModelTests(unittest.TestCase):
         self.assertEqual(_model_for(ctx, cfg, "555"), "m-beta")
         # Токен одноразовый: повторный клик ничего не меняет.
         asyncio.run(on_model_pin(_cb_update(bot, pin.callback_data), ctx))
-        self.assertIn("устарел", bot.edited[-1]["text"])
+        self.assertIn(_("⚠️ выбор устарел, повтори /model"), bot.edited[-1]["text"])
 
     def test_text_commands_session_pin_default(self) -> None:
         bot, cfg = FakeBot(), _cfg()
         ctx = _ctx(cfg)
         asyncio.run(on_model(_cmd_update(bot, "/model opus"), ctx))
-        self.assertEqual(_model_label(ctx, cfg, "555"), "opus ⏳ до конца сессии")
+        self.assertEqual(_model_label(ctx, cfg, "555"), _("{name} ⏳ до конца сессии").format(name="opus"))
         self.assertFalse(ctx.application.bot_data.get("model_by_target"))
         asyncio.run(on_model(_cmd_update(bot, "/model pin"), ctx))  # закрепить текущую
-        self.assertEqual(_model_label(ctx, cfg, "555"), "opus 📌 закреплена за темой")
+        self.assertEqual(_model_label(ctx, cfg, "555"), _("{name} 📌 закреплена за темой").format(name="opus"))
         asyncio.run(on_model(_cmd_update(bot, "/model pin fable"), ctx))
         self.assertEqual(ctx.application.bot_data["model_by_target"], {"555": "fable"})
         asyncio.run(on_model(_cmd_update(bot, "/model haiku"), ctx))
         asyncio.run(on_model(_cmd_update(bot, "/model default"), ctx))
-        self.assertEqual(_model_label(ctx, cfg, "555"), "claude-sonnet-5 — дефолт")
+        self.assertEqual(_model_label(ctx, cfg, "555"), _("{name} — дефолт").format(name="claude-sonnet-5"))
 
     def test_menu_offers_to_pin_the_session_model(self) -> None:
         bot, cfg = FakeBot(), _cfg()
@@ -310,8 +312,8 @@ class SessionModelTests(unittest.TestCase):
         self._pick(bot, ctx, "m-beta")
         asyncio.run(on_model(_cmd_update(bot), ctx))
         labels = [b.text for row in bot.sent[-1]["reply_markup"].inline_keyboard for b in row]
-        self.assertIn("📌 закрепить m-beta за темой", labels)
-        self.assertIn("m-beta ⏳ до конца сессии", bot.sent[-1]["text"])
+        self.assertIn(_("📌 закрепить {model} за темой").format(model="m-beta"), labels)
+        self.assertIn(_("{name} ⏳ до конца сессии").format(name="m-beta"), bot.sent[-1]["text"])
 
     def test_footer_note_only_for_non_default_model(self) -> None:
         bot, cfg = FakeBot(), _cfg()

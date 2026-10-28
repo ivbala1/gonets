@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from claude_tg_bot.i18n import _  # noqa: E402
 from claude_tg_bot.skills.chat_digest import __main__ as skill  # noqa: E402
 from claude_tg_bot.skills.chat_digest.core import (  # noqa: E402
     PLAIN_TOPIC_ID,
@@ -31,6 +32,11 @@ from claude_tg_bot.skills.chat_digest.core import (  # noqa: E402
 
 def _msg(i: int, text: str = "привет", **kw) -> Message:
     return Message(id=i, date=f"2026-09-{10 + i % 3:02d}T10:00+00:00", sender="Маша", text=text, **kw)
+
+
+def _digest(*blocks: str) -> list[str]:
+    """Блоки сводки, как их пишет модель на языке бота: «Лично тебе», затем темы."""
+    return [f"{_('Лично тебе')}: ничего"] + [f"{_('Тема')}: {b}" for b in blocks]
 
 
 def _chat(*, forum=True) -> ChatUnread:
@@ -108,21 +114,24 @@ class FormatTest(unittest.TestCase):
         topic = _chat().topics[0]
         topic.messages.append(_msg(103, "фото", media="Photo", reply_to=101, forwarded_from="Канал"))
         text = format_topic(topic)
-        self.assertIn("# Тема «Девочки», непрочитанных 3", text)
-        self.assertIn("103 2026-09-11T10:00+00:00 Маша: [Photo] [пересылка: Канал] (ответ на 101) фото", text)
+        self.assertIn(_("# Тема «{title}», непрочитанных {count}").format(title="Девочки", count=3), text)
+        self.assertIn("103 2026-09-11T10:00+00:00 Маша: [Photo] "
+                      + _("[пересылка: {sender}]").format(sender="Канал") + " "
+                      + _("(ответ на {id})").format(id=101) + " фото", text)
 
     def test_reply_to_topic_root_is_not_marked(self):
         topic = _chat().topics[0]
         topic.messages.append(_msg(104, "в корень", reply_to=31566))
-        self.assertNotIn("(ответ на 31566)", format_topic(topic))
+        self.assertNotIn(_("(ответ на {id})").format(id=31566), format_topic(topic))
 
     def test_prompt_and_header(self):
         chat = _chat()
         prompt = build_prompt(chat, "Мария Иванова (@mivanova)")
         self.assertIn("@mivanova", prompt)
-        self.assertIn("форум с темами", prompt)
+        self.assertIn(_(", форум с темами"), prompt)
         self.assertIn("-----", prompt)
-        self.assertEqual(header_line(chat), "Сводка «Наши люди», 2026-09-10 … 2026-09-12: 2 непрочитанных. Темы: Девочки (2)")
+        self.assertEqual(header_line(chat), _("Сводка «{title}», {period}: {total} непрочитанных. Темы: {topics}").format(
+            title="Наши люди", period="2026-09-10 … 2026-09-12", total=2, topics="Девочки (2)"))
 
     def test_split_sections(self):
         digest = "Лично тебе: ничего\n-----\nТема: Девочки\nтекст\n\n------\n\nТема: Юмор\nмемы\n"
@@ -167,7 +176,7 @@ class BudgetTest(unittest.TestCase):
 class ValidateTest(unittest.TestCase):
     def test_complete(self):
         chat = _chat()
-        self.assertEqual(validate_digest(["Лично тебе: ничего", "Тема: девочки\nтекст"], chat), [])
+        self.assertEqual(validate_digest(_digest("девочки\nтекст"), chat), [])
 
     def test_missing_topic_and_personal_block(self):
         chat = _chat()
@@ -177,19 +186,21 @@ class ValidateTest(unittest.TestCase):
 
     def test_plain_chat_accepts_any_story_blocks(self):
         chat = _chat(forum=False)
-        self.assertEqual(validate_digest(["Лично тебе: ничего", "Тема: Выборы\n..."], chat), [])
-        self.assertEqual(len(validate_digest(["Лично тебе: ничего"], chat)), 1)
+        self.assertEqual(validate_digest(_digest("Выборы\n..."), chat), [])
+        self.assertEqual(len(validate_digest(_digest(), chat)), 1)
 
     def test_title_with_emoji_matches_trimmed_heading(self):
         chat = _chat()
         chat.topics[0].title = "Здоровье и спорт 💉🤸"
-        self.assertEqual(validate_digest(["Лично тебе: ничего", "Тема: Здоровье и спорт\n..."], chat), [])
+        self.assertEqual(validate_digest(_digest("Здоровье и спорт\n..."), chat), [])
 
 
 class MainFlowTest(unittest.TestCase):
     """Отметка только после полной доставки; dry-run и --no-mark без побочек."""
 
-    DIGEST = "Лично тебе: ничего\n-----\nТема: Девочки\nвсё хорошо"
+    @property
+    def DIGEST(self) -> str:
+        return "\n-----\n".join(_digest("Девочки\nвсё хорошо"))
 
     def _run(self, argv, *, send_results, chats=None, digest=None, mark_problems=None):
         env = {
@@ -238,7 +249,7 @@ class MainFlowTest(unittest.TestCase):
         rc, calls = self._run([], send_results=[0, 0, 0])
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls["sent"]), 3)
-        self.assertTrue(calls["sent"][0].startswith("Сводка «Наши люди»"))
+        self.assertTrue(calls["sent"][0].startswith(header_line(_chat())))
         self.assertEqual(calls["marked"], [{-100: {31566: 102}}])
 
     def test_text_is_separated_from_flags(self):
@@ -321,7 +332,7 @@ class ClaudeRunTest(unittest.TestCase):
         with patch.object(skill, "run_claude_oneshot", boom), patch.object(skill, "resolve_claude_bin", lambda: "claude"):
             with self.assertRaises(RuntimeError) as cm:
                 skill.run_digest_claude("x", 1)
-        self.assertIn("не уложился", str(cm.exception))
+        self.assertEqual(str(cm.exception), _("claude не уложился в {seconds} с").format(seconds=1))
 
     def test_child_output_is_not_echoed_on_failure(self):
         from subprocess import CompletedProcess
@@ -333,7 +344,7 @@ class ClaudeRunTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 skill.run_digest_claude("x", 1)
         self.assertNotIn("very-private-detail", str(cm.exception))
-        self.assertIn("лимит", str(cm.exception))
+        self.assertEqual(str(cm.exception), _("claude exit {rc}: {kind}").format(rc=1, kind=_("лимит или доступ")))
 
 
 if __name__ == "__main__":

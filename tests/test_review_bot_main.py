@@ -24,6 +24,7 @@ from claude_tg_bot import claude_runner  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult, SessionStore  # noqa: E402
 from claude_tg_bot.config import Project  # noqa: E402
 from claude_tg_bot.replies import extract_send_file_markers  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 USER = 7
 GROUP = -100
@@ -179,7 +180,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
     def cb_update(self, query: SimpleNamespace) -> SimpleNamespace:
         return SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=USER),
-                               update_id=2)
+                               effective_chat=SimpleNamespace(id=GROUP, type="supergroup"), update_id=2)
 
 
 # ---- b2.1, b5.1: ран по чужому тексту не отправляет файлы ----
@@ -195,7 +196,7 @@ class UntrustedSendFileTests(_Base):
                 self.assertEqual(self.send_files.await_args.args[1], [])
                 text = self.send_reply_text.await_args.args[2]
                 self.assertNotIn("<<SEND_FILE", text)
-                self.assertIn("пропущен", text)
+                self.assertRegex(text, msg_re("⚠️ SEND_FILE({raw}) пропущен: {error}"))
                 # Обычный ран тот же файл отправляет: запрет только у untrusted.
                 await self.dispatch("обычный")
                 self.assertEqual(len(self.send_files.await_args.args[1]), 1)
@@ -325,7 +326,8 @@ class PlanCardTests(_Base):
         botmod._bump_session_epoch(self.ctx, str(GROUP))  # /reset
         q = await self._pick(data)
         self.assertEqual(q.dispatched, 0)
-        self.assertIn("сменилась", q.edit_message_text.await_args.args[0])
+        self.assertRegex(q.edit_message_text.await_args.args[0], msg_re(
+            "⚠️ сессия темы сменилась после этого плана, решение не отправлено: повтори /plan"))
 
     async def test_card_after_resume_other_session_does_not_execute(self) -> None:
         self.store.set(str(GROUP), "sid-A")
@@ -333,6 +335,35 @@ class PlanCardTests(_Base):
         self.store.set(str(GROUP), "sid-B")  # подменили сессию мимо эпохи
         q = await self._pick(data)
         self.assertEqual(q.dispatched, 0)
+
+    async def test_card_under_other_message_does_not_execute(self) -> None:
+        # Токен карточки под чужим сообщением не срабатывает (проект шага 1, 2.4).
+        self.store.set(str(GROUP), "sid-A")
+        msg = _msg()
+        msg.reply_text = AsyncMock(return_value=SimpleNamespace(chat_id=GROUP, message_id=55))
+        await botmod._send_plan_card(self.ctx, _update(msg), str(GROUP))
+        data = msg.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
+        q = self.query(data)  # сообщение 11, карточка ушла в 55
+        with patch.object(botmod, "_dispatch_to_claude", AsyncMock()) as disp:
+            await botmod.on_plan_pick(self.cb_update(q), self.ctx)
+        self.assertEqual(disp.await_count, 0)
+        self.assertEqual(len(self.bot_data["plan_options"]), 1)
+        q = self.query(data, card=_msg("card", message_id=55))
+        with patch.object(botmod, "Update", lambda update_id, message: _update(message)), \
+                patch.object(botmod, "_dispatch_to_claude", AsyncMock()) as disp:
+            await botmod.on_plan_pick(self.cb_update(q), self.ctx)
+        self.assertEqual(disp.await_count, 1)
+
+    async def test_card_from_disallowed_chat_ignored(self) -> None:
+        self.store.set(str(GROUP), "sid-A")
+        data = await self._card()
+        q = self.query(data)
+        upd = self.cb_update(q)
+        upd.effective_chat = SimpleNamespace(id=-555, type="supergroup")
+        with patch.object(botmod, "_dispatch_to_claude", AsyncMock()) as disp:
+            await botmod.on_plan_pick(upd, self.ctx)
+        self.assertEqual(disp.await_count, 0)
+        self.assertEqual(len(self.bot_data["plan_options"]), 1)
 
     async def test_new_plan_invalidates_old_card(self) -> None:
         self.store.set(str(GROUP), "sid-A")
@@ -398,7 +429,9 @@ class AskStaleTests(_Base):
         await botmod.on_ask_pick(self.cb_update(q), self.ctx)
         self.assertEqual(q.answer.await_count, 1)
         args, kwargs = q.answer.await_args
-        self.assertIn("устарел", args[0])
+        self.assertRegex(args[0], msg_re(
+            "Ответ не принят: вопрос устарел (старше 12 часов, повторён ниже, бот "
+            "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."))
         self.assertTrue(kwargs.get("show_alert"))
 
 
@@ -443,7 +476,7 @@ class ComposeCancelTests(_Base):
             self.assertIsNone(botmod._compose_fill(self.ctx, ck, slot, "голос"))
             self.assertTrue(botmod._compose_cancelled(self.ctx, ck, slot))
         disp.assert_not_awaited()
-        self.assertIn("отменён", go_msg.reply_text.await_args.args[0])
+        self.assertRegex(go_msg.reply_text.await_args.args[0], msg_re("🗑 буфер отменён, ничего не отправляю."))
 
     async def test_late_voice_after_cancel_not_dispatched(self) -> None:
         ck = str(GROUP)
@@ -507,7 +540,7 @@ class CancelGatherTests(_Base):
             msg = _msg("/cancel")
             await botmod.on_cancel(_update(msg), self.ctx)
         self.assertTrue(batch.cancelled)
-        self.assertIn("отменено до отправки", msg.reply_text.await_args.args[0])
+        self.assertRegex(msg.reply_text.await_args.args[0], msg_re(" · отменено до отправки в Claude: {count} сообщ."))
 
 
 # ---- B27: пересланное «/login» не команда ----
@@ -552,13 +585,15 @@ class ShutdownTests(_Base):
         self.run_hook = hook
         self.result_error = True
         await self.dispatch("долгий ран")
-        self.assertIn("перезапускается", self.send_reply_text.await_args.args[2])
+        self.assertRegex(self.send_reply_text.await_args.args[2],
+                         msg_re("♻️ Бот перезапускается, ран прерван. Повтори запрос после рестарта."))
 
     async def test_no_new_run_while_stopping(self) -> None:
         self.bot_data["stopping"] = True
         msg = await self.dispatch("ждал замка")
         self.assertEqual(self.runs, [])
-        self.assertIn("перезапускается", msg.reply_text.await_args.args[0])
+        self.assertRegex(msg.reply_text.await_args.args[0],
+                         msg_re("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
 
 
 # ---- b1.4: /at переживает рестарт, пока ждёт занятую тему ----
@@ -736,7 +771,10 @@ class ResumeTests(_Base):
         q = await self._pick(self.b, "sid-alpha")
         self.assertIsNone(self.store.get(self.b))
         self.assertEqual(self.store.get(self.a), "sid-alpha")
-        self.assertIn("скоуп", q.edit_message_text.await_args.args[0])
+        self.assertRegex(q.edit_message_text.await_args.args[0], msg_re(
+            "⚠️ сессия {sid} шла со скоупом «{origin}», а у этой "
+            "темы «{hint}». Память закрепляется за сессией, поэтому "
+            "подцепить её сюда нельзя: смени /scope темы или начни новую сессию."))
 
     async def test_other_scope_refused_by_fingerprint(self) -> None:
         # Сессия до этого выпуска: скоупа по sid нет, есть отпечаток темы-владельца.
@@ -775,7 +813,11 @@ class ResumeUnknownScopeTests(ResumeTests):
         q = await self._pick(self.b, "sid-term")
         self.assertIsNone(self.store.get(self.b))
         self.assertIsNone(self.bot_data["scope_fingerprints"].get(self.b))
-        self.assertIn("неизвестно", q.edit_message_text.await_args.args[0])
+        self.assertRegex(q.edit_message_text.await_args.args[0], msg_re(
+            "⚠️ с каким скоупом шла сессия {sid}, неизвестно: её начинал не бот "
+            "или она старше записи скоупов. У этой темы скоуп «{hint}», а память "
+            "закрепляется за сессией, поэтому подцепить её сюда нельзя: продолжи её "
+            "в терминале или в теме без скоупа."))
 
     async def test_unknown_scope_allowed_in_topic_without_scope(self) -> None:
         self.scopes[self.b] = ""
@@ -914,7 +956,8 @@ class StopBeforeProcessTests(_Base):
                              AsyncMock(return_value=ClaudeResult(text="GPT"))) as codex:
             await self.dispatch("x")
         codex.assert_not_awaited()
-        self.assertIn("перезапускается", self.send_reply_text.await_args.args[2])
+        self.assertRegex(self.send_reply_text.await_args.args[2],
+                         msg_re("♻️ Бот перезапускается, ран прерван. Повтори запрос после рестарта."))
 
 
     async def test_forced_gpt_prefix_passes_should_stop(self) -> None:

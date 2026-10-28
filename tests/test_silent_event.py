@@ -278,6 +278,40 @@ class SilentWakeRunTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(endpoint=endpoint, text=(data.get("text") or "")[:30]):
                 self.assertIs(data.get("disable_notification"), True)
 
+    async def test_loud_marker_sounds_only_the_reply(self) -> None:
+        """Сторож будит без звука, ответ с <<LOUD>> звучит, остальное тихо
+        (решение Ивана 26.10.2026)."""
+        self.answer = ("Рекрутер Torrex зовёт на звонок завтра в 11, ответь до вечера. "
+                       f"<<SEND_FILE:{self.attachment}>> <<ASK:Отвечаем?|да|позже>>\n\n<<LOUD>>")
+        self.cost = 0.42
+        task = await self._event({"source": "Домовой", "title": "сторож", "wake": True,
+                                  "notice": False, "silent": True, "prompt": "сторож"})
+        await task
+        sends = self.wire.sends()
+        chunks = [(e, d) for e, d in sends
+                  if e == "sendMessage" and not (d.get("text") or "").startswith(("🔧", "💸", "❓"))]
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertNotIn("LOUD", "".join(d.get("text") or "" for _, d in sends))
+        for _, data in chunks:
+            with self.subTest(text=(data.get("text") or "")[:30]):
+                self.assertFalse(data.get("disable_notification", False))
+        rest = [(e, d) for e, d in sends if (e, d) not in chunks]
+        self.assertIn("sendDocument", [e for e, _ in rest])
+        for endpoint, data in rest:
+            with self.subTest(endpoint=endpoint, text=(data.get("text") or "")[:30]):
+                self.assertIs(data.get("disable_notification"), True)
+        # После ответа тихий ран снова тихий: флаг вернулся.
+        self.assertTrue(any((d.get("text") or "").startswith("💸") for _, d in rest))
+
+    async def test_silent_wake_without_marker_stays_muted(self) -> None:
+        self.answer = "Пришло автоуведомление о просмотре отклика, делать ничего не надо."
+        task = await self._event({"source": "Домовой", "title": "сторож", "wake": True,
+                                  "notice": False, "silent": True, "prompt": "сторож"})
+        await task
+        for endpoint, data in self.wire.sends():
+            with self.subTest(endpoint=endpoint, text=(data.get("text") or "")[:30]):
+                self.assertIs(data.get("disable_notification"), True)
+
     async def test_wake_without_silent_sounds(self) -> None:
         self.cost = 0.42
         task = await self._event({"source": "Домовой", "title": "Вечер", "wake": True,

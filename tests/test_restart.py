@@ -21,6 +21,8 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import approval, restart  # noqa: E402
 from claude_tg_bot import bot as botmod  # noqa: E402
+from claude_tg_bot.i18n import _, plural  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 
 class RequestFileTests(unittest.TestCase):
@@ -72,7 +74,7 @@ class CodeProblemTests(unittest.TestCase):
 
     def test_dirty_and_untracked_code(self) -> None:
         (self.repo / "src" / "a.py").write_text("x = 2\n")
-        self.assertIn("незакоммиченные", restart.code_problem(self.head, self.repo))
+        self.assertRegex(restart.code_problem(self.head, self.repo), msg_re("в коде есть незакоммиченные правки: {shown}"))
         _git(self.repo, "checkout", "-q", "--", "src/a.py")
         (self.repo / "src" / "new.py").write_text("")
         self.assertIn("src/new.py", restart.code_problem(self.head, self.repo))
@@ -85,13 +87,14 @@ class CodeProblemTests(unittest.TestCase):
     def test_commit_changed(self) -> None:
         (self.repo / "src" / "a.py").write_text("x = 3\n")
         _git(self.repo, "commit", "-qam", "next")
-        self.assertIn("коммит сменился", restart.code_problem(self.head, self.repo))
+        self.assertRegex(restart.code_problem(self.head, self.repo),
+                         msg_re("коммит сменился после заявки: было {old}, стало {new}"))
 
 
 class ValidateTests(unittest.IsolatedAsyncioTestCase):
     async def test_failing_step_is_reported(self) -> None:
         problem = await restart.validate_code(Path("/"), python=shutil.which("false"), timeout=10)
-        self.assertTrue(problem.startswith("импорт модулей: код 1"), problem)
+        self.assertTrue(problem.startswith(_("{name}: код {rc}\n{tail}").format(name=_("импорт модулей"), rc=1, tail="")), problem)
 
     async def test_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -99,7 +102,7 @@ class ValidateTests(unittest.IsolatedAsyncioTestCase):
             slow.write_text("#!/bin/sh\nsleep 5\n")
             slow.chmod(0o755)
             problem = await restart.validate_code(Path(d), python=str(slow), timeout=0.2)
-        self.assertIn("не уложилось", problem)
+        self.assertIn(_("не уложилось в {seconds} с").format(seconds=0), problem)
 
 
 class DrainTests(unittest.IsolatedAsyncioTestCase):
@@ -138,7 +141,7 @@ class DrainTests(unittest.IsolatedAsyncioTestCase):
         drain, notes, events = self._drain([0])
         await drain.run()
         self.assertEqual(events, ["code:c1", "validate", "code:c1", "restart"])
-        self.assertIn("Активной работы нет", notes[0][0])
+        self.assertIn(_("Активной работы нет, проверяю код."), notes[0][0])
 
     async def test_code_rechecked_after_validation(self) -> None:
         checks = iter(["", "коммит сменился после заявки"])
@@ -154,7 +157,7 @@ class DrainTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(drain.run())
         await asyncio.sleep(0.05)
         self.assertEqual(events, [])
-        self.assertIn("Жду окончания работы: 2", notes[0][0])
+        self.assertIn(_("Жду окончания работы: {count}. Новые сообщения пока не беру.").format(count=2), notes[0][0])
         active[0] = 0
         await asyncio.wait_for(task, 1)
         self.assertEqual(events[-1], "restart")
@@ -168,7 +171,10 @@ class DrainTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         asks = [n for n in notes if n[1]]
         self.assertEqual(len(asks), 1)
-        self.assertIn("Перезапустить сейчас", asks[0][0])
+        self.assertEqual(asks[0][0], _(
+            "⏳ Жду уже {minutes} {unit}, работы ещё {count}. "
+            "Перезапустить сейчас (идущие раны прервутся), ждать дальше или отменить заявку?").format(
+            minutes=1, unit=plural(1, ("минуту", "минуты", "минут"), ("minute", "minutes")), count=1))
         drain.now_event.set()
         await asyncio.wait_for(task, 1)
         self.assertEqual(events[-1], "restart")
@@ -217,15 +223,18 @@ class DispatchCountTests(unittest.IsolatedAsyncioTestCase):
             app.bot_data["draining"] = True
             await botmod._dispatch_to_claude(update, ctx, "y", send_voice_reply=False)
             self.assertEqual(seen, [1])
-            self.assertIn("повтори", msg.reply_text.call_args.args[0])
+            self.assertEqual(_("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
+                               "повтори через пару минут"), msg.reply_text.call_args.args[0])
             await botmod._dispatch_to_claude(update, ctx, "z", send_voice_reply=False,
                                              on_run_start=lambda: None, deferred=True)
-            self.assertIn("отложенный промпт", msg.reply_text.call_args.args[0])
+            self.assertEqual(_("♻️ бот готовится к перезапуску: отложенный промпт уйдёт после рестарта"),
+                             msg.reply_text.call_args.args[0])
             # on_run_start есть и у выполнения задачи, а само оно после
             # рестарта не уйдёт: текст решает явный флаг /at (проект шага 3, 1.5)
             await botmod._dispatch_to_claude(update, ctx, "w", send_voice_reply=False,
                                              on_run_start=lambda: None)
-            self.assertIn("повтори", msg.reply_text.call_args.args[0])
+            self.assertEqual(_("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
+                               "повтори через пару минут"), msg.reply_text.call_args.args[0])
             gate.set()
             await task
         self.assertEqual(app.bot_data["active_work"], 0)

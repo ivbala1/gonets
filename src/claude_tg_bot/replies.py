@@ -70,8 +70,10 @@ async def send_reply_text(cfg: Config, update: Update, text: str) -> None:
     await send_text_to(cfg, update.message, text)
 
 
-async def send_text_to(cfg: Config, msg, text: str) -> None:
-    """То же, что send_reply_text, ответом на любое сообщение (кнопка под голосовым)."""
+async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
+    """То же, что send_reply_text, ответом на любое сообщение (кнопка под голосовым).
+    head: первая строка каждого куска и начало подписи файла (ярлык дела,
+    по нему свайп на любой кусок находит дело, опыт В1)."""
     if not text.strip():
         return
     if len(text) >= cfg.large_reply_as_file_threshold:
@@ -80,7 +82,9 @@ async def send_text_to(cfg: Config, msg, text: str) -> None:
         def doc() -> Awaitable[Any]:
             buf = io.BytesIO(data)
             buf.name = "claude-reply.txt"
-            return msg.reply_document(document=buf, filename="claude-reply.txt", caption=_("{count} chars").format(count=len(text)))
+            caption = _("{count} chars").format(count=len(text))
+            return msg.reply_document(document=buf, filename="claude-reply.txt",
+                                      caption=f"{head}\n{caption}" if head else caption)
 
         await _send_retrying(doc)
         return
@@ -89,7 +93,11 @@ async def send_text_to(cfg: Config, msg, text: str) -> None:
     # (allow_sending_without_reply), отказ цитаты: повтор без неё. У пробуждений
     # без сообщения (номер 0) цитаты нет.
     quote = _quote_of(msg)
-    for chunk in split_for_telegram(text, cfg.telegram_text_limit):
+    # +2: перевод строки и второе слово UTF-16 у 🧵 (Telegram считает так).
+    limit = cfg.telegram_text_limit - (len(head) + 2 if head else 0)
+    for chunk in split_for_telegram(text, limit):
+        if head:
+            chunk = f"{head}\n{chunk}"
         plain, entities = render_markup(chunk)
         extra = {"reply_parameters": quote} if quote is not None else {}
         quote = None
@@ -599,6 +607,31 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
     cleaned = _ASK_RE.sub(_sub, text)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return (found[0] if found else None), cleaned
+
+
+# Метка звука: ран без звука (/event с silent и wake) зовёт владельца со звуком
+# одним итоговым ответом, когда уверен, что нужна его реакция (решение Ивана
+# 26.10.2026: «пробуждение слушателя не равно пробуждению меня»). Вырезается
+# из любого ответа; внутри блока ``` остаётся как есть, как и ASK.
+_LOUD_RE = re.compile(r"[ \t]*<<LOUD>>")
+
+
+def extract_loud_marker(text: str) -> tuple[bool, str]:
+    """Есть ли <<LOUD>> вне кодовых блоков → (да или нет, текст без меток)."""
+    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    found = False
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal found
+        if any(start <= m.start() < end for start, end in fences):
+            return m.group(0)
+        found = True
+        return ""
+
+    cleaned = _LOUD_RE.sub(_sub, text)
+    if not found:
+        return False, text
+    return True, cleaned.strip()
 
 
 async def send_cost_footer(

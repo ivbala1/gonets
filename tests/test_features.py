@@ -21,6 +21,7 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import bot as botmod  # noqa: E402
 from claude_tg_bot.approval import _format_tool_call  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 from claude_tg_bot.bot import (  # noqa: E402
     ComposeBuffer,
     _bump_session_epoch,
@@ -42,6 +43,7 @@ from claude_tg_bot.bot import (  # noqa: E402
 )
 from claude_tg_bot.replies import (  # noqa: E402
     extract_ask_marker,
+    extract_loud_marker,
     load_full_text,
     plan_voice_series,
     render_markup,
@@ -93,6 +95,22 @@ class AskMarkerTests(unittest.TestCase):
         ask, cleaned = extract_ask_marker(text)
         self.assertIsNone(ask)
         self.assertIn("<<ASK:Пример?|да|нет>>", cleaned)
+
+    def test_loud_marker_removed(self) -> None:
+        loud, cleaned = extract_loud_marker("Позвони рекрутеру до 18.\n\n<<LOUD>>")
+        self.assertTrue(loud)
+        self.assertEqual(cleaned, "Позвони рекрутеру до 18.")
+        loud, cleaned = extract_loud_marker("<<LOUD>> раз <<LOUD>>\n\nдва <<LOUD>>")
+        self.assertTrue(loud)
+        self.assertEqual(cleaned, "раз\n\nдва")
+        # Код вне метки не трогается, даже пустые строки внутри блока.
+        loud, cleaned = extract_loud_marker("```\na\n\n\n\nb\n```\n<<LOUD>>")
+        self.assertEqual((loud, cleaned), (True, "```\na\n\n\n\nb\n```"))
+
+    def test_loud_marker_absent_or_in_fence(self) -> None:
+        self.assertEqual(extract_loud_marker("просто текст  "), (False, "просто текст  "))
+        text = "Метка:\n```\n<<LOUD>>\n```\nвот"
+        self.assertEqual(extract_loud_marker(text), (False, text))
 
     def test_overlong_option_rejected(self) -> None:
         """Хвост, который не влезет на кнопку, не должен уходить в промпт."""
@@ -409,14 +427,14 @@ class SendFilesTests(unittest.TestCase):
         msg = self._send(err)
         msg.reply_document.assert_awaited_once()  # без повтора: дубль файла
         text = msg.reply_text.await_args.args[0]
-        self.assertIn("track.gpx", text)
-        self.assertIn("мог дойти", text)
+        self.assertIn(_("⚠️ Telegram не подтвердил отправку файла {name}: он мог дойти, проверь чат выше").format(
+            name="track.gpx"), text)
 
     def test_other_error_says_failed(self) -> None:
         err = TimedOut()
         err.__cause__ = httpx.WriteTimeout("")
         text = self._send(err).reply_text.await_args.args[0]
-        self.assertIn("не удалось отправить файл track.gpx", text)
+        self.assertIn(_("⚠️ не удалось отправить файл {name}").format(name="track.gpx"), text)
 
 
 class ComposeBufferTests(unittest.TestCase):
@@ -764,12 +782,12 @@ class ForwardNoteTests(unittest.TestCase):
         )
         self.assertEqual(
             _forward_note(SimpleNamespace(forward_origin=origin)),
-            "[Переслано от: Kseniia Safronova]\n",
+            _("[Переслано от: {who}]\n").format(who="Kseniia Safronova"),
         )
 
     def test_forwarded_from_hidden_user(self) -> None:
         origin = SimpleNamespace(sender_user=None, sender_user_name="Скрытый", chat=None)
-        self.assertEqual(_forward_note(SimpleNamespace(forward_origin=origin)), "[Переслано от: Скрытый]\n")
+        self.assertEqual(_forward_note(SimpleNamespace(forward_origin=origin)), _("[Переслано от: {who}]\n").format(who="Скрытый"))
 
     def test_forwarded_from_channel(self) -> None:
         origin = SimpleNamespace(
@@ -777,7 +795,7 @@ class ForwardNoteTests(unittest.TestCase):
             chat=SimpleNamespace(title="Канал про горы", id=-1),
         )
         self.assertEqual(
-            _forward_note(SimpleNamespace(forward_origin=origin)), "[Переслано от: Канал про горы]\n",
+            _forward_note(SimpleNamespace(forward_origin=origin)), _("[Переслано от: {who}]\n").format(who="Канал про горы"),
         )
 
 
@@ -904,7 +922,7 @@ class DiffCardTests(unittest.TestCase):
         card = _format_tool_call(
             "Edit", {"file_path": "/t/a", "old_string": "x\n", "new_string": "x"}, None
         )
-        self.assertNotIn("нет текстовых изменений", card)
+        self.assertNotIn(_("(нет текстовых изменений)"), card)
         self.assertIn("␊", card)
 
     def test_huge_input_is_capped(self) -> None:

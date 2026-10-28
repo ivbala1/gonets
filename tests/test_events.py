@@ -11,6 +11,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import events  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 
 def _rec(key=None, **kw):
@@ -236,6 +237,16 @@ class EventWakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((got["status"], got["outcome"]), ("done", "ran"))
         self.assertIn("started_at", got)
 
+    async def test_untrusted_prompt_is_fenced(self) -> None:
+        # Свежая своя сессия рана по чужому тексту: имя заказчика из письма не
+        # должно закрепить её память, роутер ограждённое не считает (шаг 1, 2.5).
+        rec = _rec("k-fence001", now=None)
+        rec["untrusted"], rec["prompt"] = True, "Сторож: письмо от заказчика"
+        await self._wake(rec)
+        prompt = self.dispatch.await_args.args[2]
+        self.assertTrue(prompt.startswith(self.botmod._(self.botmod.UNTRUSTED_PROMPT_NOTE)))
+        self.assertIn("```\nСторож: письмо от заказчика\n```", prompt)
+
     async def test_refused_by_stop_stays_accepted(self) -> None:
         got = await self._wake(_rec("k-stop0001", now=None), run=False, refused=True)
         self.assertEqual(got["status"], "accepted")
@@ -297,10 +308,17 @@ class EventWakeTests(unittest.IsolatedAsyncioTestCase):
         await self.botmod._events_resume(self.app)
         await __import__("asyncio").sleep(0)
         args, kwargs = wake.call_args
-        self.assertIn("ждало 20 мин", args[2])
+        from datetime import datetime
+        when = datetime.fromtimestamp(float(waiting["accepted_at"])).strftime("%H:%M")
+        self.assertIn(_("(Событие получено в {when}, ждало {minutes} мин: бот перезапускался.)\n\n").format(
+            when=when, minutes=20), args[2])
         self.assertEqual((args[3], kwargs["untrusted"], kwargs["event_id"]), (False, True, waiting["id"]))
         self.assertEqual(events.load(self.store, started["id"])["outcome"], "interrupted")
-        self.assertIn("оборвал", self.app.bot.send_message.await_args.args[1])
+        cut_at = datetime.fromtimestamp(float(started["accepted_at"])).strftime("%H:%M")
+        self.assertIn(_("⚠️ Пробуждение «{source}: {title}» (получено в {when}) оборвал "
+                        "перезапуск бота посреди рана. Повторять не стал: что успело "
+                        "сделаться, видно по журналу и чату.").format(source="домовой", title="Утро", when=cut_at),
+                      self.app.bot.send_message.await_args.args[1])
 
 
 class GuardedDataTests(unittest.TestCase):

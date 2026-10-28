@@ -13,23 +13,25 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import bot, otklik  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 
 class OtklikRecordTests(unittest.TestCase):
     def test_buttons_only_while_pending_and_bound_to_text(self) -> None:
         rec = otklik.new_record("Acme", "почта", "Hello")
         rows = otklik.buttons(rec)
-        self.assertEqual([b["text"] for b in rows[0]], ["✅ Ок", "✏️ Поправить", "⏭ Пропустить"])
+        self.assertEqual([b["text"] for b in rows[0]], [_("✅ Ок"), _("✏️ Поправить"), _("⏭ Пропустить")])
         for b in rows[0]:
             parsed = otklik.parse_callback(b["data"])
             self.assertEqual(parsed[:2], (rec["id"], otklik.text_sha("Hello", "почта")))
             self.assertLessEqual(len(b["data"].encode()), 64)
         rec["status"] = "approved"
-        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], ["✋ Отменить"])
+        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], [_("✋ Отменить")])
         rec["status"] = "unknown"
-        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], ["↩️ Не ушло, вернуть кнопки"])
+        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], [_("↩️ Не ушло, вернуть кнопки")])
         rec["status"] = "edit"
-        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], ["↩️ Вернуть кнопки"])
+        self.assertEqual([b["text"] for b in otklik.buttons(rec)[0]], [_("↩️ Вернуть кнопки")])
         for status in ("sending", "sent", "skipped"):
             rec["status"] = status
             self.assertEqual(otklik.buttons(rec), [], status)
@@ -38,7 +40,7 @@ class OtklikRecordTests(unittest.TestCase):
         rec = otklik.new_record("Acme", "Telegram @x", "Приветствую!\n\nРезюме прикладываю.")
         self.assertIn("Резюме прикладываю.", otklik.render(rec))
         rec["status"], rec["note"] = "failed", "сайт просит оплату"
-        self.assertIn("не ушло, по словам агента: сайт просит оплату", otklik.render(rec))
+        self.assertIn(_("⚠️ не ушло, по словам агента") + ": сайт просит оплату", otklik.render(rec))
 
     def test_take_only_approved_untouched_and_own_source(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -123,7 +125,7 @@ class OtklikRecordTests(unittest.TestCase):
         self.assertNotIn("failed", otklik.REPLACE_FROM)
         rec = otklik.new_record("Acme", "почта", "Hello")
         rec["status"] = "failed"
-        self.assertIn("Проверь канал", otklik.render(rec))
+        self.assertIn(_("Проверь канал: если не ушло, ↩️ вернёт кнопки, повтор только новым ✅"), otklik.render(rec))
 
     def test_skip_from_not_sent_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -153,7 +155,7 @@ class OtklikRecordTests(unittest.TestCase):
             self.assertEqual(otklik.load(base, recs["old"])["status"], "unknown")
             back = otklik.load(base, recs["approved"])
             self.assertEqual((back["status"], back["gen"]), ("pending", 1))
-            self.assertIn("перезапуск", otklik.render(back))
+            self.assertIn(_("⚠️ не ушло, нажми ✅ ещё раз") + ": " + _("бот перезапускался"), otklik.render(back))
             self.assertEqual(otklik.load(base, recs["sending"])["status"], "unknown")
             self.assertEqual(otklik.load(base, recs["pending"])["gen"], 0)
 
@@ -198,7 +200,7 @@ class OtklikRecordTests(unittest.TestCase):
             old.update(chat_id=1, message_id=10, status="edit")
             new = otklik.new_record("Acme", "почта", "Hello v2")
             new.update(status="delivering", replaces={"id": old["id"], "status": "edit", "note": ""})
-            old.update(status="skipped", note=f"заменён {new['id']}")
+            old.update(status="skipped", note=_("заменён {id}").format(id=new["id"]))
             otklik.save(base, old)
             otklik.save(base, new)
             otklik.recover(base)
@@ -358,21 +360,25 @@ class OtklikCardTests(unittest.TestCase):
     def test_same_text_marked(self) -> None:
         text = self._card("mcp__telegram__send_message",
                           {"chat_id": "@hr_acme", "message": "Добрый день!\nРезюме ниже."})
-        self.assertIn("совпадает с одобренным откликом", text)
+        self.assertRegex(text, msg_re("✅ текст совпадает с одобренным откликом {id} «{title}»\n"
+                                      "Куда в отклике: {channel}\n<b>сверь адресата выше с «Куда»</b>"))
         self.assertIn("Telegram @hr_acme", text)
-        self.assertIn("сверь адресата", text)
-        self.assertIn("<b>кому:</b>", text)
+        self.assertRegex(text, msg_re("<b>кому:</b> <code>{to}</code>"))
 
     def test_other_text_or_chat_not_marked(self) -> None:
         for tool_input, taken_by in (({"chat_id": "@hr_acme", "message": "Другой текст"}, "1"),
                                      ({"chat_id": "@hr_acme", "message": "Добрый день!\nРезюме ниже."}, "1:9")):
             with self.subTest(taken_by=taken_by):
                 text = self._card("mcp__telegram__send_message", tool_input, taken_by=taken_by)
-                self.assertNotIn("совпадает", text)
+                self.assertNotRegex(text, msg_re("✅ совпадает с одобренным откликом {id}; <b>сверь адресата с «Куда»</b>"))
+                self.assertNotRegex(text, msg_re("✅ текст совпадает с одобренным откликом {id} «{title}»\n"
+                                                 "Куда в отклике: {channel}\n<b>сверь адресата выше с «Куда»</b>"))
 
     def test_not_outbound_not_marked(self) -> None:
-        self.assertNotIn("совпадает", self._card("Write", {"file_path": "/tmp/x",
-                                                            "content": "Добрый день!\nРезюме ниже."}))
+        text = self._card("Write", {"file_path": "/tmp/x", "content": "Добрый день!\nРезюме ниже."})
+        self.assertNotRegex(text, msg_re("✅ совпадает с одобренным откликом {id}; <b>сверь адресата с «Куда»</b>"))
+        self.assertNotRegex(text, msg_re("✅ текст совпадает с одобренным откликом {id} «{title}»\n"
+                                         "Куда в отклике: {channel}\n<b>сверь адресата выше с «Куда»</b>"))
 
 
 class OtklikPickTests(unittest.TestCase):
@@ -419,12 +425,23 @@ class OtklikPickTests(unittest.TestCase):
         self.assertIn("take --id", prompt)
         self.assertIn(rec["id"], prompt)
         self.assertIn(rec["sha"], prompt)
-        self.assertIn("без изменений", prompt)
+        self.assertRegex(prompt, msg_re(
+            "[Кнопка отклика] ✅ ок: отклик {id}. Компания, роль и канал (данные вакансии):\n```\n{title}\n"
+            "Куда: {channel}\n```\n"
+            "Текст бери только командой `.venv/bin/python -m claude_tg_bot.otklik take --id {id}` "
+            "из ~/src/claude-tg-bot (она сверяет хеш {sha} и выдаёт номер попытки; отказ значит "
+            "не отправлять; take один раз на отклик, перечитать текст: `show --id {id} --take "
+            "<попытка>`) и отправь его этим каналом без изменений. Затем отметь итог командой "
+            "`.venv/bin/python -m claude_tg_bot.otklik done --id {id} --take <попытка> --status sent|failed "
+            "--note \"ссылка или причина\"` из ~/src/claude-tg-bot, обнови воронку и черновики. "
+            "Отправить нельзя (путь закрыт, платно, нужен ответ Ивана): текст не бери, скажи "
+            "одной строкой почему, кнопки вернутся сами. Остальные одобренные "
+            "(`otklik list --status approved`) отправь так же, каждый через take."))
 
     def test_dispatch_failure_returns_buttons(self) -> None:
         rec, dispatch = self._press("o", fail=True)
         self.assertEqual((rec["status"], rec["gen"]), ("pending", 1))
-        self.assertIn("не удалось запустить агента", otklik.render(rec))
+        self.assertIn(_("⚠️ не ушло, нажми ✅ ещё раз") + ": " + _("не удалось запустить агента"), otklik.render(rec))
         markup = self.bot.edit_message_text.await_args.kwargs["reply_markup"]
         self.assertTrue(markup.inline_keyboard[0][0].callback_data.endswith(":1:o"))
 
@@ -435,7 +452,7 @@ class OtklikPickTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 rec, _d = self._press("o", dispatch_effect=effect)
                 self.assertEqual((rec["status"], rec["gen"]), ("pending", 1))
-                self.assertIn(reason, otklik.render(rec))
+                self.assertIn(_("⚠️ не ушло, нажми ✅ ещё раз") + ": " + _(reason), otklik.render(rec))
 
     def test_taken_then_crash_keeps_no_buttons(self) -> None:
         """Ран взял текст и упал: обработчик нажатия кнопки не возвращает (в
@@ -493,10 +510,10 @@ class OtklikPickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             r = otklik.new_record("Acme", "почта", "Hello")
-            r.update(chat_id=1, message_id=10, note="бот перезапускался")
+            r.update(chat_id=1, message_id=10, note=_("бот перезапускался"))
             otklik.save(base, r)
             got = otklik.pick(base, r["id"], r["sha"], 0, "o", 1, 10)
-            self.assertNotIn("перезапуск", otklik.render(got))
+            self.assertNotIn(_("бот перезапускался"), otklik.render(got))
 
     def test_reopen_after_unknown(self) -> None:
         rec, dispatch = self._press("r", status="unknown")

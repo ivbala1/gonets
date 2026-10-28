@@ -25,6 +25,7 @@ from claude_tg_bot.approval import (  # noqa: E402
     needs_full_view,
 )
 from claude_tg_bot.danger import ORANGE, RED, YELLOW, classify  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 BOT = Path(__file__).resolve().parents[1]
 # Боевое значение APPROVE_BASH_AUTO_ALLOW_REGEX из .env.example.
@@ -242,7 +243,7 @@ class RoundFourTests(unittest.TestCase):
                     "gcloud --project x compute instances list",
                     "doctl compute droplet list --format ID"):
             self.assertEqual(level(cmd), ORANGE, cmd)
-            self.assertTrue(any('чтение' in r for r in verdict(cmd).orange))
+            self.assertIn(_("обращается к облаку (чтение)"), verdict(cmd).orange)
 
     def test_7_kube_verb_after_flag_values(self) -> None:
         # Значение флага не глагол kubectl и helm (ревью 11.10.2026).

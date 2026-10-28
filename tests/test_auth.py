@@ -18,6 +18,7 @@ from claude_tg_bot.bot import (
 )
 from claude_tg_bot.claude_runner import ClaudeResult, run_claude
 from claude_tg_bot.codex_runner import run_codex
+from claude_tg_bot.i18n import _
 
 ERROR = "Failed to authenticate: OAuth session expired and could not be refreshed"
 CODE = "a" * 43 + "#" + "b" * 43
@@ -152,13 +153,20 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.sent = []
 
+        self.code_asked = asyncio.Event()
+
         async def send(**kw):
             self.sent.append(kw)
+            if kw.get("protect_content"):
+                self.code_asked.set()
             return SimpleNamespace(delete=AsyncMock())
 
         self.bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
         self.script = Path(self.tmp.name) / "fake-cli"
-        self.manager = LoginManager(self.bot, str(self.script), str(self.script), Path(self.tmp.name), ttl=3)
+        # Срок входа по умолчанию: эти тесты проверяют ход входа, а не часы.
+        # С ttl=3 медленный запуск fake CLI (на маке до секунд) обрывал вход
+        # по сроку, тест срока задаёт свой ttl.
+        self.manager = LoginManager(self.bot, str(self.script), str(self.script), Path(self.tmp.name))
         self.addAsyncCleanup(self.manager.close)
 
     def script_body(self, body):
@@ -166,10 +174,13 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.script.chmod(0o700)
 
     async def wait_for_code(self):
-        async with asyncio.timeout(2):
-            while self.manager.session and not self.manager.session.accepts_code:
-                await asyncio.sleep(0.01)
-        self.assertIsNotNone(self.manager.session)
+        # Ждём событие, а не опрос с таймаутом: ссылка с запросом кода ушла
+        # в чат или вход уже завершился (тогда кода не ждут и тест падает).
+        session = self.manager.session
+        asked = asyncio.ensure_future(self.code_asked.wait())
+        await asyncio.wait({asked, session.task}, return_when=asyncio.FIRST_COMPLETED)
+        asked.cancel()
+        self.assertTrue(session.accepts_code)
 
     def claude_script(self, *, status=True):
         self.script_body(
@@ -187,13 +198,15 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         session = self.manager.session
         self.assertFalse(self.manager.start("codex", 2, 2))
         await self.wait_for_code()
-        self.assertIn("Нет ожидающего", await self.manager.submit(2, 2, CODE))
-        self.assertIn("без ссылки", await self.manager.submit(1, 1, "https://example.test"))
-        self.assertIn("Код принят", await self.manager.submit(1, 1, CODE))
-        self.assertIn("уже отправлен", await self.manager.submit(1, 1, CODE))
+        self.assertEqual(_("Нет ожидающего входа. Начни с /login claude."), await self.manager.submit(2, 2, CODE))
+        self.assertEqual(_("Нужен одноразовый код с сайта Claude целиком, без ссылки и пробелов."),
+                         await self.manager.submit(1, 1, "https://example.test"))
+        self.assertEqual(_("Код принят. Проверяю вход."), await self.manager.submit(1, 1, CODE))
+        self.assertEqual(_("Код уже отправлен. Жду результат входа."), await self.manager.submit(1, 1, CODE))
         await session.task
         self.assertIsNone(self.manager.session)
-        self.assertIn("восстановлен", self.sent[-1]["text"])
+        self.assertIn(_("Вход {name} восстановлен. Можно повторить запрос боту.").format(name="Claude"),
+                      self.sent[-1]["text"])
         self.assertNotIn(CODE, str(self.sent))
         for message in session.messages:
             message.delete.assert_awaited_once()
@@ -205,7 +218,8 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_code()
         await self.manager.submit(1, 1, CODE)
         await session.task
-        self.assertIn("Не удалось подтвердить", self.sent[-1]["text"])
+        self.assertIn(_("Не удалось подтвердить вход {name}. Повтори /login {engine}.").format(
+            name="Claude", engine="claude"), self.sent[-1]["text"])
 
     async def test_codex_flow_never_needs_code_in_chat(self):
         self.script_body(
@@ -216,7 +230,8 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start("codex", 1, 1)
         await self.manager.session.task
         self.assertTrue(any("ABCD-12345" in s["text"] and s["protect_content"] for s in self.sent))
-        self.assertIn("Вход Codex восстановлен", self.sent[-1]["text"])
+        self.assertIn(_("Вход {name} восстановлен. Можно повторить запрос боту.").format(name="Codex"),
+                      self.sent[-1]["text"])
 
     async def test_timeout_kills_login_process_and_clears_state(self):
         self.script_body("print('waiting', flush=True)\ntime.sleep(30)\n")
@@ -226,7 +241,8 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         await session.task
         self.assertIsNotNone(session.proc.returncode)
         self.assertIsNone(self.manager.session)
-        self.assertIn("истекло", self.sent[-1]["text"])
+        self.assertIn(_("Время ожидания входа истекло. Повтори /login {engine}.").format(engine="claude"),
+                      self.sent[-1]["text"])
 
     async def test_cancel_and_shutdown_clean_process(self):
         self.claude_script()
@@ -246,7 +262,11 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         self.manager.start("codex", 1, 1)
         await self.manager.session.task
         self.assertNotIn(CODE, str(self.sent))
-        self.assertIn("настройках безопасности ChatGPT", self.sent[-1]["text"])
+        self.assertIn(_(
+            "Вход Codex не завершён. Если вход по коду устройства выключен, "
+            "включи его в настройках безопасности ChatGPT и повтори /login codex. "
+            "Другой способ: codex login в терминале WSL."
+        ), self.sent[-1]["text"])
 
 
 class TelegramAuthTests(unittest.IsolatedAsyncioTestCase):

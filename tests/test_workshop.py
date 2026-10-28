@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from claude_tg_bot import approval  # noqa: E402
 from claude_tg_bot import bot as botmod  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 from test_review_bot_main import GROUP, _Base, _msg  # noqa: E402
 
 WS = f"{GROUP}:77"
@@ -40,7 +41,7 @@ class WorkshopDefaultsTests(unittest.TestCase):
 
     def test_status_line(self) -> None:
         ctx, cfg = self._ctx()
-        self.assertIn("свободна", botmod._workshop_status(ctx, cfg))
+        self.assertIn(_("🛠 мастерская: свободна"), botmod._workshop_status(ctx, cfg))
         ctx.application.bot_data.update(workshop_run={"since": 0.0, "what": "поиск"}, lock_waiting={WS: 2})
         line = botmod._workshop_status(ctx, cfg)
         self.assertIn("поиск", line)
@@ -84,7 +85,8 @@ class WorkshopDispatchTests(_Base):
         finally:
             botmod._send_ask_card = orig
         self.assertEqual(sent_cards, [])
-        self.assertIn("Вопрос: Отправлять?", self._forwarded()[0])
+        self.assertIn(_("Вопрос: {question} ({options})").format(question="Отправлять?", options="да; нет"),
+                      self._forwarded()[0])
 
     async def test_show_key_passed_to_run(self) -> None:
         await self.dispatch("Наряд", msg=_msg(thread=77), unattended=True)
@@ -134,7 +136,7 @@ class WorkshopCardTests(unittest.TestCase):
             return bot.send_message.call_args.kwargs
         kw = asyncio.run(go())
         self.assertEqual(kw["chat_id"], 1)
-        self.assertIn("Мастерская", kw["text"])
+        self.assertIn(_("🛠 <b>Мастерская</b>"), kw["text"])
 
 
 if __name__ == "__main__":
@@ -210,7 +212,7 @@ class AskCardTests(_Base):
         upd = SimpleNamespace(message=msg)
         for _ in range(2):
             await botmod._send_ask_card(self.ctx, upd, str(GROUP), ("Отправлять?", ["да", "нет"]),
-                                        permission_mode="bypassPermissions", unattended=False)
+                                        permission_mode="bypassPermissions", epoch=0)
         pending = self.bot_data["ask_options"]
         self.assertEqual({v["msg"][1] for v in pending.values()}, {102})
         self.ctx.bot.edit_message_reply_markup.assert_awaited_once()
@@ -218,12 +220,15 @@ class AskCardTests(_Base):
     async def test_old_card_expires(self) -> None:
         pending = self.bot_data.setdefault("ask_options", {})
         pending["tok"] = {"chat_key": str(GROUP), "answer": "да", "question": "q", "card": "c", "at": 0.0,
-                          "permission_mode": "bypassPermissions", "unattended": False, "epoch": 0}
+                          "permission_mode": "bypassPermissions", "epoch": 0}
         query = SimpleNamespace(data="ask:tok", answer=AsyncMock(), edit_message_reply_markup=AsyncMock(),
                                 message=_msg())
-        upd = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7))
+        upd = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
+                              effective_chat=SimpleNamespace(id=GROUP, type="supergroup"))
         await botmod.on_ask_pick(upd, self.ctx)
-        self.assertIn("устарел", query.answer.await_args.args[0])
+        self.assertEqual(_("Ответ не принят: вопрос устарел (старше 12 часов, повторён ниже, бот "
+                           "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."),
+                         query.answer.await_args.args[0])
         self.assertEqual(self.runs, [])
 
 

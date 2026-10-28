@@ -54,6 +54,11 @@ AUDIT_LOG_NAME = "audit.jsonl"
 # разрешает ЛЮБЫЕ действия (вкл. Bash/Write/Edit) на 15 мин / 1 ч — иначе на
 # самый частый инструмент (Bash) приходился пучок ручных аппрувов. Размен
 # удобства на безопасность: в открытом окне rm/push/curl проходят без карточки.
+# С 28.10.2026 (решение Ивана «Пусть окно пускает») окно пускает и команды,
+# которые читают или пишут секрет: кнопки ⏩ на такой карточке были, а
+# следующая команда с токеном снова шла карточкой. В audit для них
+# decision="allow:burst:secret". Отправка наружу, фоновые раны и force_card
+# окно по-прежнему не берёт.
 # Set оставлен пустым, чтобы при необходимости снова что-то исключить точечно.
 _BURST_DENY_TOOLS: frozenset[str] = frozenset()
 
@@ -2620,7 +2625,7 @@ async def handle_approve(request: web.Request) -> web.Response:
 
     burst_eligible = (
         target is not None and not is_unattended and tool_name not in _BURST_DENY_TOOLS
-        and not outbound and not secret and not force_card
+        and not outbound and not force_card
     )
     if burst_eligible and time.time() < burst_until:
         aid = uuid.uuid4().hex[:12]
@@ -2634,7 +2639,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             approval_id=aid,
             tool_name=tool_name,
             tool_input=tool_input,
-            decision="allow:burst",
+            decision="allow:burst:secret" if secret else "allow:burst",
         )
         return web.json_response({"decision": "allow", "reason": "burst"})
 
@@ -2949,6 +2954,11 @@ async def handle_event(request: web.Request) -> web.Response:
     silent = payload.get("silent", False)
     if not isinstance(silent, bool):
         return web.json_response({"error": "silent must be a JSON boolean"}, status=400)
+    # Вопросы рана становятся делами (опыт В1, docs/design-2026-10-26-v1.md):
+    # только явное "deal", иначе обычные карточки.
+    asks = payload.get("asks")
+    if asks is not None and asks not in ("deal", "card"):
+        return web.json_response({"error": "asks must be \"deal\" or \"card\""}, status=400)
     with_notice = payload.get("notice", True)
     if not isinstance(with_notice, bool):
         return web.json_response({"error": "notice must be a JSON boolean"}, status=400)
@@ -3009,6 +3019,8 @@ async def _handle_event_admitted(
     if text:
         notice += f"\n{_esc_truncate(text, TRUNCATE_PAYLOAD)}"
     wake = application.bot_data.get("event_wake") if payload.get("wake") else None
+    # Проверено в handle_event; чужой текст делами не становится.
+    deal_asks = payload.get("asks") == "deal" and not untrusted
     prompt = str(payload.get("prompt") or "").strip() or (
         _("Внешнее событие от «{source}»: {title}\n\n{text}\n\n"
           "Сделай первичный разбор: что это, серьёзно ли, что проверить. "
@@ -3019,6 +3031,7 @@ async def _handle_event_admitted(
     if wake is not None and store is not None:
         rec = events.new_record(key=key, chat_id=chat_id, thread_id=thread_id, prompt=prompt, fresh=fresh,
                                 untrusted=untrusted, silent=silent, source=source, title=title, ttl=ttl,
+                                deal_asks=deal_asks,
                                 expires_at=expires_at, receiving=sends_notice,
                                 boot=application.bot_data.get("boot_id"))
         try:
@@ -3087,7 +3100,8 @@ async def _handle_event_admitted(
         # ссылку (сборщик может убить её на середине).
         tasks: set[asyncio.Task] = application.bot_data.setdefault("event_wake_tasks", set())
         task = asyncio.create_task(
-            wake(chat_id, thread_id, prompt, fresh, untrusted=untrusted, silent=silent, event_id=event_id))
+            wake(chat_id, thread_id, prompt, fresh, untrusted=untrusted, silent=silent, event_id=event_id,
+                 deal_asks=deal_asks))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 

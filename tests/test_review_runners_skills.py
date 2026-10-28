@@ -14,6 +14,7 @@ import pytest
 from claude_tg_bot import approval, claude_runner as runner, config, notify
 from claude_tg_bot.skills.news_digest.core import Candidate, parse_answer
 from claude_tg_bot.skills.yt_subs import __main__ as yt
+from tests.texts import msg_re
 
 
 def fake_config(**env):
@@ -129,7 +130,7 @@ def test_oversized_stream_line_skipped(monkeypatch):
 @pytest.mark.parametrize('url', ['http://127.0.0.1/x', 'http://router.lan/x', 'http://192.168.1.1/x'])
 def test_b18_input_url_rejected_before_fetch(url):
     with patch.object(yt, '_ytdlp') as fetch:
-        with pytest.raises(SystemExit, match='публичная'):
+        with pytest.raises(SystemExit, match=msg_re('нужна публичная ссылка http(s):// без IP-адреса')):
             yt.main([url])
     fetch.assert_not_called()
 
@@ -139,7 +140,7 @@ def test_b18_track_url_rejected_before_download(auto):
     info = {'id': 'test', 'automatic_captions' if auto else 'subtitles': {
         'ru': [{'url': 'https://public.example/sub.vtt'}, {'url': 'http://127.0.0.1/private'}]}}
     with patch.object(yt, '_ytdlp', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(info))) as fetch:
-        with pytest.raises(SystemExit, match='непубличный'):
+        with pytest.raises(SystemExit, match=msg_re('дорожка содержит непубличный адрес')):
             yt.main(['https://public.example/video'])
     assert fetch.call_count == 1
 

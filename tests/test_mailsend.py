@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import approval, mailsend  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import msg_re  # noqa: E402
 
 PY = ".venv/bin/python -m claude_tg_bot.mailsend"
 
@@ -183,7 +185,7 @@ class HandleApproveTests(_Env):
         out, card = self._decide(
             f"{PY} --to a@b.c --subject S --body-file {self.body} --attach {self.outside / 'secret.pdf'}")
         self.assertEqual(out["decision"], "deny")
-        self.assertIn("разрешённых каталогов", out["reason"])
+        self.assertRegex(out["reason"], msg_re("вложение {path} не из разрешённых каталогов ({dirs})"))
         card.assert_not_called()
 
     def test_agent_cannot_supply_snapshot(self) -> None:
@@ -233,7 +235,8 @@ class SendAfterCardTests(_Env):
         code, smtp, text = self._run()
         self.assertEqual(code, 1)
         smtp.send_message.assert_not_called()
-        self.assertIn("нет одобрения", text)
+        self.assertIn(_("нет одобрения карточкой на это письмо: запускай без обходов, чтобы бот показал "
+                        "карточку, и не меняй текст и вложения после неё"), text)
 
     def test_approved_letter_sent_once(self) -> None:
         self._approve()
@@ -264,10 +267,11 @@ class SendAfterCardTests(_Env):
     def test_forged_or_stale_ticket_refused(self) -> None:
         kind, info = approval._mailsend_check(self.cmd(), None)
         mailsend.write_ticket(self.state, info["digest"], "другой секрет")
-        self.assertIn("не от бота", mailsend.take_ticket(self.state, info["digest"], "s3"))
+        self.assertEqual(_("билет одобрения не от бота"), mailsend.take_ticket(self.state, info["digest"], "s3"))
         mailsend.write_ticket(self.state, info["digest"], "s3")
         with patch.object(mailsend.time, "time", return_value=time.time() + mailsend.TICKET_TTL_SEC + 5):
-            self.assertIn("устарело", mailsend.take_ticket(self.state, info["digest"], "s3"))
+            self.assertEqual(_("одобрение карточкой устарело, нужна новая карточка"),
+                             mailsend.take_ticket(self.state, info["digest"], "s3"))
 
     def test_reply_headers(self) -> None:
         args = mailsend.build_parser().parse_args(
@@ -289,22 +293,22 @@ class MailCardTextTests(_Env):
 
     def test_card_shows_recipient_subject_body_and_sizes(self) -> None:
         text = approval._format_tool_call("Bash", self._input(), "sid")
-        self.assertIn("письмо от твоего имени", text)
+        self.assertIn(_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"), text)
         self.assertIn("hr@example.com", text)
         self.assertIn("DevOps (Senior)", text)
         self.assertIn("Резюме &lt;во&gt; вложении.", text)
         self.assertIn("cv.pdf", text)
-        self.assertIn("13 Б", text)
-        self.assertNotIn("длиннее карточки", text)
+        self.assertIn(_("{size} Б").format(size=13), text)
+        self.assertNotIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
 
     def test_long_body_full_view_and_no_burst_buttons(self) -> None:
         tool_input = self._input("абв " * 1500 + "КОНЕЦ")
         text = approval._format_tool_call("Bash", tool_input, "sid")
-        self.assertIn("длиннее карточки", text)
+        self.assertIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
         self.assertTrue(approval.needs_full_view(tool_input, "Bash"))
         full = approval.full_view_text("Bash", tool_input)
         self.assertIn("КОНЕЦ", full)
-        self.assertNotIn("остальные поля", full)
+        self.assertNotIn(_("\n\n--- остальные поля ---\n"), full)
 
         async def go() -> list:
             registry = approval.ApprovalRegistry()

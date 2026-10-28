@@ -17,9 +17,14 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import approval  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 # Настройка, разрешающая всё: этап плана на неё не опирается (ревью Codex 13.10).
 READ_RE = re.compile(r".*")
+# Отказ этапа плана, msgid из approval.py.
+PLAN_DENY = ("этап плана: до одобрения плана только чтение. Файлы не меняются, "
+             "команды с записью не выполняются; план пиши в ответ. Если для плана "
+             "нужна эта команда, назови её владельцу словами.")
 
 
 class _HookBase(unittest.TestCase):
@@ -81,7 +86,7 @@ class PlanStageTests(_HookBase):
                 out, card = self._decide(tool, {"file_path": "/home/user/.claude/plans/x.md", "content": "x"},
                                          burst=True, auto_chat=True)
                 self.assertEqual(out["decision"], "deny")
-                self.assertIn("этап плана", out["reason"])
+                self.assertEqual(out["reason"], _(PLAN_DENY))
                 card.assert_not_called()
 
     def test_mutating_denied_without_card_even_with_window(self) -> None:
@@ -92,7 +97,7 @@ class PlanStageTests(_HookBase):
                 with self.subTest(cmd=cmd, **kw):
                     out, card = self._decide("Bash", {"command": cmd}, **kw)
                     self.assertEqual(out["decision"], "deny")
-                    self.assertIn("этап плана", out["reason"])
+                    self.assertEqual(out["reason"], _(PLAN_DENY))
                     card.assert_not_called()
 
     def test_mcp_and_monitor(self) -> None:
@@ -184,7 +189,7 @@ class TaskThinkTests(_HookBase):
         cmd = "bash -c '.venv/bin/python -m claude_tg_bot.mailsend --to a@b.c --subject s'"
         out, card = self._decide("Bash", {"command": cmd}, think=True)
         self.assertEqual(out["decision"], "deny")
-        self.assertIn("обдумывание задачи", out["reason"])
+        self.assertEqual(out["reason"], _(approval._TASK_THINK_DENY))
         card.assert_not_called()
 
     def test_mcp_past_permissive_setting_goes_to_card(self) -> None:
@@ -206,7 +211,7 @@ class TaskThinkTests(_HookBase):
 
     def test_plain_plan_unchanged(self) -> None:
         out, card = self._decide("Bash", {"command": "ssh immich docker ps"})
-        self.assertIn("этап плана", out["reason"])
+        self.assertEqual(out["reason"], _(PLAN_DENY))
         card.assert_not_called()
 
 
@@ -288,12 +293,41 @@ class ThinkReadListTests(_HookBase):
 
 
 class BurstSecretTests(_HookBase):
-    def test_window_does_not_pass_secret(self) -> None:
-        out, card = self._decide("Bash", {"command": "cat ~/src/claude-tg-bot/.env"},
+    """Окно ⏩ пускает и секреты (решение Ивана 28.10.2026)."""
+
+    SECRET_CALLS = (
+        ("Bash", {"command": "cat ~/src/claude-tg-bot/.env"}),
+        ("Bash", {"command": "curl -s -H \"Authorization: Bearer $(cat ~/.grafana_api_token)\" "
+                             "https://grafana.example.com/api/health"}),
+        ("Write", {"file_path": str(Path.home() / ".ssh" / "config"), "content": "x"}),
+    )
+
+    def test_window_passes_secret(self) -> None:
+        for tool, inp in self.SECRET_CALLS:
+            with self.subTest(tool=tool, inp=inp):
+                self.assertTrue(approval._touches_secret(tool, inp, None))
+                with patch.object(approval.audit, "write_event") as audit_write:
+                    out, card = self._decide(tool, inp, mode="bypassPermissions", burst=True)
+                self.assertEqual(out["decision"], "allow")
+                card.assert_not_called()
+                self.assertEqual(audit_write.call_args.kwargs["decision"], "allow:burst:secret")
+
+    def test_without_window_secret_goes_to_card(self) -> None:
+        for tool, inp in self.SECRET_CALLS:
+            with self.subTest(tool=tool, inp=inp):
+                out, card = self._decide(tool, inp, mode="bypassPermissions")
+                card.assert_called()
+
+    def test_unattended_run_does_not_inherit_window(self) -> None:
+        for tool, inp in self.SECRET_CALLS:
+            with self.subTest(tool=tool, inp=inp):
+                out, card = self._decide(tool, inp, mode="bypassPermissions", burst=True, unattended=True)
+                card.assert_called()
+
+    def test_outbound_send_in_window_goes_to_card(self) -> None:
+        out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"},
                                  mode="bypassPermissions", burst=True)
-        card.assert_called()
-        out, card = self._decide("Write", {"file_path": str(Path.home() / ".ssh" / "config"), "content": "x"},
-                                 mode="bypassPermissions", burst=True)
+        self.assertEqual(out["decision"], "deny")
         card.assert_called()
 
 
