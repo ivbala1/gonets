@@ -249,6 +249,20 @@ class TextTests(unittest.TestCase):
         task.update(plan="шаги", skill="immich-upgrade")
         self.assertIn("~/.claude/skills/immich-upgrade/SKILL.md", tasks.exec_prompt(task))
 
+    def test_think_rules_name_open_two_mind_path(self):
+        # Путь в подсказке тот, что пускает approval на этапе обдумывания:
+        # без него агент считал запись закрытой и Codex не спрашивал.
+        from claude_tg_bot.approval import _plan_read_allowed, _two_mind_request
+        rules = tasks.think_rules()
+        m = re.search(r" (/\S+/2mind/) ", rules)
+        self.assertIsNotNone(m)
+        state = Path(m.group(1)).parent
+        self.assertTrue(_two_mind_request(Path(m.group(1)) / "kanzo-review.txt", state))
+        # и вызов ask.py с этим файлом, как его называет подсказка, без карточки
+        self.assertIn("python3 ~/.claude/skills/2mind/ask.py", rules)
+        ask = f"python3 ~/.claude/skills/2mind/ask.py {m.group(1)}kanzo-review.txt"
+        self.assertTrue(_plan_read_allowed(ask, None, two_mind=True))
+
     def test_topic_name_prefers_task_name(self):
         it = _item()
         it.task = "Правка секретов с телефона"

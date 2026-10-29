@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -430,9 +431,190 @@ class AskStaleTests(_Base):
         self.assertEqual(q.answer.await_count, 1)
         args, kwargs = q.answer.await_args
         self.assertRegex(args[0], msg_re(
-            "Ответ не принят: вопрос устарел (старше 12 часов, повторён ниже, бот "
+            "Ответ не принят: вопрос устарел (старше 12 часов, заменён новым, бот "
             "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."))
         self.assertTrue(kwargs.get("show_alert"))
+
+
+# ---- 29.10.2026: один текущий вопрос, двойное нажатие, вопрос после нажатия ----
+
+class AskCardTests(_Base):
+    def option(self, card: str, answer: str, question: str = "Как проверяем?", **extra) -> dict:
+        v = {"chat_key": str(GROUP), "answer": answer, "question": question, "card": card,
+             "epoch": botmod._session_epoch(self.ctx, str(GROUP)), "permission_mode": "bypassPermissions",
+             "at": time.time()}
+        v.update(extra)
+        return v
+
+    async def test_second_option_of_same_card_starts_no_run(self) -> None:
+        # Ревью Codex 29.10.2026: соседний вариант гас только после await
+        # query.answer(), и второе нажатие запускало второй ход.
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending.update({"a": self.option("c1", "не надо"), "b": self.option("c1", "пока не надо")})
+        card = _msg("card", chat=SimpleNamespace(id=GROUP, type="supergroup"))
+        second = self.query("ask:b", card)
+
+        async def press_second(*_a, **_kw):
+            await botmod.on_ask_pick(self.cb_update(second), self.ctx)
+
+        first = self.query("ask:a", card)
+        first.answer = AsyncMock(side_effect=press_second)
+        await botmod.on_ask_pick(self.cb_update(first), self.ctx)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("не надо", self.runs[0]["prompt"])
+        self.assertEqual(pending, {})
+
+    async def test_new_question_replaces_any_open_card_in_place(self) -> None:
+        # Случай 29.10.2026: тот же вопрос другими словами оставлял две живые
+        # карточки. Теперь любая прежняя карточка чата гаснет правкой на месте.
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["old"] = self.option("c1", "не надо", "Как проверяем штрафы в России?", msg=(GROUP, 50, None))
+        pending["other"] = self.option("c9", "да", "Чужой чат?", chat_key="-5")
+        self.ctx.bot.edit_message_text = AsyncMock()
+        msg = _msg()
+        msg.reply_text = AsyncMock(return_value=SimpleNamespace(chat_id=GROUP, message_id=60,
+                                                                message_thread_id=None))
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Как проверять российские?", ["никак"]),
+                                    permission_mode="bypassPermissions",
+                                    epoch=botmod._session_epoch(self.ctx, str(GROUP)))
+        self.assertEqual(sorted(v["question"] for v in pending.values()),
+                         ["Как проверять российские?", "Чужой чат?"])
+        edit = self.ctx.bot.edit_message_text.await_args
+        self.assertEqual(edit.kwargs["message_id"], 50)
+        self.assertIsNone(edit.kwargs["reply_markup"])
+        self.assertIn("1. не надо", edit.args[0])
+        self.assertIn(botmod._("↓ вопрос заменён новым ниже"), edit.args[0])
+        self.ctx.bot.send_message.assert_not_awaited()
+
+    async def test_question_of_run_before_queued_answer_has_no_buttons(self) -> None:
+        # Ответ кнопкой ждёт замка, а идущий ран кончился новым вопросом: он
+        # сочинён без ответа и уходит текстом без кнопок, чужих карточек не
+        # гасит. Вопрос хода самого ответа идёт кнопками.
+        pending = self.bot_data.setdefault("ask_options", {})
+        botmod._ask_picks_queued(self.ctx, str(GROUP)).add("q1")
+        self.answer = "Итог.\n<<ASK: Как проверять российские? | никак | позже>>"
+        msg = _msg()
+        msg.reply_text = AsyncMock(return_value=SimpleNamespace(chat_id=GROUP, message_id=90,
+                                                                message_thread_id=None))
+        await self.dispatch("x", msg)
+        text = msg.reply_text.await_args.args[0]
+        self.assertIn("Как проверять российские?", text)
+        self.assertIn(botmod._("без кнопок: ты уже ответил на прежний вопрос, ответ в очереди"), text)
+        self.assertNotIn("reply_markup", msg.reply_text.await_args.kwargs)
+        self.assertEqual(pending, {})
+        await self.dispatch("[Ответ на вопрос «Как проверяем?»]: не надо", msg, from_callback=True,
+                            ask_ref={"question": "Как проверяем?", "answer": "не надо", "queued": "q1"})
+        self.assertIn("reply_markup", msg.reply_text.await_args.kwargs)
+        self.assertEqual(len(pending), 2)
+
+    async def test_late_card_of_old_session_keeps_current_one(self) -> None:
+        # Карточка рана прежней сессии пришла после /reset: без кнопок и
+        # действующий вопрос не гасит (ревью Codex 29.10.2026).
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["cur"] = self.option("c1", "да")
+        epoch = botmod._session_epoch(self.ctx, str(GROUP))
+        botmod._bump_session_epoch(self.ctx, str(GROUP))
+        pending["cur"]["epoch"] = botmod._session_epoch(self.ctx, str(GROUP))
+        msg = _msg()
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Старый?", ["нет"]),
+                                    permission_mode="bypassPermissions", epoch=epoch)
+        self.assertEqual(list(pending), ["cur"])
+        self.assertIn(botmod._("без кнопок: сессия темы сменилась"), msg.reply_text.await_args.args[0])
+
+    async def test_old_card_pressed_while_new_one_sends_is_refused(self) -> None:
+        # Старая карточка снимается до отправки новой: нажатая в это окно,
+        # она не даёт второго хода (ревью Codex 29.10.2026).
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["old"] = self.option("c1", "не надо", msg=(GROUP, 50, None))
+        self.ctx.bot.edit_message_text = AsyncMock()
+        card = _msg("card", chat=SimpleNamespace(id=GROUP, type="supergroup"), message_id=50)
+        press = self.query("ask:old", card)
+
+        async def send(*_a, **_kw):
+            await botmod.on_ask_pick(self.cb_update(press), self.ctx)
+            return SimpleNamespace(chat_id=GROUP, message_id=60, message_thread_id=None)
+        msg = _msg()
+        msg.reply_text = AsyncMock(side_effect=send)
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Новый?", ["да"]),
+                                    permission_mode="bypassPermissions",
+                                    epoch=botmod._session_epoch(self.ctx, str(GROUP)))
+        self.assertEqual(self.runs, [])
+        self.assertTrue(press.answer.await_args.kwargs.get("show_alert"))
+        self.assertEqual([v["question"] for v in pending.values()], ["Новый?"])
+
+    async def test_failed_send_restores_old_card(self) -> None:
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["old"] = self.option("c1", "да")
+        msg = _msg()
+        msg.reply_text = AsyncMock(side_effect=RuntimeError("net"))
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Новый?", ["нет"]),
+                                    permission_mode="bypassPermissions",
+                                    epoch=botmod._session_epoch(self.ctx, str(GROUP)))
+        self.assertEqual(list(pending), ["old"])
+
+    async def test_queued_mark_lives_until_answer_turn_ends(self) -> None:
+        # Отметка снимается в конце хода ответа, а не под замком: ран до него
+        # шлёт карточку уже после замка (ревью 29.10.2026).
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["a"] = self.option("c1", "не надо")
+        seen: list = []
+
+        async def during(_run) -> None:
+            seen.append(set(botmod._ask_picks_queued(self.ctx, str(GROUP))))
+        self.run_hook = during
+        card = _msg("card", chat=SimpleNamespace(id=GROUP, type="supergroup"))
+        await botmod.on_ask_pick(self.cb_update(self.query("ask:a", card)), self.ctx)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(seen[0]), 1)
+        self.assertEqual(botmod._ask_picks_queued(self.ctx, str(GROUP)), set())
+
+    async def test_card_replaced_while_sending_loses_buttons(self) -> None:
+        # Следующая карточка сменила эту, пока та отправлялась (сообщения ещё
+        # не было): эта правится сама, живых кнопок без реестра не остаётся.
+        pending = self.bot_data.setdefault("ask_options", {})
+        self.ctx.bot.edit_message_text = AsyncMock()
+
+        async def send(*_a, **_kw):
+            botmod._take_ask_cards(pending, lambda v: True)
+            return SimpleNamespace(chat_id=GROUP, message_id=80, message_thread_id=None)
+        msg = _msg()
+        msg.reply_text = AsyncMock(side_effect=send)
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Отправлять?", ["да"]),
+                                    permission_mode="bypassPermissions", epoch=0)
+        self.assertEqual(self.ctx.bot.edit_message_text.await_args.kwargs["message_id"], 80)
+        self.assertIsNone(self.ctx.bot.edit_message_text.await_args.kwargs["reply_markup"])
+
+
+    async def test_answer_queued_before_first_await(self) -> None:
+        # Отметка «ответ в очереди» ставится до query.answer(): вопрос другого
+        # рана, ушедший в это окно, кнопок не получает (ревью Codex 29.10.2026).
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["a"] = self.option("c1", "не надо")
+        seen: list = []
+        card = _msg("card", chat=SimpleNamespace(id=GROUP, type="supergroup"))
+        press = self.query("ask:a", card)
+
+        async def answer(*_a, **_kw):
+            seen.append(len(botmod._ask_picks_queued(self.ctx, str(GROUP))))
+        press.answer = AsyncMock(side_effect=answer)
+        await botmod.on_ask_pick(self.cb_update(press), self.ctx)
+        self.assertEqual(seen, [1])
+
+    async def test_failed_send_keeps_cards_changed_meanwhile(self) -> None:
+        # Отправка A сняла O и упала, а за это время карточку B доставили и на
+        # неё ответили (реестр пуст): O не возвращается.
+        pending = self.bot_data.setdefault("ask_options", {})
+        pending["old"] = self.option("c1", "да")
+
+        async def send(*_a, **_kw):
+            botmod._ask_cards_changed(self.ctx, str(GROUP))
+            raise RuntimeError("net")
+        msg = _msg()
+        msg.reply_text = AsyncMock(side_effect=send)
+        await botmod._send_ask_card(self.ctx, _update(msg), str(GROUP), ("Новый?", ["нет"]),
+                                    permission_mode="bypassPermissions",
+                                    epoch=botmod._session_epoch(self.ctx, str(GROUP)))
+        self.assertEqual(pending, {})
 
 
 # ---- B38, b1.2: смена скоупа поднимает эпоху ----
