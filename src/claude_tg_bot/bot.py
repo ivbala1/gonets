@@ -24,7 +24,8 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from aiohttp import web
 from telegram import (BotCommand, Chat, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
-                      LinkPreviewOptions, Message, ReplyParameters, Update)
+                      LinkPreviewOptions, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+                      ReplyParameters, Update)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
@@ -318,16 +319,17 @@ async def _cleanup_abandoned_approvals(
     registry: ApprovalRegistry = ctx.application.bot_data["registry"]
     abandoned = registry.resolve_by_session(session_id, reason_tag)
     for p in abandoned:
-        if p.telegram_message_id is None:
-            continue
         chat_id = p.target_chat_id if p.target_chat_id is not None else cfg.primary_chat_id
         thread_id = p.target_thread_id
         try:
-            await ctx.bot.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=p.telegram_message_id,
-                reply_markup=None,
-            )
+            # Номера нет после таймаута отправки карточки: кнопки не снять,
+            # но пояснение всё равно нужно.
+            if p.telegram_message_id is not None:
+                await ctx.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=p.telegram_message_id,
+                    reply_markup=None,
+                )
             # PTB сам опускает message_thread_id=None — танец с kwargs не нужен.
             await ctx.bot.send_message(
                 chat_id=chat_id,
@@ -767,10 +769,75 @@ def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, 
                and float(vs[0].get("at") or 0) > now - ASK_REPEAT_HOLD_SEC for vs in cards.values())
 
 
+def _ask_picks_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> set[str]:
+    """Принятые ответы кнопкой этого чата, чей ход ещё не закончился. Ран,
+    закончившийся при непустом наборе (кроме своего ответа), задал вопрос, не
+    зная ответа Ивана."""
+    return ctx.application.bot_data.setdefault("ask_picks_queued", {}).setdefault(chat_key, set())
+
+
+def _ask_cards_changed(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
+    """Поколение карточек чата: растёт при каждой замене и принятом ответе.
+    Сбой отправки возвращает прежние карточки, только если поколение то же:
+    пустой реестр не значит, что между ними не было другой карточки."""
+    gens: dict[str, int] = ctx.application.bot_data.setdefault("ask_card_gen", {})
+    gens[chat_key] = gens.get(chat_key, 0) + 1
+    return gens[chat_key]
+
+
+def _take_ask_cards(pending: dict[str, dict], keep: Callable[[dict], bool]) -> list[dict]:
+    """Снимает из реестра все варианты карточек, у которых keep(вариант)
+    истинно, без единого await: нажатие, пришедшее следом, их уже не найдёт.
+    Возвращает по записи на карточку: сообщение, вопрос и варианты по порядку."""
+    taken = {t: v for t, v in pending.items() if keep(v)}
+    for t in taken:
+        pending.pop(t, None)
+    return _ask_cards_of(taken)
+
+
+def _ask_cards_of(options: dict[str, dict]) -> list[dict]:
+    """Варианты реестра по карточкам: сообщение, вопрос, варианты по порядку."""
+    cards: dict[Any, dict] = {}
+    for v in options.values():
+        c = cards.setdefault(v.get("card"), {"msg": v.get("msg"), "question": v.get("question", ""),
+                                             "options": []})
+        c["options"].append(v.get("answer", ""))
+    return list(cards.values())
+
+
+@contextlib.contextmanager
+def _ask_answer_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ref: dict):
+    """Ответ на вопрос ждёт замка темы и идёт своим ходом: пока ход не
+    кончился, вопрос другого рана сочинён без этого ответа и кнопками не
+    уходит (_send_ask_card; случай 29.10.2026: Иван нажал и его, второй ход
+    повторил первый). Снимается в конце хода, а не под замком: ран до него
+    шлёт карточку уже после замка, и ход ответа успел бы его взять."""
+    queued = uuid.uuid4().hex[:8]
+    ref["queued"] = queued
+    _ask_picks_queued(ctx, chat_key).add(queued)
+    try:
+        yield
+    finally:
+        _ask_picks_queued(ctx, chat_key).discard(queued)
+
+
+async def _retire_ask_cards(ctx: ContextTypes.DEFAULT_TYPE, cards: list[dict], note: str) -> None:
+    """Снятые карточки правятся на месте: кнопки убраны, внизу пометка. Без
+    отдельного сообщения на каждую замену (ревью Codex 29.10.2026)."""
+    for c in cards:
+        where = c.get("msg")
+        if not where:
+            continue
+        listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(c["options"], 1))
+        with contextlib.suppress(Exception):
+            await ctx.bot.edit_message_text(f"❓ {c['question']}\n\n{listing}\n\n{note}",
+                                            chat_id=where[0], message_id=where[1], reply_markup=None)
+
+
 async def _send_ask_card(
     ctx: ContextTypes.DEFAULT_TYPE, update: Update, chat_key: str,
     ask: tuple[str, list[str]], *, permission_mode: str, epoch: int,
-    untrusted: bool = False,
+    untrusted: bool = False, own_queued: str | None = None,
 ) -> None:
     """Уточняющий вопрос Claude кнопками. Выбор уходит следующим сообщением
     в ту же сессию — за рулём это тап вместо печати.
@@ -786,12 +853,35 @@ async def _send_ask_card(
     """
     question, options = ask
     pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
-    # Один вопрос, одна живая карточка (проект Домового 22.10.2026, 1.5: 20
-    # повторов вопроса из 125): прежняя карточка того же чата с тем же
-    # вопросом гаснет с пометкой «повторён ниже».
-    # Гасятся только после отправки новой: её сбой не оставит вопрос без кнопок.
-    old_cards = {v.get("card"): v.get("msg") for v in pending.values()
-                 if v.get("chat_key") == chat_key and v.get("question") == question}
+    # Telegram обрезает подпись кнопки по ширине экрана, и вариант читался
+    # наполовину. Полный текст вариантов идёт в самом сообщении с номерами,
+    # кнопка несёт номер и начало: выбор виден целиком до нажатия.
+    listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, 1))
+    # Вопрос, сочинённый без ответа Ивана из очереди или в прежней сессии,
+    # уходит без кнопок и ничьих карточек не гасит: карточка идёт уже после
+    # замка темы, и за это время мог прийти ответ или /reset (ревью 29.10.2026).
+    if _ask_picks_queued(ctx, chat_key) - {own_queued}:
+        stale = _("без кнопок: ты уже ответил на прежний вопрос, ответ в очереди")
+    elif epoch != _session_epoch(ctx, chat_key):
+        stale = _("без кнопок: сессия темы сменилась")
+    else:
+        stale = ""
+    if stale:
+        log.info("ask without buttons chat=%s", chat_key)
+        with contextlib.suppress(Exception):
+            await update.message.reply_text(f"❓ {question}\n\n{listing}\n\n({stale})")
+        return
+    # Один текущий вопрос на чат (проект Домового 22.10.2026, 1.5; случай
+    # 29.10.2026: тот же вопрос другими словами дал две живые карточки, Иван
+    # нажал обе): любая прежняя карточка этого чата гаснет, а не только с тем
+    # же текстом, в том числе от фонового рана: варианты остаются в тексте,
+    # ответить можно словами. Вопросы дел живут в своём реестре и не задеваются.
+    # Снимаются до отправки, без await: иначе старую нажимали, пока шла новая,
+    # и обе давали ход. Сбой отправки возвращает их.
+    old = {t: v for t, v in pending.items() if v.get("chat_key") == chat_key}
+    for t in old:
+        pending.pop(t, None)
+    gen = _ask_cards_changed(ctx, chat_key)
     # Токен вместо текста: callback_data ограничена 64 байтами.
     rows = []
     card_id = uuid.uuid4().hex[:8]
@@ -809,36 +899,29 @@ async def _send_ask_card(
         }
         rows.append([InlineKeyboardButton(_ask_button_label(len(rows) + 1, opt),
                                           callback_data=f"ask:{token}")])
-    # Telegram обрезает подпись кнопки по ширине экрана, и вариант читался
-    # наполовину. Полный текст вариантов идёт в самом сообщении с номерами,
-    # кнопка несёт номер и начало: выбор виден целиком до нажатия.
-    listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, 1))
     try:
         sent = await update.message.reply_text(
             f"❓ {question}\n\n{listing}", reply_markup=InlineKeyboardMarkup(rows),
         )
         if isinstance(getattr(sent, "message_id", None), int):
             where = (sent.chat_id, sent.message_id, getattr(sent, "message_thread_id", None))
-            for v in pending.values():
-                if v.get("card") == card_id:
-                    v["msg"] = where
+            mine = [v for v in pending.values() if v.get("card") == card_id]
+            for v in mine:
+                v["msg"] = where
+            if not mine:
+                # Пока карточка отправлялась, её уже сменила следующая (отправка
+                # идёт после замка темы): без сообщения та её не поправила.
+                await _retire_ask_cards(ctx, [{"msg": where, "question": question, "options": list(options)}],
+                                        _("↓ вопрос заменён новым ниже"))
     except Exception:
         log.exception("ask card failed")
         for t, v in list(pending.items()):
             if v.get("card") == card_id:
                 pending.pop(t, None)
-        return
-    for t, v in list(pending.items()):
-        if v.get("card") in old_cards:
-            pending.pop(t, None)
-    for where in old_cards.values():
-        if where:
-            with contextlib.suppress(Exception):
-                await ctx.bot.edit_message_reply_markup(chat_id=where[0], message_id=where[1], reply_markup=None)
-                await ctx.bot.send_message(where[0], _("↓ вопрос повторён ниже"), message_thread_id=where[2],
-                                           reply_parameters=ReplyParameters(
-                                               message_id=where[1], allow_sending_without_reply=True),
-                                           disable_notification=True)
+        if ctx.application.bot_data.get("ask_card_gen", {}).get(chat_key) == gen:
+            pending.update(old)
+            return
+    await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
 
 
 ASK_TTL_SEC = 12 * 3600
@@ -895,12 +978,14 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _answer_quietly(query, _("Ответ не принят: кнопка не от этого вопроса."), show_alert=True)
         return
     picked = pending.pop(token, None)
+    if picked is not None:
+        # Соседние варианты гаснут вместе с выбранным, до первого await:
+        # иначе второй вариант, нажатый следом, проходил проверку и запускал
+        # второй ход (ревью Codex 29.10.2026).
+        _take_ask_cards(pending, lambda v: v.get("card") == picked.get("card"))
     if picked is not None and picked.get("at") is not None and time.time() - float(picked["at"]) > ASK_TTL_SEC:
         # Карточка пережила полдня (и сжатие сессии, эпоха при нём та же):
         # ответ на неё уже не о том (проект 22.10.2026, 1.5).
-        for t, v in list(pending.items()):
-            if v.get("card") == picked.get("card"):
-                pending.pop(t, None)
         picked = None
     # Сверка эпохи одна на всё нажатие: /reset во время await ниже не должен
     # дать снять проект, а потом отказать (ревью 25.10.2026).
@@ -921,7 +1006,7 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # теряла ответ. Ответ на нажатие один, поэтому причина в нём, а не
         # после пустого query.answer() (ревью 12.10.2026).
         await _answer_quietly(
-            query, _("Ответ не принят: вопрос устарел (старше 12 часов, повторён ниже, бот "
+            query, _("Ответ не принят: вопрос устарел (старше 12 часов, заменён новым, бот "
             "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."), show_alert=True,
         )
         try:
@@ -929,17 +1014,25 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         return
+    if not same_session:
+        await _ask_pick_finish(update, ctx, query, picked, same_session)
+        return
+    # Ответ встаёт в очередь чата до первого await: иначе вопрос другого рана,
+    # ушедший в это окно, получал кнопки, и его нажатие давало второй ход
+    # (ревью Codex 29.10.2026).
+    _ask_cards_changed(ctx, str(picked["chat_key"]))
+    with _ask_answer_queued(ctx, str(picked["chat_key"]), picked):
+        await _ask_pick_finish(update, ctx, query, picked, same_session)
+
+
+async def _ask_pick_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: Any, picked: dict,
+                           same_session: bool) -> None:
     try:
         await query.answer()
     except Exception:
         log.debug("callback answer failed (ignored)", exc_info=True)
     chat_key = picked["chat_key"]
     answer = picked["answer"]
-    # Гасим только соседние варианты ЭТОГО вопроса: у более свежего вопроса
-    # в том же чате свои токены, их трогать нельзя.
-    for t, v in list(pending.items()):
-        if v.get("card") == picked.get("card"):
-            pending.pop(t, None)
     card = query.message
     if not same_session:
         # Между вопросом и тапом был /reset, /resume или idle-сброс: отвечать
@@ -964,6 +1057,11 @@ async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     untrusted = bool(picked.get("untrusted"))
     if untrusted:
         prompt = _(UNTRUSTED_PROMPT_NOTE) + prompt
+    await _dispatch_ask_answer(update, ctx, card, prompt, picked, untrusted)
+
+
+async def _dispatch_ask_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, card: Any, prompt: str,
+                               picked: dict, untrusted: bool) -> None:
     # update у callback-апдейта не имеет .message — заворачиваем сообщение
     # карточки, у него реальный message_id и та же тема.
     await _dispatch_to_claude(
@@ -1194,13 +1292,14 @@ async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: st
         _deal_update(app, deal_id, lambda d: d.update(state="closed", error="fork", last_at=time.time()))
         log.info("deal refused id=%s why=fork", deal_id)
         if deal.get("answering"):
-            await _dispatch_to_claude(
-                update, ctx, _("[Ответ на вопрос «{question}»]: {answer}").format(
-                    question=deal.get("question", ""), answer=answer),
-                # Запреты дела остаются: без GPT и переноса в /at (ревью 26.10).
-                send_voice_reply=False, from_callback=True, allow_codex_fallback=False,
-                expect_epoch=deal.get("qepoch"),
-                ask_ref={"question": deal.get("question", ""), "answer": answer})
+            ask_ref = {"question": deal.get("question", ""), "answer": answer}
+            with _ask_answer_queued(ctx, _chat_key(update)[0], ask_ref):
+                await _dispatch_to_claude(
+                    update, ctx, _("[Ответ на вопрос «{question}»]: {answer}").format(
+                        question=deal.get("question", ""), answer=answer),
+                    # Запреты дела остаются: без GPT и переноса в /at (ревью 26.10).
+                    send_voice_reply=False, from_callback=True, allow_codex_fallback=False,
+                    expect_epoch=deal.get("qepoch"), ask_ref=ask_ref)
         else:
             with contextlib.suppress(Exception):
                 await update.message.reply_text(ref["head"] + "\n" + _(
@@ -4562,6 +4661,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset [force] — сбросить claude-сессию в этом чате (force = прибить активный claude и сбросить разом)\n"
         "/cancel — прервать текущий claude-процесс\n"
         "/status — что сейчас происходит\n"
+        "/keys [off] — кнопки «Новый диалог», «Стоп», «Статус» под полем ввода\n"
         "/login — восстановить вход Claude или Codex в личном чате\n"
         "/plan <задача> — сначала план с кнопками, выполнение после ✅\n"
         "/task <что сделать>: отдельная тема задачи в группе «Новостей», там обсуждение, итоговый план и выполнение после ✅\n"
@@ -4580,7 +4680,6 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
-    store: SessionStore = ctx.application.bot_data["sessions"]
     if not _is_allowed(cfg, update):
         return
     chat_key, _unused, _unused = _chat_key(update)
@@ -4588,6 +4687,21 @@ async def on_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # прибиваем его (SIGTERM→SIGKILL) и сбрасываем сессию одной командой, не
     # требуя ручного /cancel. Без аргумента — прежнее безопасное поведение.
     force = bool(ctx.args) and ctx.args[0].strip().lower() in ("force", "now", "!")
+    answer = await _reset_session(ctx, cfg, chat_key, force=force)
+    if answer is None:
+        await update.message.reply_text(
+            _("⚠️ Claude сейчас работает в этом чате/теме. Сначала /cancel, потом /reset "
+              "(или `/reset force` — прибить и сбросить разом).")
+        )
+        return
+    await update.message.reply_text(answer)
+
+
+async def _reset_session(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str, *,
+                         force: bool) -> str | None:
+    """Ядро /reset; его же зовут кнопки «Новый диалог» (/keys). Возвращает
+    текст подтверждения, None если в теме идёт ран, а force не задан."""
+    store: SessionStore = ctx.application.bot_data["sessions"]
     session_model = ctx.application.bot_data.get("model_by_session", {}).get(chat_key, "")
 
     lock = _chat_lock(ctx, chat_key)
@@ -4598,11 +4712,7 @@ async def on_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Иначе завершение run_claude перезапишет session_id обратно и reset
         # фактически откатится.
         if not force:
-            await update.message.reply_text(
-                _("⚠️ Claude сейчас работает в этом чате/теме. Сначала /cancel, потом /reset "
-                  "(или `/reset force` — прибить и сбросить разом).")
-            )
-            return
+            return None
         # force: убиваем активный процесс, чтобы освободить lock и гарантировать,
         # что run_claude вернётся по signal-пути (rc=-15) БЕЗ store.set, не
         # перезаписав session_id поверх нашего remove. Ждём завершения inline —
@@ -4627,12 +4737,111 @@ async def on_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             prev = store.remove(chat_key)
             _bump_session_epoch(ctx, chat_key)
     note = _(" · активный claude прибит") if killed else ""
+    return _("Сессия сброшена (была: {prev}){note}. "
+             "Следующее сообщение начнёт новый разговор.{revert}").format(
+        prev=prev[:8] if prev else '—', note=note,
+        revert=_model_reverted_note(ctx, cfg, chat_key, session_model))
+
+
+# Кнопки под полем ввода (/keys): метка и действие. Добавить или убрать
+# кнопку: строка здесь и ветка в on_key_button.
+KEY_BUTTONS = ((N_("🔄 Новый диалог"), "reset"), (N_("⛔ Стоп"), "cancel"), (N_("📊 Статус"), "status"))
+_KEYS_OFF_ARGS = ("off", "убрать", "выкл")
+
+
+def _key_labels() -> list[str]:
+    return [_(label) for label, _action in KEY_BUTTONS]
+
+
+async def on_keys(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обычная клавиатура Telegram: её хранит сам клиент, файл состояния не
+    нужен. is_persistent=False оставляет значок у поля ввода, им клавиатура
+    сворачивается и разворачивается (решение Ивана 29.10.2026)."""
+    cfg: Config = ctx.application.bot_data["cfg"]
+    if not _is_allowed(cfg, update):
+        return
+    if ctx.args and ctx.args[0].strip().lower() in _KEYS_OFF_ARGS:
+        await update.message.reply_text(_("Кнопки убраны. Вернуть: /keys"),
+                                        reply_markup=ReplyKeyboardRemove())
+        return
     await update.message.reply_text(
-        _("Сессия сброшена (была: {prev}){note}. "
-          "Следующее сообщение начнёт новый разговор.{revert}").format(
-            prev=prev[:8] if prev else '—', note=note,
-            revert=_model_reverted_note(ctx, cfg, chat_key, session_model))
-    )
+        _("Кнопки под полем ввода. Свернуть значком у поля, убрать: /keys off"),
+        reply_markup=ReplyKeyboardMarkup([_key_labels()], resize_keyboard=True,
+                                         is_persistent=False))
+
+
+async def on_key_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажатие кнопки /keys приходит текстом; обработчик стоит раньше on_text,
+    в Claude такой текст не уходит."""
+    cfg: Config = ctx.application.bot_data["cfg"]
+    if not _is_allowed(cfg, update):
+        return
+    text = (update.message.text or "").strip()
+    action = next((a for label, a in KEY_BUTTONS if _(label) == text), "")
+    if action == "cancel":
+        await on_cancel(update, ctx)
+        return
+    if action == "status":
+        await on_status(update, ctx)
+        return
+    if action != "reset":
+        return
+    chat_key, _unused, _unused = _chat_key(update)
+    answer = await _reset_session(ctx, cfg, chat_key, force=False)
+    if answer is not None:
+        await update.message.reply_text(answer)
+        return
+    # Одноразовый токен вопроса, при нём тема, эпоха и pid рана: второе нажатие,
+    # вопрос после рестарта (реестр в памяти) и вопрос про уже другой ран
+    # ничего не прибивают; тема не собирается заново из сообщения кнопки.
+    proc = ctx.application.bot_data["procs"].get(chat_key)
+    pid = proc.pid if proc is not None and proc.returncode is None else 0
+    token = uuid.uuid4().hex[:8]
+    ctx.application.bot_data.setdefault("keys_resets", {})[token] = (
+        chat_key, _session_epoch(ctx, chat_key), pid)
+    await update.message.reply_text(
+        _("Сейчас идёт ответ. Прервать и начать заново?"),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(_("⛔ Прервать и начать заново"), callback_data=f"keys:reset:{token}"),
+            InlineKeyboardButton(_("Нет"), callback_data=f"keys:keep:{token}"),
+        ]]))
+
+
+async def on_keys_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = ctx.application.bot_data["cfg"]
+    query = update.callback_query
+    if query is None:
+        return
+    user = update.effective_user
+    if user is None or user.id not in cfg.allowed_user_ids:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        log.debug("callback answer failed (ignored)", exc_info=True)
+    _prefix, action, token = ((query.data or "").split(":") + ["", ""])[:3]
+    # pop до первого await: из двух быстрых нажатий сработает одно.
+    entry = ctx.application.bot_data.get("keys_resets", {}).pop(token, None)
+    if entry is None:
+        text = _("Вопрос устарел: нажми «🔄 Новый диалог» ещё раз")
+    elif action == "keep":
+        text = _("Оставил как есть")
+    else:
+        chat_key, epoch, pid = entry
+        proc = ctx.application.bot_data["procs"].get(chat_key)
+        live = proc is not None and proc.returncode is None
+        if epoch != _session_epoch(ctx, chat_key):
+            text = _("Сессия уже сброшена")
+        elif _chat_lock(ctx, chat_key).locked() and not (live and proc.pid == pid):
+            # Тот ответ кончился (или ещё не стартовал процесс), идёт другой:
+            # его пользователь не видел в вопросе, прибивать не за что.
+            text = _("Тот ответ уже закончился, идёт следующий. Прервать его: «🔄 Новый диалог» ещё раз")
+        else:
+            text = await _reset_session(ctx, cfg, chat_key, force=True) or ""
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        log.debug("keys pick edit failed (ignored)", exc_info=True)
 
 
 async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6344,6 +6553,7 @@ async def _dispatch_to_claude_impl(
         await _send_ask_card(
             ctx, update, chat_key, ask,
             permission_mode=permission_mode, untrusted=untrusted, epoch=run_epoch,
+            own_queued=(ask_ref or {}).get("queued"),
         )
     elif permission_mode == "plan" and not result.is_error and reply.strip() and not ask_held:
         if _task_for(cfg, chat_id, thread_id, ctx) is not None:
@@ -7389,6 +7599,22 @@ async def on_voice_full_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     await send_text_to(cfg, query.message, text)
 
 
+def _is_card_of(msg, pending, expected_chat: int) -> bool:
+    """Сообщение и есть карточка pending: тот же чат и тема, а в клавиатуре
+    самого сообщения его кнопка. callback_data Telegram не сверяет с кнопками
+    сообщения, а клавиатуру сообщения подставить нельзя (ревью Codex 29.10).
+    Карточке отправки от имени Ивана номер не подбирается никогда."""
+    if _is_outbound_send(pending.tool_name) or MAILSEND_CARD_KEY in pending.tool_input:
+        return False
+    # Тема как в _chat_key: у General message_thread_id бывает, но это не тема.
+    thread = getattr(msg, "message_thread_id", None) if getattr(msg, "is_topic_message", False) else None
+    if msg.chat_id != expected_chat or (thread or None) != pending.target_thread_id:
+        return False
+    markup = getattr(msg, "reply_markup", None)
+    datas = {b.callback_data for row in (getattr(markup, "inline_keyboard", None) or ()) for b in row}
+    return f"apprfull:{pending.approval_id}" in datas
+
+
 async def on_approval_full(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Кнопка «📄 Полностью»: полный вход инструмента файлом, пока карточка
     ещё ждёт решения. Карточка режет длинную команду, а решать по обрезку
@@ -7417,6 +7643,10 @@ async def on_approval_full(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     # бы содержимое чужой карточки в другой чат или тему.
     msg = query.message
     expected_chat = pending.target_chat_id if pending.target_chat_id is not None else cfg.primary_chat_id
+    if pending.telegram_message_id is None and _is_card_of(msg, pending, expected_chat):
+        # Отправка карточки кончилась таймаутом ответа, номер не узнали:
+        # первое нажатие с неё называет её номер.
+        pending.telegram_message_id = msg.message_id
     if msg.message_id != pending.telegram_message_id or msg.chat_id != expected_chat:
         log.warning("full view: aid=%s запрошен не с его карточки", aid)
         return
@@ -7745,6 +7975,7 @@ async def _on_post_init(app: Application) -> None:
             BotCommand("login", _("восстановить вход Claude или Codex")),
             BotCommand("cancel", _("прервать текущий claude-процесс")),
             BotCommand("reset", _("сбросить сессию (force = прибить и сбросить)")),
+            BotCommand("keys", _("кнопки под полем ввода (off = убрать)")),
             BotCommand("plan", _("сначала план с кнопками, выполнение после ✅")),
             BotCommand("task", _("завести тему задачи: /task что сделать")),
             BotCommand("auto", _("окно auto-approve: 15m|1h|off")),
@@ -8346,6 +8577,10 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CommandHandler("plan", on_plan, filters=own_command))
     app.add_handler(CommandHandler("task", on_task, filters=own_command))
     app.add_handler(CommandHandler("usage", on_usage, filters=own_command))
+    app.add_handler(CommandHandler("keys", on_keys, filters=own_command))
+    # Нажатие кнопки /keys: раньше on_text и вложений, в Claude не уходит.
+    # Пересланный такой же текст остаётся данными (own_command без FORWARDED).
+    app.add_handler(MessageHandler(filters.Text(_key_labels()) & own_command, on_key_button))
     # Служебные forum-события: кэшируем имя темы для авто-скоупинга проектов.
     app.add_handler(MessageHandler(
         filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
@@ -8366,6 +8601,7 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_plan_pick, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_model_pick, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(on_model_pin, pattern=r"^modelpin:"))
+    app.add_handler(CallbackQueryHandler(on_keys_pick, pattern=r"^keys:"))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     # Любые остальные вложения-файлы (pdf/docx/zip/video/audio/video_note/animation) → on_file.

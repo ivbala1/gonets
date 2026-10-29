@@ -440,12 +440,15 @@ class UntrustedSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.store.remove("1")
             botmod._bump_session_epoch(self.ctx, "1")
 
+        # С 29.10.2026 такой вопрос уходит без кнопок: нажимать нечего.
+        upd = self._update()
+        upd.message.reply_text = AsyncMock()
+        self.answer = "Что делать?<<ASK:Понижать базу?|Да, удалить|Оставить>>"
         with patch.object(botmod, "send_reply_text", AsyncMock(side_effect=reset_during_send)):
-            card, token = await self._ask_card()
-        before = len(self.runs)
-        query = await self._tap(card, token)
-        self.assertEqual(len(self.runs), before)
-        self.assertIn("Понижать базу?", query.edit_message_text.await_args.args[0])
+            await botmod._dispatch_to_claude(upd, self.ctx, "утренний план", send_voice_reply=False)
+        self.assertEqual(self.bot_data.get("ask_options", {}), {})
+        self.assertNotIn("reply_markup", upd.message.reply_text.await_args.kwargs)
+        self.assertIn(botmod._("без кнопок: сессия темы сменилась"), upd.message.reply_text.await_args.args[0])
 
     async def test_ask_pick_from_disallowed_chat_ignored(self) -> None:
         card, token = await self._ask_card()

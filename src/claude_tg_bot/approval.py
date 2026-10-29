@@ -20,6 +20,7 @@ import difflib
 import glob
 import hmac
 import html
+import httpx
 import ipaddress
 import json
 import logging
@@ -34,6 +35,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut
 from telegram.ext import Application
 
 from . import audit, danger, events, mailsend, otklik
@@ -57,8 +59,9 @@ AUDIT_LOG_NAME = "audit.jsonl"
 # С 28.10.2026 (решение Ивана «Пусть окно пускает») окно пускает и команды,
 # которые читают или пишут секрет: кнопки ⏩ на такой карточке были, а
 # следующая команда с токеном снова шла карточкой. В audit для них
-# decision="allow:burst:secret". Отправка наружу, фоновые раны и force_card
-# окно по-прежнему не берёт.
+# decision="allow:burst:secret". Отправка наружу и фоновые раны окно
+# по-прежнему не берёт. С 29.10.2026 (решение Ивана «⏩ и дубли») окно берёт и
+# обдумывание задачи: там без него каждая проверка шла карточкой.
 # Set оставлен пустым, чтобы при необходимости снова что-то исключить точечно.
 _BURST_DENY_TOOLS: frozenset[str] = frozenset()
 
@@ -323,8 +326,6 @@ class Pending:
     # Рабочий каталог агента из входа хука: относительный путь в команде
     # оценивается от него (ревью 11.10.2026).
     cwd: str | None = None
-    # Карточка обдумывания темы задачи: без кнопок ⏩ (окно там не действует).
-    no_burst: bool = False
 
 
 class ApprovalRegistry:
@@ -2247,6 +2248,20 @@ def _otklik_match(cfg: Config, pending: Pending, chat_id: int,
     return None
 
 
+def _calls_bot_skill(command: str) -> bool:
+    """Команда упоминает скилл бота после снятия кавычек оболочкой
+    (`ski""lls` иначе прошёл бы, ревью Codex 29.10). Неразборчивое считается
+    упоминанием."""
+    try:
+        words = shlex.split(command, comments=False)
+    except ValueError:
+        return True
+    return any("claude_tg_bot.skills" in w or "claude_tg_bot/skills" in w for w in words)
+
+
+CARD_SEND_TIMEOUT = 30
+
+
 async def send_approval_request(
     application: Application, cfg: Config, pending: Pending
 ) -> None:
@@ -2282,7 +2297,7 @@ async def send_approval_request(
     # окно auto-approve по решению Ивана покрывает любые действия.
     # Отправке от имени Ивана окно не положено: каждая идёт своей карточкой.
     if (pending.tool_name not in _BURST_DENY_TOOLS and not _is_outbound_send(pending.tool_name)
-            and MAILSEND_CARD_KEY not in pending.tool_input and not pending.no_burst):
+            and MAILSEND_CARD_KEY not in pending.tool_input):
         rows.append([
             InlineKeyboardButton("⏩ 15m", callback_data=f"appr:{pending.approval_id}:auto15"),
             InlineKeyboardButton("⏩ 1h", callback_data=f"appr:{pending.approval_id}:auto60"),
@@ -2298,6 +2313,9 @@ async def send_approval_request(
         reply_markup=kb,
         parse_mode="HTML",
         message_thread_id=thread_id,
+        # Умолчание PTB 5 с: карточка доходила, а бот считал отправку неудачной.
+        read_timeout=CARD_SEND_TIMEOUT,
+        write_timeout=CARD_SEND_TIMEOUT,
     )
     pending.telegram_message_id = msg.message_id
 
@@ -2499,7 +2517,8 @@ async def handle_approve(request: web.Request) -> web.Response:
     plan_stage = permission_mode == "plan" or (bool(session_id) and session_id in plan_sids)
     # Обдумывание темы задачи с Иваном у карточек (переделка 18.10.2026): то
     # же чтение, плюс /2mind; прочее, кроме записи файлов и отправки наружу,
-    # идёт карточкой мимо всех автоаппрувов ниже (force_card), а не отказом.
+    # идёт карточкой мимо всех автоаппрувов ниже (force_card), а не отказом;
+    # открытое Иваном окно ⏩ её пускает (решение Ивана 29.10.2026).
     # В сессии бывает чужой текст: whitelist путей, вызов скиллов, окно ⏩ и
     # regex Bash его обходили бы (ревью Codex 18.10).
     think_sids: set[str] = application.bot_data.get("task_think_sids") or set()
@@ -2625,7 +2644,10 @@ async def handle_approve(request: web.Request) -> web.Response:
 
     burst_eligible = (
         target is not None and not is_unattended and tool_name not in _BURST_DENY_TOOLS
-        and not outbound and not force_card
+        and not outbound
+        # Скиллы бота (task_new заводит тему и запускает ран) до «Делай» только
+        # карточкой: окно обдумывания для проверок, не для действий бота.
+        and not (force_card and _calls_bot_skill(str(tool_input.get("command", ""))))
     )
     if burst_eligible and time.time() < burst_until:
         aid = uuid.uuid4().hex[:12]
@@ -2809,18 +2831,38 @@ async def handle_approve(request: web.Request) -> web.Response:
         cwd=cwd,
         origin_key=origin_key,
     )
-    # Окно ⏩ обдумывание задачи не берёт (force_card): кнопки только сбивали бы.
-    pending.no_burst = force_card
     log.info("approve request aid=%s tool=%s sid=%s", pending.approval_id, tool_name, (session_id or "?")[:8])
     # 2-3 попытки: секундный лаг Telegram/502 не должен молча превращаться в
     # deny — Claude обойдёт «отклонённый» шаг, а пользователь этого не увидит.
     # Fail-closed сохраняется: deny только после исчерпания попыток.
+    # Таймаут чтения значит, что запрос ушёл, а ответ Telegram не дождались:
+    # карточка обычно дошла. Повтор давал дубль, три таймаута подряд давали
+    # отказ по карточке, которую Иван видит (лог 22-29.10.2026: все TimedOut
+    # такие). Поэтому ждём нажатия, как после удачной отправки. Карточке
+    # отправки от имени Ивана нужен номер её сообщения (нажатие сверяется с
+    # ним), ей прежний повтор.
+    needs_message_id = _is_outbound_send(tool_name) or MAILSEND_CARD_KEY in card_input
+    send_started = time.monotonic()
     send_ok = False
     for attempt in range(3):
         try:
             await send_approval_request(application, cfg, pending)
             send_ok = True
             break
+        except TimedOut as e:
+            # PTB зовёт TimedOut и таймауты соединения и пула, где запрос не
+            # ушёл: им повтор (ревью Codex 29.10).
+            if not needs_message_id and isinstance(e.__cause__, httpx.ReadTimeout):
+                log.warning("approval card send timed out, waiting for a press anyway aid=%s",
+                            pending.approval_id)
+                send_ok = True
+                break
+            log.exception(
+                "failed to send approval request (attempt %d/3) aid=%s",
+                attempt + 1, pending.approval_id,
+            )
+            if attempt < 2:
+                await asyncio.sleep(3.0)
         except Exception:
             log.exception(
                 "failed to send approval request (attempt %d/3) aid=%s",
@@ -2842,7 +2884,10 @@ async def handle_approve(request: web.Request) -> web.Response:
         return web.json_response({"decision": "deny", "reason": "telegram send failed"})
 
     try:
-        decision = await asyncio.wait_for(pending.future, timeout=cfg.approve_timeout_sec)
+        # Срок общий с отправкой: хук ждёт весь запрос approve_timeout_sec + 30
+        # (hook_approve), а отправка с повторами занимает до полутора минут.
+        left = cfg.approve_timeout_sec - (time.monotonic() - send_started)
+        decision = await asyncio.wait_for(pending.future, timeout=max(left, 1.0))
     except asyncio.TimeoutError:
         registry.expire(pending.approval_id)
         await asyncio.to_thread(
@@ -2853,20 +2898,20 @@ async def handle_approve(request: web.Request) -> web.Response:
             tool_input=tool_input,
             decision="deny:timeout",
         )
-        if pending.telegram_message_id is not None:
-            try:
+        try:
+            if pending.telegram_message_id is not None:
                 await application.bot.edit_message_reply_markup(
                     chat_id=target_chat_id,
                     message_id=pending.telegram_message_id,
                     reply_markup=None,
                 )
-                await application.bot.send_message(
-                    chat_id=target_chat_id,
-                    text=f"⌛ timeout approval aid={pending.approval_id} — deny",
-                    message_thread_id=target_thread_id,
-                )
-            except Exception:
-                log.exception("failed to mark timeout message")
+            await application.bot.send_message(
+                chat_id=target_chat_id,
+                text=f"⌛ timeout approval aid={pending.approval_id} — deny",
+                message_thread_id=target_thread_id,
+            )
+        except Exception:
+            log.exception("failed to mark timeout message")
         return web.json_response({"decision": "deny", "reason": "user timeout"})
 
     # ✅ на карточке письма: билет на ровно это письмо (хеш снимка), его

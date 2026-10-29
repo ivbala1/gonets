@@ -191,5 +191,116 @@ class OutboundCallbackTests(unittest.TestCase):
     def test_press_from_other_message_ignored(self) -> None:
         self.assertIsNone(self._press("allow", message_id=11))
 
+class CardTimeoutTests(unittest.TestCase):
+    """Таймаут ответа Telegram: карточка обычно дошла, повтор давал дубль
+    (случай 29.10.2026)."""
+
+    @staticmethod
+    def _timed_out(cause: Exception) -> Exception:
+        from telegram.error import TimedOut
+        err = TimedOut()
+        err.__cause__ = cause
+        return err
+
+    def _decide(self, tool_name: str, tool_input: dict, *, cause: Exception | None = None,
+                press: str | None = None) -> tuple[dict, AsyncMock]:
+        import httpx
+        cfg = SimpleNamespace(
+            approve_shared_secret="", primary_chat_id=1, state_dir=Path(tempfile.gettempdir()),
+            approve_auto_chat_keys=frozenset(), approve_whitelist_paths=(),
+            mcp_auto_allow_re=None, bash_auto_allow_re=None, approve_timeout_sec=5 if press else 0.01,
+        )
+        bot_data = {"unattended_sids": set(), "untrusted_sids": set(), "burst_until_by_target": {}}
+        request = SimpleNamespace(
+            app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
+                 "registry": approval.ApprovalRegistry(),
+                 "session_targets": {"sid": (1, None)}},
+            headers={}, remote="127.0.0.1",
+            json=AsyncMock(return_value={
+                "tool_name": tool_name, "tool_input": tool_input,
+                "session_id": "sid", "permission_mode": "default",
+            }),
+        )
+        registry = request.app["registry"]
+        err = self._timed_out(cause or httpx.ReadTimeout("read"))
+
+        async def send(_app, _cfg, pending):
+            if press:
+                # Иван жмёт кнопку на карточке, номер которой бот не узнал.
+                asyncio.get_running_loop().call_later(
+                    0.01, registry.resolve, pending.approval_id, press)
+            raise err
+
+        card = AsyncMock(side_effect=send)
+        with patch.object(approval, "send_approval_request", card), \
+                patch.object(approval.asyncio, "sleep", AsyncMock()), \
+                patch.object(approval.audit, "write_event"):
+            resp = asyncio.run(approval.handle_approve(request))
+        return json.loads(resp.text), card
+
+    def test_timed_out_card_is_not_resent_and_waits_for_press(self) -> None:
+        out, card = self._decide("Bash", {"command": "ssh immich docker ps"})
+        self.assertEqual(card.await_count, 1)
+        self.assertEqual(out["reason"], "user timeout")
+
+    def test_outbound_card_still_retried(self) -> None:
+        out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})
+        self.assertEqual(card.await_count, 3)
+        self.assertEqual(out["reason"], "telegram send failed")
+
+    def test_press_on_card_without_number_decides(self) -> None:
+        out, card = self._decide("Bash", {"command": "ssh immich docker ps"}, press="allow")
+        self.assertEqual(card.await_count, 1)
+        self.assertEqual(out["decision"], "allow")
+
+    def test_connect_timeout_is_retried(self) -> None:
+        # запрос не ушёл: прежний повтор и отказ
+        import httpx
+        out, card = self._decide("Bash", {"command": "ssh immich docker ps"},
+                                 cause=httpx.ConnectTimeout("connect"))
+        self.assertEqual(card.await_count, 3)
+        self.assertEqual(out["reason"], "telegram send failed")
+
+
+class CardBindTests(unittest.TestCase):
+    """Номер карточки без номера берётся только с её собственного сообщения."""
+
+    def _msg(self, *, thread=7, datas=("apprfull:a1",), chat=1):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("x", callback_data=d) for d in datas]])
+        return SimpleNamespace(chat_id=chat, message_thread_id=thread, reply_markup=kb, message_id=5,
+                               is_topic_message=thread is not None)
+
+    def _pending(self, tool="Bash"):
+        return SimpleNamespace(approval_id="a1", tool_name=tool, tool_input={"command": "ls"},
+                               target_thread_id=7)
+
+    def test_own_card_binds(self) -> None:
+        self.assertTrue(bot._is_card_of(self._msg(), self._pending(), 1))
+
+    def test_other_message_does_not_bind(self) -> None:
+        self.assertFalse(bot._is_card_of(self._msg(thread=8), self._pending(), 1))
+        self.assertFalse(bot._is_card_of(self._msg(datas=("apprfull:b2",)), self._pending(), 1))
+        self.assertFalse(bot._is_card_of(self._msg(chat=2), self._pending(), 1))
+
+    def test_general_card_binds(self) -> None:
+        # General: номер темы у сообщения есть, но это не тема
+        msg = self._msg(thread=1)
+        msg.is_topic_message = False
+        pending = self._pending()
+        pending.target_thread_id = None
+        self.assertTrue(bot._is_card_of(msg, pending, 1))
+
+    def test_outbound_card_never_binds(self) -> None:
+        self.assertFalse(bot._is_card_of(self._msg(), self._pending("mcp__telegram__send_message"), 1))
+
+    def test_quoted_skill_name_is_seen(self) -> None:
+        for cmd in ("python -m claude_tg_bot.ski\"\"lls.task_new x", "python -m 'claude_tg_bot.skills.task_new'",
+                    "echo 'unclosed"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(approval._calls_bot_skill(cmd))
+        self.assertFalse(approval._calls_bot_skill("ssh immich docker ps"))
+
+
 if __name__ == "__main__":
     unittest.main()

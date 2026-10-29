@@ -152,7 +152,7 @@ class TaskThinkTests(_HookBase):
 
     def test_unlisted_goes_to_card_past_every_auto_allow(self) -> None:
         skill = f"{approval._SKILL_PYTHON} -m claude_tg_bot.skills.task_new 'обнови Immich'"
-        for kw in ({}, {"burst": True}, {"auto_chat": True}):
+        for kw in ({}, {"auto_chat": True}):
             for cmd in ("ssh immich docker ps", "rm -rf ~/src/x", skill):
                 with self.subTest(cmd=cmd, **kw):
                     out, card = self._decide("Bash", {"command": cmd}, think=True, **kw)
@@ -160,7 +160,7 @@ class TaskThinkTests(_HookBase):
                     self.assertEqual(out["decision"], "deny")  # карточка не ушла (OSError)
 
     def test_mcp_write_goes_to_card(self) -> None:
-        out, card = self._decide("mcp__x__create_issue", {"title": "t"}, think=True, burst=True)
+        out, card = self._decide("mcp__x__create_issue", {"title": "t"}, think=True)
         card.assert_called()
 
     def test_reads_and_two_mind_pass_without_card(self) -> None:
@@ -197,12 +197,17 @@ class TaskThinkTests(_HookBase):
         out, card = self._decide("mcp__x__listing_purge", {"id": 1}, think=True)
         card.assert_called()
 
-    def test_card_has_no_window_buttons(self) -> None:
+    def test_open_window_passes_check(self) -> None:
+        # окно ⏩ берёт и обдумывание (решение Ивана 29.10.2026)
         out, card = self._decide("Bash", {"command": "ssh immich docker ps"}, think=True)
-        self.assertTrue(card.call_args.args[2].no_burst)
-        # обычная карточка (запись вне белого списка) кнопки ⏩ сохраняет
-        out, card = self._decide("Write", {"file_path": "/etc/x", "content": "x"}, mode="bypassPermissions")
-        self.assertFalse(card.call_args.args[2].no_burst)
+        card.assert_called()
+        out, card = self._decide("Bash", {"command": "ssh immich docker ps"}, think=True, burst=True)
+        self.assertEqual(out["decision"], "allow")
+        card.assert_not_called()
+        # скилл бота (task_new заводит тему) окно не пускает
+        skill = f"{approval._SKILL_PYTHON} -m claude_tg_bot.skills.task_new 'обнови Immich'"
+        out, card = self._decide("Bash", {"command": skill}, think=True, burst=True)
+        card.assert_called()
 
     def test_background_run_stays_strict(self) -> None:
         out, card = self._decide("Bash", {"command": "ssh immich docker ps"}, think=True, unattended=True)
@@ -286,10 +291,9 @@ class ThinkReadListTests(_HookBase):
                 out, card = self._decide("Bash", {"command": cmd})
                 self.assertEqual(out["decision"], "deny")
                 card.assert_not_called()
-                # обдумывание задачи: карточка мимо окна ⏩ и автоаппрува чата
-                out, card = self._decide("Bash", {"command": cmd}, think=True, burst=True, auto_chat=True)
+                # обдумывание задачи: карточка мимо автоаппрува чата
+                out, card = self._decide("Bash", {"command": cmd}, think=True, auto_chat=True)
                 card.assert_called()
-                self.assertTrue(card.call_args.args[2].no_burst)
 
 
 class BurstSecretTests(_HookBase):

@@ -205,7 +205,7 @@ class AskCardTests(_Base):
     """1.5: один вопрос, одна живая карточка; срок кнопок 12 часов."""
 
     async def test_repeat_question_retires_old_card(self) -> None:
-        self.ctx.bot.edit_message_reply_markup = AsyncMock()
+        self.ctx.bot.edit_message_text = AsyncMock()
         msg = _msg()
         msg.reply_text = AsyncMock(side_effect=[SimpleNamespace(chat_id=GROUP, message_id=101),
                                                 SimpleNamespace(chat_id=GROUP, message_id=102)])
@@ -215,7 +215,9 @@ class AskCardTests(_Base):
                                         permission_mode="bypassPermissions", epoch=0)
         pending = self.bot_data["ask_options"]
         self.assertEqual({v["msg"][1] for v in pending.values()}, {102})
-        self.ctx.bot.edit_message_reply_markup.assert_awaited_once()
+        # Старая карточка правится на месте, без отдельного сообщения (29.10.2026).
+        self.ctx.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(self.ctx.bot.edit_message_text.await_args.kwargs["message_id"], 101)
 
     async def test_old_card_expires(self) -> None:
         pending = self.bot_data.setdefault("ask_options", {})
@@ -226,7 +228,7 @@ class AskCardTests(_Base):
         upd = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
                               effective_chat=SimpleNamespace(id=GROUP, type="supergroup"))
         await botmod.on_ask_pick(upd, self.ctx)
-        self.assertEqual(_("Ответ не принят: вопрос устарел (старше 12 часов, повторён ниже, бот "
+        self.assertEqual(_("Ответ не принят: вопрос устарел (старше 12 часов, заменён новым, бот "
                            "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."),
                          query.answer.await_args.args[0])
         self.assertEqual(self.runs, [])
