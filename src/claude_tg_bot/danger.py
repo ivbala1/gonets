@@ -24,6 +24,18 @@ RED = "red"
 ORANGE = "orange"
 YELLOW = "yellow"
 
+# Метки смысла для правил, а не для человека: текст причины переводится и
+# меняется, метка нет. По ним разрешение на план оставляет карточку
+# (проект шага 2, ревью Codex 29.10.2026).
+DELETE = "delete"          # удаляет данные: файлы, тома, базы, ресурсы
+HISTORY = "history"        # переписывает историю git или выбрасывает правки
+PUBLISH = "publish"        # отправляет наружу: push, запрос с данными, пакет, GitHub
+POWER = "power"            # перезагружает или выключает машину
+DISK = "disk"              # пишет на диск напрямую: mkfs, dd
+GUARD = "guard"            # меняет ключи, настройки, память или код бота
+FETCH_EXEC = "fetch-exec"  # скачивает и сразу запускает код
+UNPARSED = "unparsed"      # разбор сдался: что исполнится, неизвестно
+
 _SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")", ";;", "|&"})
 _REDIRECTS = frozenset({">", ">>", "&>", "&>>", ">|", "<>"})
 _FD_DUPS = frozenset({">&", "<&", "<", "<<", "<<<"})
@@ -46,8 +58,18 @@ class Verdict:
     # Действие может прочитать или записать секрет. Не цвет, а признак: по нему
     # автоаппрув чата и выполнение задачи шлют карточку (находка Codex 15.10).
     secret: bool = False
+    # Каждая программа звена с аргументами, как её увидел разбор, обёртки тоже,
+    # и присваивания перед командой как ("=", [присваивание]): по этому списку
+    # approval пускает без карточки только знакомое чтение.
+    programs: list[tuple[str, list[str]]] = field(default_factory=list)
+    tags: set[str] = field(default_factory=set)
+    # Куда команда копирует данные: хост rsync и scp, бакет s3. Отправка на
+    # названное в одобренном плане идёт без карточки (approval._plan_card_tags).
+    remotes: set[str] = field(default_factory=set)
 
-    def add(self, level: str, reason: str) -> None:
+    def add(self, level: str, reason: str, tag: str = "") -> None:
+        if tag:
+            self.tags.add(tag)
         bucket = self.red if level == RED else self.orange
         if reason not in bucket:
             bucket.append(reason)
@@ -67,7 +89,8 @@ def classify(tool_name: str, tool_input: dict, cwd: str | None = None) -> Verdic
     try:
         if tool_name == "Bash":
             _classify_bash(str(tool_input.get("command", "")), v, depth=0)
-            v.secret = v.secret or _mentions_secret(str(tool_input.get("command", "")))
+            v.secret = v.secret or (_mentions_secret(str(tool_input.get("command", "")))
+                                    and not _metadata_only(v, str(tool_input.get("command", ""))))
         elif tool_name == "Monitor":
             # Monitor запускает shell-команду в фоне, как Bash (ревью 11.10.2026).
             command = tool_input.get("command")
@@ -75,7 +98,7 @@ def classify(tool_name: str, tool_input: dict, cwd: str | None = None) -> Verdic
                 _classify_bash(command, v, depth=0)
                 v.secret = v.secret or _mentions_secret(command)
             else:
-                v.add(ORANGE, _("инструмент Monitor без команды, не разобран"))
+                v.add(ORANGE, _("инструмент Monitor без команды, не разобран"), UNPARSED)
         elif tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             _classify_path(str(tool_input.get("file_path") or tool_input.get("notebook_path") or ""), v)
         elif tool_name.startswith("mcp__"):
@@ -207,7 +230,7 @@ def _strip_heredocs(command: str, v: Verdict, depth: int) -> str:
                 i = j
                 continue
             if parsed is None:
-                v.add(ORANGE, _("heredoc не разобран"))
+                v.add(ORANGE, _("heredoc не разобран"), UNPARSED)
                 out.append(command[i:j])
                 word_start = True
                 i = j
@@ -342,25 +365,31 @@ def _segments(tokens: list[str], v: Verdict) -> Iterator[list[str]]:
 
 def _classify_bash(command: str, v: Verdict, depth: int) -> None:
     if depth > 2:
-        v.add(ORANGE, _("вложенная команда не разобрана"))
+        v.add(ORANGE, _("вложенная команда не разобрана"), UNPARSED)
         return
     text = _strip_heredocs(command, v, depth)
     if "`" in _quote_mask(text) or "`" in text:
         v.add(ORANGE, _("есть команда в обратных кавычках"))
+        if re.search(r"\b(?:curl|wget)\b", text):
+            # Подстановка исчезнет ниже, а её вывод уйдёт запросом (ревью Codex 29.10).
+            v.add(RED, _("отправляет данные в сеть"), PUBLISH)
         text = text.replace("`", " ; ")
     if "$(" in text or "<(" in text or ">(" in text:
         v.add(ORANGE, _("есть вложенная команда $(…), <(…) или >(…)"))
     text = _pipe_to_interpreter(text, v)
     # Шаблон скрытых имён вне кавычек может подставить .env. Внутри
     # программы jq или awk это обычный текст (ревью 11.10.2026).
-    masked_tokens = _tokenize(_quote_mask(text)) or []
+    masked = _quote_mask(text)
+    masked_tokens = _tokenize(masked) or []
     if any(part.startswith(".") and glob.has_magic(part)
            for word in masked_tokens for part in word.split("/")):
         v.secret = True
         v.add(ORANGE, _("шаблон может подставить скрытые секретные файлы"))
+    if _expansion_hides_flag(text, masked, masked_tokens):
+        v.add(ORANGE, _("оболочка раскроет слово во флаг или команду, не разобрано"), UNPARSED)
     tokens = _tokenize(_newlines_to_separators(text))
     if tokens is None:
-        v.add(ORANGE, _("команда не разобрана: незакрытая кавычка"))
+        v.add(ORANGE, _("команда не разобрана: незакрытая кавычка"), UNPARSED)
         return
     token = _CWD.set(_CWD.get())
     try:
@@ -372,18 +401,183 @@ def _classify_bash(command: str, v: Verdict, depth: int) -> None:
         _CWD.reset(token)
 
 
+_BRACE_RE = re.compile(r"\{([^{}]*)\}")
+_IFS_RE = re.compile(r"\$\{?IFS\b")
+
+
+def _expansion_hides_flag(text: str, masked: str, masked_tokens: list[str]) -> bool:
+    """Слово, которое bash раскроет уже после разбора во флаг или в несколько
+    слов: `{rm,-rf,x}`, `find . {-delete,}`, `rm${IFS}-rf`, `$'-delete'`
+    (аудит guard 31.10.2026, проверено bash 5.2). Обычные `f{,.bak}` и
+    `src/{a,b}` не трогает."""
+    if _IFS_RE.search(masked):
+        return True
+    for word in masked_tokens:
+        for m in _BRACE_RE.finditer(word):
+            body = m.group(1)
+            if "," in body or ".." in body:
+                alts = body.split(",") if "," in body else [body]
+                if any((word[:m.start()] + alt).startswith("-") for alt in alts):
+                    return True
+    i = masked.find("$'")
+    while i >= 0:
+        j = masked.find("'", i + 2)
+        if (i == 0 or masked[i - 1] != "\\") and j > 0:
+            try:
+                value = bytes(text[i + 2:j], "utf-8").decode("unicode_escape")
+            except (UnicodeDecodeError, ValueError):
+                return True
+            if value.startswith("-"):
+                return True
+        i = masked.find("$'", i + 2)
+    return False
+
+
 # Скачанное идёт интерпретатору как программа: `| sh`, `| bash -s`, `| python3`
 # или `| python3 -`. `| python3 -c '…'` и `| sh -c '…'` лишь читают ввод.
 _PIPE_EXEC_RE = re.compile(
-    r"\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+(?:-\S+\s+)*)?"
-    r"(?:(?:ba|z|da)?sh|python3?|perl|ruby|node)(?:\s+-s\b|\s+-(?=\s|$))?\s*(?:$|[;&|)\n])"
+    r"\b(?:curl|wget)\b[^|;&\n]*\|\s*(?:tee\b[^|;&\n]*\|\s*)*"
+    # Обёртки перед интерпретатором: `| env bash`, `| timeout 30 sh` (ревью Codex 29.10).
+    r"(?:(?:sudo|doas|env|nice|nohup|command|exec|stdbuf|ionice|time|timeout(?:\s+\S+)?)\s+"
+    r"(?:(?:-\S+|\w+=\S*)\s+)*)*"
+    r"(?:\S*/)?(?:(?:ba|z|da)?sh|python3?|perl|ruby|node)(?:\s+-s\b|\s+-(?=\s|$))?\s*(?:$|[;&|)\n])"
 )
 
 
+# Скачанное идёт оболочке подстановкой: `eval "$(curl …)"`, `source <(curl …)`,
+# `bash -c "$(curl …)"` (ревью 29.10.2026).
+_SUBST_EXEC_RE = re.compile(
+    r"(?:\b(?:source|eval)|(?:^|[;&|(\s])\.|\b(?:(?:ba|z|da)?sh|python3?|perl|ruby|node)(?:\s+-\w+)*)"
+    r"\s+[\"']?(?:<|\$)\(\s*(?:\S*/)?(?:curl|wget)\b"
+)
+_FETCH_PIPE_RE = re.compile(r"\b(?:curl|wget)\b[^|;&\n]*\|(?:\s*tee\b[^|;&\n]*\|)*")
+_FETCH_WRAPPERS = frozenset({"sudo", "doas", "env", "nice", "nohup", "command", "exec", "stdbuf",
+                             "ionice", "time", "timeout", "strace", "ltrace"})
+_INTERPRETER_RE = re.compile(r"(?:ba|z|da)?sh|python3?(?:\.\d+)?|perl|ruby|node")
+
+
+def _pipe_feeds_interpreter(masked: str) -> bool:
+    """`… | bash -s -- флаги`, `| bash -x`, `| bash /dev/stdin`, `| python3 -`:
+    интерпретатор читает программу со входа (аудит guard 31.10.2026).
+    Код строкой (`-c`, `-e`, `-m`) или файл скрипта читают вход как данные."""
+    for m in _FETCH_PIPE_RE.finditer(masked):
+        words = re.split(r"[;&|)\n]", masked[m.end():], maxsplit=1)[0].split()
+        i = 0
+        while i < len(words) and (os.path.basename(words[i]) in _FETCH_WRAPPERS
+                                  or words[i].startswith("-") or _ASSIGN_RE.match(words[i])
+                                  or (i and words[i - 1] == "timeout")):
+            i += 1
+        if i >= len(words) or not _INTERPRETER_RE.fullmatch(os.path.basename(words[i])):
+            continue
+        shell = os.path.basename(words[i]).endswith("sh")
+        code_flags = "c" if shell else "cme" if "python" in words[i] else "eEp"
+        program_from_input = True
+        for a in words[i + 1:]:
+            if a in ("-", "--", "/dev/stdin") or (shell and a.startswith("-") and not a.startswith("--")
+                                                  and "s" in a):
+                break
+            if a.startswith("-") and not a.startswith("--") and set(a[1:]) & set(code_flags):
+                program_from_input = False
+                break
+            if not a.startswith("-"):
+                program_from_input = False
+                break
+        if program_from_input:
+            return True
+    return False
+
+
 def _pipe_to_interpreter(text: str, v: Verdict) -> str:
-    if _PIPE_EXEC_RE.search(_quote_mask(text)):
-        v.add(RED, _("скачивает и сразу запускает код"))
+    masked = _quote_mask(text)
+    if _PIPE_EXEC_RE.search(masked) or _SUBST_EXEC_RE.search(text) or _pipe_feeds_interpreter(masked):
+        v.add(RED, _("скачивает и сразу запускает код"), FETCH_EXEC)
     return text
+
+
+# Программы, у которых первое слово решает, что делать: оно из переменной
+# не разобрано (`git $a`); у echo и awk это просто данные.
+_SUBCOMMAND_PROGS = frozenset({
+    "git", "docker", "podman", "docker-compose", "kubectl", "helm", "systemctl", "service",
+    "terraform", "aws", "gcloud", "az", "doctl", "gh", "npm", "pnpm", "yarn", "apt", "apt-get",
+    "rclone", "loginctl", "zfs", "zpool", "ansible", "redis-cli",
+})
+
+
+def _tagged_program(prog: str, args: list[str]) -> str:
+    """Метка программы, которую разбор иначе считает незнакомой или
+    безобидной: почта и сырые сетевые каналы, диски, rclone, loginctl
+    (ревью 29.10.2026). Список не полон, как и весь разбор."""
+    pos = _positionals(args)
+    sub = pos[0] if pos else ""
+    if prog in ("nc", "ncat", "netcat", "socat", "mail", "mailx", "sendmail", "msmtp", "mutt",
+                "swaks", "telnet"):
+        return PUBLISH
+    if prog in ("twine", "flit", "poetry") and sub in ("upload", "publish"):
+        return PUBLISH
+    if prog == "rclone":
+        if sub in ("delete", "deletefile", "purge", "rmdir", "rmdirs", "cleanup"):
+            return DELETE
+        if sub in ("copy", "copyto", "sync", "move", "moveto", "copyurl", "rcat", "bisync"):
+            return PUBLISH
+    if prog in ("mke2fs", "mkswap", "wipefs", "blkdiscard", "fdisk", "sfdisk", "gdisk", "sgdisk",
+                "cfdisk", "parted", "swapoff") or (prog == "nvme" and sub in ("format", "sanitize")):
+        return DISK
+    if prog in ("shred", "srm", "wipe", "lvremove", "vgremove", "pvremove") or (
+            prog == "cryptsetup" and sub in ("erase", "luksErase", "luksKillSlot")) or (
+            prog in ("zfs", "zpool") and sub in ("destroy", "labelclear")):
+        return DELETE
+    if prog == "loginctl" and sub in ("reboot", "poweroff", "halt", "suspend", "hibernate", "kexec",
+                                      "soft-reboot"):
+        return POWER
+    # `crontab файл` и `crontab -` заменяют весь crontab, прочие строки
+    # теряются, как при `-r` (аудит guard 31.10.2026, задание guard2).
+    if prog == "crontab" and ("-r" in _flags(args) or (
+            not {"-l", "-e"} & _flags(args) and _operands(args, frozenset({"-u"})))):
+        return DELETE
+    # `tailscale funnel|serve <порт>` открывает службу в интернет или в
+    # tailnet; показ, сброс и выключение не публикуют.
+    if prog == "tailscale" and sub in ("funnel", "serve") and not {"status", "reset", "off"} & set(pos):
+        return PUBLISH
+    # Выключение Windows и всей WSL с ней из WSL (аудит guard 31.10.2026).
+    low = prog.lower()
+    text = " ".join(args).lower()
+    if low == "shutdown.exe" or (low in ("wsl", "wsl.exe") and {"--shutdown", "--terminate", "-t"}
+                                  & set(args)) or (
+            low in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
+            and re.search(r"\b(?:restart|stop)-computer\b", text)) or (
+            low == "cmd.exe" and re.search(r"\bshutdown(?:\.exe)?\b", text)):
+        return POWER
+    return ""
+
+
+# strace и ltrace запускают следующую команду. Без карточки только сводка и
+# отбор вызовов; журнал в файл, подключение к процессу, смена окружения и
+# пользователя карточкой, `-v` и `-e abbrev=` печатают переменные окружения.
+# У ltrace `-x`, `-w`, `-e` и `-s` значат другое и берут значение.
+_TRACER_PLAIN_RE = {"strace": re.compile(r"-(?:[fcCqtTyxrizZw]+|[es](?:trace=)?[%\w,!-]+)"),
+                    "ltrace": re.compile(r"-[fcCrtTi]+")}
+_TRACER_VALUE = frozenset({"-e", "-s"})
+_TRACER_RISKY_VALUE = frozenset({"-o", "--output", "-p", "--attach", "-E", "--env", "-u", "--user",
+                                 "-P", "-I", "-b", "-S", "-O", "-X", "-a", "-A", "-n", "-l", "-F", "-D",
+                                 "-e", "-s", "-x", "-w"})
+
+
+def _tracer_command(prog: str, args: list[str], v: Verdict) -> list[str]:
+    """Команда под strace или ltrace; что нельзя считать чтением, красит v."""
+    rest = list(args)
+    while rest and rest[0].startswith("-"):
+        flag = rest[0]
+        plain = _TRACER_PLAIN_RE[prog]
+        if flag in _TRACER_VALUE and plain.fullmatch(flag + "".join(rest[1:2])):
+            rest = rest[2:]
+        elif plain.fullmatch(flag):
+            rest = rest[1:]
+        else:
+            v.add(ORANGE, _("{prog} с записью, чужим процессом или показом окружения").format(prog=prog))
+            rest = rest[2:] if flag in _TRACER_RISKY_VALUE else rest[1:]
+    if not rest:
+        v.add(ORANGE, _("{prog} без команды").format(prog=prog))
+    return rest
 
 
 # Обёртка -> (флаги со значением, сколько позиционных до команды).
@@ -397,8 +591,49 @@ _WRAPPERS = {
     "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
     "nohup": (set(), 0), "time": (set(), 0), "command": (set(), 0), "exec": (set(), 0),
     "builtin": (set(), 0), "rtk": (set(), 0), "chronic": (set(), 0),
+    # Запуск команды в другом сеансе, на других ядрах, с другим приоритетом
+    # или в своих пространствах имён: метки внутренней команды не теряются
+    # (аудит guard 31.10.2026, задание guard2). `busybox rm` это тот же rm.
+    "busybox": (set(), 0), "setsid": (set(), 0),
+    "taskset": (set(), 1), "chrt": ({"-T", "--sched-runtime", "-P", "--sched-period", "-D",
+                                     "--sched-deadline"}, 1),
+    "unshare": ({"-S", "--setuid", "-G", "--setgid", "-R", "--root", "-w", "--wd"}, 0),
+    "nsenter": ({"-t", "--target", "-S", "--setuid", "-G", "--setgid"}, 0),
+    # `flock [флаги] файл команда` или `файл -c 'строка'`; файл блокировки создаётся.
+    "flock": ({"-w", "--timeout", "-E", "--conflict-exit-code"}, 1),
 }
+# Короткие флаги sudo со значением: в связке значение берёт последний (`-iu root`).
+_SUDO_VALUE_SHORT = frozenset("ugCDhprtU")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SCRIPT_VALUE_SHORT = frozenset("cEIOBTm")
+
+
+def _script_command(args: list[str]) -> str:
+    """Строка команды `script`: `-c X`, `-qcX`, `--command X`, `--command=X`,
+    сокращение `--comm=X`. Пусто: script запустит оболочку без команды."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if long_flag(name, "--command", 4):
+                return val if eq else (args[i + 1] if i + 1 < len(args) else "")
+        elif a.startswith("-") and len(a) > 1:
+            for k, c in enumerate(a[1:], 1):
+                if c in _SCRIPT_VALUE_SHORT:
+                    val = a[k + 1:]
+                    if not val:
+                        i += 1
+                        val = args[i] if i < len(args) else ""
+                    if c == "c":
+                        return val
+                    break
+        i += 1
+    return ""
+# Подкоманды rtk, которые запускают произвольную команду строкой.
+_RTK_SHELL = frozenset({"test", "err", "summary", "run"})
 _XARGS_VALUE_FLAGS = frozenset({
     "-I", "-n", "-L", "-P", "-d", "-a", "-s", "-E", "--max-args", "--max-procs",
     "--delimiter", "--arg-file", "--max-chars", "--process-slot-var",
@@ -475,9 +710,12 @@ _SECRET_WORD_RE = re.compile(
     r"|\.codex/auth\.json|gh/hosts\.ya?ml|\.docker/config\.json"
     # Облачные токены rclone и истории оболочек (ревью 11.10.2026).
     r"|rclone/rclone\.conf|fish/fish_history"
+    # Токены gcloud и бота telegram-send: `cat` шёл без карточки (корпус guard2).
+    r"|gcloud/(?:application_default_credentials\.json|credentials\.db|access_tokens\.db"
+    r"|legacy_credentials)|telegram-send\.conf"
     r"|(?:^|[/=:@])\.(?:zsh|bash|python|psql|mysql)_history(?:$|/)"
     r"|(?:^|[/=:@])\.[^/]*(?:token|secret|passw|credential)"
-    r"|(?:^|/)(?:credentials?(?:\.[^/]*)?|id_(?:rsa|dsa|ecdsa|ed25519)|shadow|gshadow)(?:/|$)"
+    r"|(?:^|/)(?:credentials?(?:\.[^/]*)?|token\.json|id_(?:rsa|dsa|ecdsa|ed25519)|shadow|gshadow)(?:/|$)"
     # Ключи, сертификаты с ключом, хранилища ключей Java и secrets.yaml
     # (решение владельца 14.10.2026).
     r"|(?:^|[/=:@])secrets\.(?:ya?ml|json)(?:$|/)"
@@ -486,9 +724,30 @@ _SECRET_WORD_RE = re.compile(
 )
 
 
+# `prod.env`, `secrets.env`, `.envrc`: значения те же, что в `.env`. Только для
+# читаемых файлов (_secret_path): в словах команды это ещё и `process.env`.
+_ENV_FILE_RE = re.compile(
+    r"(?:^|/)(?!(?:example|sample)\.env(?:/|$))[^/]+\.env(?:/|$)|(?:^|/)\.envrc(?:/|$)", re.IGNORECASE)
+
+
+def _secret_name(path: str) -> bool:
+    return bool(_SECRET_WORD_RE.search(path) or _ENV_FILE_RE.search(path))
+
+
 # Слова команды целиком, включая строки внутри кавычек и тела heredoc:
 # программа на python или node, читающая `.env`, разбором оболочки не видна.
 _MENTION_SPLIT_RE = re.compile(r"[\s'\"()\[\]{},;`<>|&]+")
+
+
+def _metadata_only(v: Verdict, command: str) -> bool:
+    """Команда ничего не пишет и не запускает незнакомого, а все её программы
+    смотрят только сведения о файлах или печатают слова: имя секрета в
+    тексте тут аргумент, а не скрытое чтение (`test -f .env && echo да`).
+    С подстановкой нет: `test -f .env && echo $TOKEN` печатает значение,
+    `for f in .env; do cat $f; done` читает файл (ревью 01.11.2026)."""
+    return "$" not in re.sub(r"\$HOME\b", "", command) and v.level == YELLOW and bool(v.programs) and all(
+        (prog in METADATA_ONLY and not any(long_flag(a, "--files0-from") for a in args))
+        or prog in ("echo", "true", "false", "cd") for prog, args in v.programs)
 
 
 def _mentions_secret(command: str) -> bool:
@@ -499,7 +758,7 @@ def _mentions_secret(command: str) -> bool:
 
 
 def _secret_path(raw: str, cwd: str | None = None) -> bool:
-    if _SECRET_WORD_RE.search(raw):
+    if _secret_name(raw):
         return True
     if not raw or raw.startswith("-") or any(c in raw for c in "\n\x00"):
         return False
@@ -508,14 +767,14 @@ def _secret_path(raw: str, cwd: str | None = None) -> bool:
         # Ссылки среди совпадений не читают содержимое, но могут передать
         # секрет читалке (ревью 11.10.2026).
         if glob.has_magic(raw) and cwd and any(
-                _SECRET_WORD_RE.search(str(Path(cwd, p).resolve()))
+                _secret_name(str(Path(cwd, p).resolve()))
                 for p in glob.glob(str(path), root_dir=cwd)):
             return True
         if not path.is_absolute():
             if cwd is None:
                 return False
             path = Path(cwd) / path
-        return bool(_SECRET_WORD_RE.search(str(path.resolve())))
+        return _secret_name(str(path.resolve()))
     except (OSError, RuntimeError, ValueError):
         return True
 
@@ -553,6 +812,16 @@ def _rg_roots(args: list[str]) -> list[str]:
     return (pos if explicit else pos[1:]) or ["."]
 
 
+def _rg_lists_files(args: list[str]) -> bool:
+    """`--files` как флаг: после `--` и за `-e` это слово, а не режим."""
+    i = 0
+    while i < len(args) and args[i] != "--":
+        if args[i] == "--files":
+            return True
+        i += 2 if args[i] in _RG_VALUES else 1
+    return False
+
+
 def _searches_tree(parts: list[str], cwd: str | None = None) -> bool:
     """grep с рекурсией и rg по каталогу без карточки не идут: какие файлы
     прочтёт обход, по именам в дереве не угадать (решение владельца
@@ -566,6 +835,10 @@ def _searches_tree(parts: list[str], cwd: str | None = None) -> bool:
         return False
     cmd, args = _program(parts[0]), parts[1:]
     if cmd in ("rg", "ripgrep"):
+        if args == ["--version"] or _rg_lists_files(args):
+            # Только имена файлов, без чтения содержимого, как find
+            # (аудит 31.10.2026). Скрытые и игнорируемые ловит _reads_secret.
+            return False
         base = cwd or os.getcwd()
         return not all(os.path.isfile(os.path.join(base, os.path.expanduser(r)))
                        for r in _rg_roots(args))
@@ -574,8 +847,8 @@ def _searches_tree(parts: list[str], cwd: str | None = None) -> bool:
     short = [a for a in args if a.startswith("-") and not a.startswith("--")]
     longs = [a.split("=", 1)[0] for a in args if a.startswith("--")]
     return any("r" in a or "R" in a for a in short) \
-        or any(len(n) > 2 and ("--recursive".startswith(n)
-                               or "--dereference-recursive".startswith(n)) for n in longs) \
+        or any(long_flag(n, "--recursive") or long_flag(n, "--dereference-recursive")
+               for n in longs) \
         or any(len(d) >= 3 and "recurse".startswith(d)
                for d in _option_values(args, "d", "--directories", _GREP_VALUES))
 
@@ -588,10 +861,23 @@ def _include_names_secret(pattern: str) -> bool:
         part.startswith(".") and glob.has_magic(part) for part in pattern.split("/"))
 
 
+# Только сведения о файле без содержимого: есть ли, размер, число строк, куда
+# ведёт ссылка. `ls -la .env`, `test -f .env`, `ls ~/.ssh` значений не
+# показывают (П1 из guard-2.md, задание guard2).
+METADATA_ONLY = frozenset({"ls", "stat", "test", "[", "du", "wc", "realpath", "readlink"})
+# Переменные без секретов: их значение агент видит и так (П3 из guard-2.md).
+PLAIN_VARS = frozenset({"HOME", "USER", "PWD", "LOGNAME", "HOSTNAME", "PATH", "SHELL", "LANG", "TERM"})
+
+
 def _reads_secret(parts: list[str], cwd: str | None = None) -> bool:
     if not parts:
         return False
     cmd, args = _program(parts[0]), parts[1:]
+    # `wc --files0-from=.env` печатает строки файла в ошибках «нет такого файла».
+    if cmd in METADATA_ONLY and not any(long_flag(a, "--files0-from") for a in args):
+        return False
+    if cmd == "printenv" and args and all(a in PLAIN_VARS for a in args):
+        return False
     # Шаблоны фильтров и шаблон поиска не имена читаемых файлов:
     # `grep -rn credentials src` ищет слово. rg ниже отдельно проверяет
     # включение скрытых файлов (ревью 11.10.2026).
@@ -645,7 +931,7 @@ def _reads_secret(parts: list[str], cwd: str | None = None) -> bool:
         return any(_include_names_secret(g)
                    for g in _option_values(args, "", "--include", _GREP_VALUES))
     if cmd == "diff":
-        return any(a.startswith("--rec") for a in args) or any("r" in a for a in short)
+        return any(long_flag(a, "--recursive", 5) for a in args) or any("r" in a for a in short)
     if cmd == "jq":
         return any(re.search(r"\b(?:env|ENV)\b", a) for a in args)
     if cmd in ("awk", "gawk", "mawk"):
@@ -678,7 +964,58 @@ def _reads_secret(parts: list[str], cwd: str | None = None) -> bool:
                 for f in re.split(r"[, ]+", fmt))
             for fmt in _option_values(args, "o", "--format", _PS_VALUES)
             + _option_values(args, "O", "", _PS_VALUES))
+    if cmd == "systemctl":
+        return _systemctl_env(args)
+    if cmd == "systemd-analyze":
+        return "dump" in args
+    # Имена читаемых файлов не в команде (аудит 31.10.2026, проверено):
+    # `find … -print0 | sort --files0-from=-` печатает найденные `.env`,
+    # `strings @список` читает файлы из списка. GNU принимает сокращение `--fil`.
+    if cmd == "sort" and any(long_flag(a, "--files0-from", 5) for a in args):
+        return True
+    if cmd == "strings" and any(a.startswith("@") for a in args):
+        return True
+    # Без операндов печатают переменные со значениями, в том числе окружение.
+    if cmd in ("export", "declare", "typeset") and all(a.startswith("-") for a in args):
+        return True
+    if cmd == "set" and not args:
+        return True
     return cmd in ("env", "printenv")
+
+
+# Значения флагов systemctl, как в `_h_systemctl`.
+_SYSTEMCTL_VALUES = frozenset({"-H", "--host", "-M", "--machine", "-t", "--type", "-p",
+                               "--property", "-P", "-n", "--lines", "-o", "--output", "--state",
+                               "-s", "--signal", "--kill-whom", "--root", "--what",
+                               "--job-mode"})
+
+
+def systemctl_prop_secret(prop: str) -> bool:
+    """Свойство `systemctl show`, в значении которого бывают секреты:
+    окружение, учётные данные, командная строка запуска (ревью 29.10.2026)."""
+    p = prop.lower()
+    # Не только буквы и цифры: systemctl снимает экранирование в списке
+    # свойств, `Environ\ment` это `Environment` (ревью Codex 29.10).
+    return not p.isalnum() or "environment" in p or "credential" in p or (
+        p.startswith("exec") and not p.startswith("execmain"))
+
+
+def _systemctl_env(args: list[str]) -> bool:
+    """`cat`, `dump`, `show-environment` и `show` без названных свойств или с
+    секретным свойством печатают `Environment=` со значениями: там бывают
+    токены службы (ревью 29.10.2026). Глагол ищется среди всех операндов:
+    значение незнакомого флага (`--timestamp utc cat x`) сдвигает его."""
+    pos = _operands(args, _SYSTEMCTL_VALUES)
+    if any(a in ("cat", "dump", "show-environment") for a in pos):
+        return True
+    if "show" not in pos:
+        return False
+    # Сокращение `--prop` getopt примет за `--property` (ревью Codex 29.10).
+    if any(long_flag(a, "--property", 5) and a.split("=", 1)[0] != "--property" for a in args):
+        return True
+    props = [p for v in _option_values(args, "p", "--property", _SYSTEMCTL_VALUES)
+             + _option_values(args, "P", "", _SYSTEMCTL_VALUES) for p in v.split(",")]
+    return not props or any(systemctl_prop_secret(p) for p in props)
 
 
 def _system_read_ok(prog: str, args: list[str]) -> bool:
@@ -734,7 +1071,8 @@ def _h_system_identity(prog: str, args: list[str], v: Verdict, depth: int) -> No
 
 
 def _h_file(prog: str, args: list[str], v: Verdict, depth: int) -> None:
-    if "-C" in _flags(args) or any(a.startswith("--compile") for a in args):
+    # getopt принимает сокращение: `--compil` это `--compile`.
+    if "-C" in _flags(args) or any(long_flag(a, "--compile", 4) for a in args):
         v.add(ORANGE, _("компилирует базу file и пишет magic.mgc"))
 
 
@@ -752,15 +1090,25 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
             return
         if _ASSIGN_RE.match(head):
             _check_assignment(head, v)
+            v.programs.append(("=", [head]))
             parts = parts[1:]
             continue
         if "/" in head:
             _check_program_path(head, v)
+        v.programs.append((prog, parts[1:]))
         if prog in ("sudo", "doas"):
             v.add(RED, _("с правами администратора"))
             rest = parts[1:]
             while rest and rest[0].startswith("-"):
-                takes_value = rest[0] in ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U")
+                # Длинные формы тоже со значением: `sudo --user root rm` (ревью Codex 29.10).
+                takes_value = rest[0] in ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U",
+                                          "--user", "--group", "--close-from", "--chdir", "--host",
+                                          "--prompt", "--role", "--type", "--other-user",
+                                          "--command-timeout") or (
+                    # Связка: `sudo -iu root rm` (аудит guard 31.10.2026).
+                    not rest[0].startswith("--") and len(rest[0]) > 2
+                    and rest[0][-1] in _SUDO_VALUE_SHORT
+                    and not set(rest[0][1:-1]) & _SUDO_VALUE_SHORT)
                 rest = rest[2:] if takes_value else rest[1:]
             parts = rest
             continue
@@ -771,6 +1119,20 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
                 if idx + 1 < len(parts):
                     _classify_bash(parts[idx + 1], v, depth + 1)
             return
+        if prog == "script":
+            # `script -c 'строка' [журнал]` отдаёт строку оболочке и пишет
+            # журнал сеанса (аудит guard 31.10.2026, задание guard2).
+            v.add(ORANGE, _("script запускает команду и пишет журнал сеанса"))
+            command = _script_command(parts[1:])
+            if command:
+                _classify_bash(command, v, depth + 1)
+            return
+        if prog in ("strace", "ltrace"):
+            parts = _tracer_command(prog, parts[1:], v)
+            continue
+        if prog in ("taskset", "chrt") and _flags(parts[1:]) & {"-p", "--pid"}:
+            v.add(ORANGE, _("меняет параметры запущенного процесса"))
+            return
         if prog in _WRAPPERS:
             value_flags, skip = _WRAPPERS[prog]
             rest = parts[1:]
@@ -778,14 +1140,23 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
             as_string = prog == "watch"
             while rest and (rest[0].startswith("-") or (prog == "env" and _ASSIGN_RE.match(rest[0]))):
                 flag = rest[0]
-                if prog == "env" and flag in ("-S", "--split-string"):
-                    v.add(ORANGE, _("env -S: команда из строки, не разобрана"))
+                # Слитные формы тоже: `-S'rm x'`, `--split-string=…`, `-iS` (ревью Codex 29.10).
+                if prog == "env" and (flag.startswith("-S") or long_flag(flag, "--split-string") or (
+                        not flag.startswith("--") and "S" in flag[1:])):
+                    v.add(ORANGE, _("env -S: команда из строки, не разобрана"), UNPARSED)
                     return
                 if prog == "env" and _ASSIGN_RE.match(flag):
                     _check_assignment(flag, v)
                 if prog == "watch" and flag in ("-x", "--exec"):
                     as_string = False
                 rest = rest[2:] if flag in value_flags else rest[1:]
+            if prog == "rtk" and rest[:1] and rest[0] in _RTK_SHELL:
+                # `rtk test|err|summary|run` склеивают аргументы и отдают их
+                # оболочке (проверено rtk 0.42.4, аудит guard 31.10.2026).
+                v.add(ORANGE, _("rtk {sub} запускает команду оболочкой").format(sub=rest[0]))
+                if rest[1:]:
+                    _classify_bash(" ".join(rest[1:]), v, depth + 1)
+                return
             if prog == "rtk" and rest[:1] == ["proxy"]:
                 rest = rest[1:]
             elif prog == "rtk" and rest[:1] == ["grep"]:
@@ -796,6 +1167,32 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
                 if rest:
                     _classify_bash(" ".join(rest), v, depth + 1)
                 return
+            if prog == "env" and not rest:
+                # Голое `env` (и с -0, -u) печатает окружение: как обёртку его
+                # нечем было проверить, признак секрета терялся (аудит 31.10.2026).
+                v.secret = True
+                v.add(ORANGE, _("может вывести секреты или окружение процессов"))
+                return
+            if prog == "flock":
+                v.add(ORANGE, _("создаёт файл блокировки"))
+                # `-c` флаг flock только до файла блокировки и сразу за ним, дальше
+                # идут аргументы самой команды: `flock f git -c x=y push`.
+                args, i = parts[1:], 0
+                while i < len(args) and args[i].startswith("-"):
+                    a = args[i]
+                    if a.startswith("--command="):
+                        _classify_bash(a.split("=", 1)[1], v, depth + 1)
+                        return
+                    if a == "--command" or (not a.startswith("--") and a.endswith("c")):
+                        if args[i + 1:i + 2]:
+                            _classify_bash(args[i + 1], v, depth + 1)
+                        return
+                    i += 2 if a in value_flags else 1
+                if args[i + 1:i + 2] and (args[i + 1] in ("-c", "--command") or args[i + 1].startswith("--command=")):
+                    command = args[i + 1].split("=", 1)[1] if "=" in args[i + 1] else " ".join(args[i + 2:i + 3])
+                    if command:
+                        _classify_bash(command, v, depth + 1)
+                    return
             parts = rest[skip:]
             continue
         if prog == "xargs":
@@ -823,8 +1220,16 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
     prog = _program(parts[0])
     args = parts[1:]
     if prog.startswith("$"):
-        v.add(ORANGE, _("команда из переменной, не разобрана"))
+        v.add(ORANGE, _("команда из переменной, не разобрана"), UNPARSED)
         return
+    if parts[0] not in ("[", "[[") and any(c in parts[0] for c in "${}*?["):
+        # `/???/r? -rf x`, `{rm,-rf,x}`: имя программы раскроет оболочка.
+        v.add(ORANGE, _("имя команды раскрывается оболочкой, не разобрано"), UNPARSED)
+        return
+    first = next((a for a in args if not a.startswith("-")), "")
+    if (first.startswith("$") or "{" in first) and prog in _SUBCOMMAND_PROGS:
+        # `git $a`: подкоманда из переменной (ревью 29.10.2026).
+        v.add(ORANGE, _("подкоманда из переменной, не разобрана"), UNPARSED)
     token = None
     if prog == "git":
         # git -C меняет основу относительных путей только в этом вызове
@@ -841,12 +1246,15 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
         if prog == "cd":
             target = next((a for a in args if a != "--"), str(Path.home()))
             _CWD.set(None if target.startswith("-") else _absolute(target))
+        tagged = _tagged_program(prog, args)
+        if tagged:
+            v.add(RED, _("необратимое или наружу ({prog})").format(prog=prog), tagged)
         handler = _HANDLERS.get(prog)
         if handler is not None:
             handler(prog, args, v, depth)
             return
         if prog.startswith("mkfs"):
-            v.add(RED, _("форматирует диск"))
+            v.add(RED, _("форматирует диск"), DISK)
         elif prog not in _READ_ONLY:
             v.add(ORANGE, _("незнакомая команда {prog}: что делает, не знаю").format(prog=prog[:40]))
     finally:
@@ -869,6 +1277,15 @@ _READ_ONLY = frozenset({
     "bzcat", "xzcat", "strings", "hexdump", "pstree", "vmstat", "iostat",
     "date", "cal", "tput", "clear", "column", "numfmt",
 })
+
+
+def long_flag(arg: str, full: str, min_len: int = 3) -> bool:
+    """Длинный флаг `full` или его сокращение: getopt_long и parse-options git
+    принимают однозначное начало (`--in` это `--in-place`, `--ha` это
+    `--hard`). Значение через `=` не мешает. min_len: длина сокращения с
+    `--`, короче которой оно неоднозначно у этой программы."""
+    name = arg.split("=", 1)[0]
+    return name.startswith("--") and len(name) >= min_len and full.startswith(name)
 
 
 def _flags(args: list[str]) -> set[str]:
@@ -948,11 +1365,22 @@ def _option_values(args: list[str], short: str, long: str,
     return out
 
 
+def _raw_device(target: str) -> bool:
+    return target.startswith("/dev/") and not target.startswith(
+        ("/dev/null", "/dev/std", "/dev/tty", "/dev/fd/", "/dev/pts/", "/dev/shm/"))
+
+
 def _write_target(target: str, v: Verdict, reason: str = N_("пишет вывод в файл")) -> None:
     if target in ("", "-", "/dev/null"):
         return
+    if target.startswith("/proc/sysrq"):
+        v.add(RED, _("перезагружает или выключает машину"), POWER)
+        return
+    if _raw_device(target):
+        v.add(RED, _("пишет на диск или в файл напрямую (dd)"), DISK)
+        return
     if _protected_path(target):
-        v.add(RED, _("перезаписывает {target}").format(target=target))
+        v.add(RED, _("перезаписывает {target}").format(target=target), GUARD)
     else:
         v.add(ORANGE, _(reason))
 
@@ -963,9 +1391,9 @@ def _h_delete(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         v.add(ORANGE, _("удаляет временные файлы в /tmp"))
         return
     if prog == "dd":
-        v.add(RED, _("пишет на диск или в файл напрямую (dd)"))
+        v.add(RED, _("пишет на диск или в файл напрямую (dd)"), DISK)
         return
-    v.add(RED, _("удаляет или затирает файлы"))
+    v.add(RED, _("удаляет или затирает файлы"), DELETE)
 
 
 _TAR_EXEC_OPTS = ("--to-command", "--checkpoint-action", "--use-compress-program", "--info-script",
@@ -988,18 +1416,28 @@ def _h_write(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     else:
         touched = targets
     if any(_protected_path(t) for t in touched):
-        v.add(RED, _("меняет ключи, настройки или код бота"))
+        v.add(RED, _("меняет ключи, настройки или код бота"), GUARD)
+    if any(_raw_device(t) for t in touched):
+        v.add(RED, _("пишет на диск или в файл напрямую (dd)"), DISK)
     if prog == "rsync" and any(":" in t and not t.startswith("/") for t in targets):
         v.add(RED, _("копирует на удалённый сервер или с него"))
+    if prog == "rsync":
+        # Не только последний: значение флага после цели (`… host:/d --exclude x`).
+        for target in targets[1:]:
+            _note_remote(target, v)
     if "--delete" in _flags(args) or any(a.startswith("--delete") for a in args):
-        v.add(RED, _("удаляет файлы в месте назначения (--delete)"))
+        v.add(RED, _("удаляет файлы в месте назначения (--delete)"), DELETE)
     v.add(ORANGE, _("копирует, перемещает или создаёт файлы"))
 
 
 def _h_sed(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     flags = _flags(args)
-    if "-i" in flags or "--in-place" in flags or any(a.startswith("-i") for a in args):
+    # getopt_long понимает сокращение: `--in`, `--i` это `--in-place`.
+    if "-i" in flags or any(a.startswith("-i") for a in args) or any(
+            long_flag(f, "--in-place") for f in flags):
         v.add(ORANGE, _("правит файлы на месте"))
+    if _option_values(args, "f", "--file"):
+        v.add(ORANGE, _("скрипт sed из файла, не разобран"))
     for a in args:
         if re.search(r"(^|[;}\s])[0-9,$]*\s*[we]\s|/[we]\s+\S", a):
             v.add(RED, _("скрипт sed пишет файл или запускает команду"))
@@ -1014,23 +1452,28 @@ def _h_sed(prog: str, args: list[str], v: Verdict, depth: int) -> None:
             v.add(RED, _("скрипт sed пишет файл или запускает команду"))
 
 
+def _sed_address(n: str) -> str:
+    """Адрес sed: номер, `$`, `first~step`, `/re/` и `\\cREc` с флагами I и M
+    (аудит guard 31.10.2026: `/x/Ie cmd` и `\\%x%e cmd` запускали команду)."""
+    return (rf"(?:[0-9$~+]+|/(?:[^/\\\n]|\\.)*/[IM]*"
+            rf"|\\(?P<{n}>\S)(?:(?!(?P={n})).)*(?P={n})[IM]*)")
+
+
 _SED_EXEC_RE = re.compile(
-    r"(?:^|[;{}\n])\s*(?:[0-9,$~+]+|/[^/]*/)?\s*!?\s*"
-    r"(?:[wW]\s*\S|e(?:$|[\s;}])|s(.).*?\1.*?\1[gpiImM0-9]*(?:e|w\s*\S))"
+    rf"(?:^|[;{{}}\n])\s*(?:{_sed_address('a1')}(?:\s*,\s*{_sed_address('a2')})?)?\s*!?\s*"
+    r"(?:[wW]\s*\S|e(?:$|[\s;}])|s(?P<d>.).*?(?P=d).*?(?P=d)[gpiImM0-9]*(?:e|w\s*\S))"
 )
 
 
 def _h_tee(prog: str, args: list[str], v: Verdict, depth: int) -> None:
-    targets = [t for t in _positionals(args) if t != "/dev/null"]
-    if any(_protected_path(t) for t in targets):
-        v.add(RED, _("меняет ключи, настройки или код бота"))
-    if targets:
-        v.add(ORANGE, _("пишет вывод в файл"))
+    # Как у перенаправления: устройства, sysrq, защищённые пути (ревью Codex 29.10).
+    for t in _positionals(args):
+        _write_target(t, v)
 
 
 def _h_find(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if any(a in ("-delete",) for a in args):
-        v.add(RED, _("удаляет найденные файлы"))
+        v.add(RED, _("удаляет найденные файлы"), DELETE)
     if any(a in ("-exec", "-execdir", "-ok", "-okdir") for a in args):
         v.add(ORANGE, _("запускает команду для найденных файлов"))
         for i, a in enumerate(args):
@@ -1153,8 +1596,22 @@ def _h_sort(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     # путь красный (ревью 11.10.2026).
     for target in _option_values(args, "o", "--output" if prog != "tree" else ""):
         _write_target(target, v)
-    if any(a.startswith("--compress-prog") for a in args):
+    # getopt принимает однозначное сокращение: `--co=sh` это `--compress-program=sh`,
+    # и при сбросе во временные файлы строки ввода исполняет sh (аудит 31.10.2026).
+    if any(long_flag(a, "--compress-program", 4) for a in args):
         v.add(ORANGE, _("sort запускает внешнюю программу"))
+    if prog == "tree" and {"-R", "-H"} <= _flags(args):
+        # `tree -R -H …` пишет 00Tree.html в каждый подкаталог (аудит 31.10.2026).
+        v.add(ORANGE, _("пишет вывод в файл"))
+    # Имена читаемых файлов из файла или потока (`printf '\\056env\\0' |
+    # sort --files0-from=-`): проверка имён их не видит (аудит guard 31.10.2026).
+    if prog == "sort" and any(long_flag(a, "--files0-from", 5) for a in args):
+        v.secret = True
+        v.add(ORANGE, _("читает файлы по списку имён из файла или потока"))
+    # Шаблон может раскрыться в имя вида `-ofile` и стать файлом вывода, как у
+    # uniq ниже (ревью 11.10.2026; разрешение чтения по danger.py 29.10.2026).
+    if any(glob.has_magic(a) for a in args):
+        v.add(ORANGE, _("шаблон в аргументах может стать флагом записи"))
 
 
 # Второй операнд uniq и xxd это файл вывода (ревью 11.10.2026).
@@ -1169,12 +1626,12 @@ def _h_second_operand(prog: str, args: list[str], v: Verdict, depth: int) -> Non
     operands = _operands(args, _SECOND_OPERAND_VALUES[prog])
     # Шаблон может дать два операнда и превратить второй в цель записи
     # (ревью 11.10.2026).
-    if prog == "uniq" and any(glob.has_magic(a) for a in operands):
+    if any(glob.has_magic(a) for a in operands):
         cwd = _CWD.get()
         if cwd and all(not glob.has_magic(a) or a.startswith("./") for a in operands):
             operands = [p for a in operands for p in (glob.glob(a, root_dir=cwd) or [a])]
         else:
-            v.add(ORANGE, _("шаблон uniq может подставить файл вывода"))
+            v.add(ORANGE, _("шаблон может подставить файл вывода"))
     if len(operands) >= 2:
         _write_target(operands[1], v)
 
@@ -1189,7 +1646,7 @@ def _h_gzip(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if not targets:
         return
     if any(_protected_path(t) for t in targets):
-        v.add(RED, _("меняет ключи, настройки или код бота"))
+        v.add(RED, _("меняет ключи, настройки или код бота"), GUARD)
     v.add(ORANGE, _("заменяет файлы сжатыми или распакованными ({prog})").format(prog=prog))
 
 
@@ -1260,12 +1717,107 @@ def _git_sub(args: list[str]) -> tuple[str, list[str], bool]:
 
 
 _GIT_RED = N_("меняет историю git или выбрасывает изменения")
+_GIT_TAG_LIST_BOOL = frozenset({"-l", "--list", "-i", "--ignore-case", "--column", "--no-column",
+                                "--omit-empty", "--color", "--no-color"})
+_GIT_TAG_LIST_VALUE = frozenset({"--sort", "--format", "--contains", "--no-contains", "--merged",
+                                 "--no-merged", "--points-at"})
+
+
+def git_tag_lists(rest: list[str]) -> bool:
+    """`git tag` только показывает метки: без имени новой метки или с -l
+    (тогда слова это шаблоны). Незнакомый флаг значит не список
+    (аудит 31.10.2026)."""
+    list_mode = positionals = False
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        name = a.split("=", 1)[0]
+        if name in _GIT_TAG_LIST_VALUE:
+            i += 1 if "=" in a else 2
+            continue
+        if a in ("-l", "--list"):
+            list_mode = True
+        elif a in _GIT_TAG_LIST_BOOL or re.fullmatch(r"-n\d*", a):
+            pass
+        elif a.startswith("-"):
+            return False
+        else:
+            positionals = True
+        i += 1
+    return list_mode or not positionals
+
+
+def git_listing(sub: str, rest: list[str]) -> bool:
+    """Подкоманды git, которые с этими аргументами только показывают."""
+    if sub == "tag":
+        return git_tag_lists(rest)
+    if sub == "stash":
+        return rest[:1] in (["list"], ["show"])
+    if sub == "worktree":
+        return rest[:1] == ["list"] and all(a in ("--porcelain", "-v", "--verbose", "-z") for a in rest[1:])
+    return False
+
+
+# Флаги со значением у push и clean: `-o -n` это опция push «-n», а не
+# --dry-run (аудит guard 31.10.2026, проверено git 2.43).
+_GIT_DRY_VALUES = {
+    "push": ("o", ("--repo", "--receive-pack", "--exec", "--push-option")),
+    "clean": ("e", ("--exclude",)),
+}
+
+
+def _git_long(flags: set[str], *names: str) -> bool:
+    """Длинный флаг git с учётом сокращения: parse-options принимает
+    однозначное начало (`--h` это `--hard`, `--d` у branch это `--delete`)."""
+    return any(long_flag(f, n) for f in flags for n in names)
+
+
+def _git_dry(sub: str, rest: list[str]) -> bool:
+    """Пробный прогон по последнему из -n, --dry-run и --no-dry-run; значение
+    флага (`-o -n`, `-e -n`) не флаг."""
+    short_values, long_values = _GIT_DRY_VALUES.get(sub, ("", ()))
+    dry = False
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if long_flag(name, "--no-dry-run", 6):
+                dry = False
+            elif long_flag(name, "--dry-run", 5):
+                dry = True
+            elif "=" not in a and _git_long({name}, *long_values):
+                i += 1
+        elif a.startswith("-") and len(a) > 1:
+            for k, c in enumerate(a[1:], 1):
+                if c in short_values:
+                    i += k == len(a) - 1
+                    break
+                dry = dry or c == "n"
+        i += 1
+    return dry
+
+
+def _git_checkout_paths(rest: list[str]) -> bool:
+    """`git checkout <путь>` и `git checkout <ревизия> <путь>` без `--`
+    выбрасывают правки в файлах так же, как `git checkout -- путь`."""
+    flags = _flags(rest)
+    if {"-b", "-B"} & flags or _git_long(flags, "--orphan", "--detach"):
+        return False
+    if _git_long(flags, "--pathspec-from-file"):
+        return True
+    pos = _operands(rest, frozenset({"--conflict", "--pathspec-from-file"}))
+    if len(pos) >= 2:
+        return True
+    return any((path := _absolute(p)) is not None and os.path.lexists(path) for p in pos)
 
 
 def _h_git(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     sub, rest, has_config = _git_sub(args)
     flags = _flags(rest)
-    dry = "--dry-run" in flags or "-n" in flags
+    dry = _git_dry(sub, rest)
     if has_config:
         v.add(ORANGE, _("git с разовыми настройками (-c)"))
     # --no-index обходит каталоги вместе со скрытыми файлами. Для обычного
@@ -1275,23 +1827,25 @@ def _h_git(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         v.add(ORANGE, _("сравнивает каталоги вместе со скрытыми файлами"))
     if sub == "push" or (sub == "lfs" and rest[:1] == ["push"]):
         if not dry:
-            v.add(RED, _("публикует в git"))
+            v.add(RED, _("публикует в git"), PUBLISH)
         return
     # Отправка наружу и запуск программ (ревью 11.10.2026).
     if sub in ("send-email", "send-pack", "http-push", "daemon", "imap-send") or (
             sub == "svn" and rest[:1] == ["dcommit"]):
-        v.add(RED, _("отправляет наружу (git {sub})").format(sub=sub))
+        v.add(RED, _("отправляет наружу (git {sub})").format(sub=sub), PUBLISH)
         return
-    if any(a.startswith(("--upload-pack", "--receive-pack", "--exec", "--open-files-in-pager"))
+    # git grep принимает сокращение: `--open-fi=cmd` запускает cmd оболочкой.
+    if any(a.startswith(("--upload-pack", "--receive-pack", "--exec"))
+           or long_flag(a, "--open-files-in-pager", 4)
            for a in rest) or (sub == "grep" and "-O" in flags):
         v.add(ORANGE, _("git запускает внешнюю программу"))
     if sub == "archive":
         for target in _option_values(rest, "o", "--output"):
             _write_target(target, v)
-    if sub == "reset" and "--hard" in flags:
-        v.add(RED, _(_GIT_RED))
+    if sub == "reset" and _git_long(flags, "--hard"):
+        v.add(RED, _(_GIT_RED), HISTORY)
     elif sub == "checkout-index" and ({"-f", "--force"} & flags):
-        v.add(RED, _(_GIT_RED))
+        v.add(RED, _(_GIT_RED), HISTORY)
     elif sub == "reset":
         v.add(ORANGE, _("меняет репозиторий (git reset)"))
     elif sub in ("read-tree", "update-index", "checkout-index", "format-patch") or (
@@ -1299,31 +1853,44 @@ def _h_git(prog: str, args: list[str], v: Verdict, depth: int) -> None:
             sub == "symbolic-ref" and (len(_positionals(rest)) >= 2 or {"-d", "--delete"} & flags)):
         v.add(ORANGE, _("меняет репозиторий или пишет файлы (git {sub})").format(sub=sub))
     elif sub == "clean" and not dry:
-        v.add(RED, _("удаляет неотслеживаемые файлы (git clean)"))
-    elif sub == "checkout" and ("-f" in flags or "--force" in flags or "--" in rest or "." in rest):
-        v.add(RED, _(_GIT_RED))
+        v.add(RED, _("удаляет неотслеживаемые файлы (git clean)"), DELETE)
+    elif (sub == "checkout" and "-B" in flags) or (sub == "switch" and ("-C" in flags or _git_long(flags, "--force-create"))):
+        # Сбрасывает существующую ветку, как `git branch -f` (аудит 31.10.2026).
+        v.add(RED, _("удаляет или переписывает ветки"), HISTORY)
+    elif sub == "checkout" and ("-f" in flags or _git_long(flags, "--force") or "--" in rest
+                                or "." in rest or _git_checkout_paths(rest)):
+        v.add(RED, _(_GIT_RED), HISTORY)
     elif sub == "restore":
-        v.add(RED, _(_GIT_RED))
-    elif sub == "switch" and ("--discard-changes" in flags or "-f" in flags or "--force" in flags):
-        v.add(RED, _(_GIT_RED))
-    elif sub == "branch" and ({"-D", "-d", "--delete", "-M", "-m", "--force", "-f"} & flags):
-        v.add(RED, _("удаляет или переписывает ветки"))
-    elif sub == "reflog" and rest and rest[0] in ("expire", "delete"):
-        v.add(RED, _(_GIT_RED))
+        v.add(RED, _(_GIT_RED), HISTORY)
+    elif sub == "switch" and ("-f" in flags or _git_long(flags, "--discard-changes", "--force")):
+        v.add(RED, _(_GIT_RED), HISTORY)
+    elif sub == "branch" and ({"-D", "-d", "-M", "-m", "-f"} & flags
+                              or _git_long(flags, "--delete", "--force", "--move")):
+        v.add(RED, _("удаляет или переписывает ветки"), HISTORY)
+    elif sub == "reflog" and rest and rest[0] in ("expire", "delete", "drop", "write"):
+        v.add(RED, _(_GIT_RED), HISTORY)
     elif sub in ("rebase", "filter-branch", "filter-repo", "gc", "prune", "update-ref"):
-        v.add(RED, _(_GIT_RED))
-    elif sub == "commit" and "--amend" in flags:
-        v.add(RED, _("переписывает последний коммит"))
+        v.add(RED, _(_GIT_RED), HISTORY)
+    elif sub == "commit" and _git_long(flags, "--amend"):
+        v.add(RED, _("переписывает последний коммит"), HISTORY)
     elif sub == "stash" and rest and rest[0] in ("drop", "clear", "pop"):
-        v.add(RED, _(_GIT_RED))
+        v.add(RED, _(_GIT_RED), HISTORY)
     elif sub == "worktree" and rest and rest[0] in ("remove", "prune"):
-        v.add(RED, _("удаляет рабочие копии git"))
+        v.add(RED, _("удаляет рабочие копии git"), DELETE)
     elif sub == "tag" and ({"-d", "--delete", "-f", "--force"} & flags):
-        v.add(RED, _("удаляет или переписывает метки git"))
+        v.add(RED, _("удаляет или переписывает метки git"), HISTORY)
     elif sub == "remote" and rest and rest[0] in ("add", "remove", "rm", "set-url", "rename"):
         v.add(ORANGE, _("меняет настройки удалённых репозиториев"))
-    elif sub == "config" and not ({"--get", "--list", "-l", "--get-all", "--get-regexp"} & flags):
-        v.add(ORANGE, _("меняет настройки git"))
+    elif sub == "config" and not ({"--get", "--list", "-l", "--get-all", "--get-regexp"} & flags) \
+            and _positionals(rest)[:1] not in (["get"], ["list"]):
+        if {"--global", "--system"} & flags:
+            # ~/.gitconfig и /etc/gitconfig защищены (_PROTECTED_FILES), а путь
+            # в команде не назван (аудит 31.10.2026).
+            v.add(RED, _("меняет ключи, настройки или код бота"), GUARD)
+        else:
+            v.add(ORANGE, _("меняет настройки git"))
+    elif sub in ("tag", "stash", "worktree") and git_listing(sub, rest):
+        pass
     elif sub in ("commit", "add", "merge", "pull", "fetch", "am", "cherry-pick", "revert", "mv",
                  "rm", "init", "clone", "submodule", "apply", "checkout", "switch", "stash", "tag",
                  "notes", "worktree", "sparse-checkout", "lfs", "maintenance"):
@@ -1347,10 +1914,29 @@ _SVC_ACTIONS = frozenset({
 })
 
 
+# Действия systemctl над всей машиной, а не службой (ревью Codex 29.10).
+_POWER_ACTIONS = frozenset({
+    "reboot", "poweroff", "halt", "suspend", "hibernate", "isolate", "default", "rescue",
+    "emergency", "exit", "soft-reboot", "suspend-then-hibernate", "hybrid-sleep", "sleep",
+    "kexec", "switch-root",
+})
+
+
 def _h_systemctl(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if any(a.startswith(("--host", "--machine")) or a in ("-H", "-M") for a in args):
         v.add(RED, _("на другой машине (systemctl --host)"))
-    acts = [a for a in _positionals(args) if a in _SVC_ACTIONS]
+    # Без значений флагов: `systemctl -H web1 reboot` (ревью Codex 29.10).
+    pos = _operands(args, frozenset({"-H", "--host", "-M", "--machine", "-t", "--type", "-p",
+                                     "--property", "-n", "--lines", "-o", "--output", "--state",
+                                     "-s", "--signal", "--kill-whom", "--root", "--what",
+                                     "--job-mode"}))
+    acts = [a for a in pos if a in _SVC_ACTIONS]
+    # Действие первое слово: `systemctl status reboot` смотрит службу (ревью Codex 29.10).
+    if (pos[:1] and pos[0] in _POWER_ACTIONS) or (acts and any(
+            a.split(".")[0] in _POWER_ACTIONS and a.endswith(".target") for a in pos[1:])):
+        v.add(RED, _("перезагружает или выключает машину"), POWER)
+    if pos[:1] == ["clean"]:
+        v.add(RED, _("удаляет данные службы (systemctl clean)"), DELETE)
     if acts:
         v.add(RED, _("управляет службами (systemctl {acts0})").format(acts0=acts[0]))
 
@@ -1362,12 +1948,29 @@ def _h_service(prog: str, args: list[str], v: Verdict, depth: int) -> None:
 
 
 def _h_power(prog: str, args: list[str], v: Verdict, depth: int) -> None:
-    v.add(RED, _("перезагружает или выключает машину"))
+    v.add(RED, _("перезагружает или выключает машину"), POWER)
+
+
+def _kill_targets(args: list[str]) -> list[str]:
+    """Цели `kill` без сигнала: `-9`, `-KILL`, `-s 9`, `-n 9`, `--signal 9`
+    первым словом это сигнал, а `-1` дальше или после `--` это все процессы."""
+    rest = list(args)
+    if rest and rest[0] in ("-s", "-n", "--signal"):
+        rest = rest[2:]
+    elif rest and rest[0].startswith("-") and rest[0] != "--":
+        rest = rest[1:]
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    return rest
 
 
 def _h_kill(prog: str, args: list[str], v: Verdict, depth: int) -> None:
-    flags = _flags(args)
-    if prog == "kill" and ("-l" in flags or "-L" in flags):
+    # Список сигналов только отдельным флагом: в `-KILL` буква L это имя сигнала.
+    if prog == "kill" and args[:1] and args[0] in ("-l", "-L", "--list", "--table"):
+        return
+    if prog == "kill" and "-1" in _kill_targets(args):
+        # Все процессы пользователя, с ботом и сеансом (аудит guard 31.10.2026).
+        v.add(RED, _("завершает все процессы пользователя"), POWER)
         return
     v.add(RED, _("завершает процессы"))
 
@@ -1378,19 +1981,37 @@ _JOURNAL_WRITE_OPTS = ("--vacuum-time", "--vacuum-size", "--vacuum-files", "--ro
 
 
 def _h_journalctl(prog: str, args: list[str], v: Verdict, depth: int) -> None:
+    # `--cursor-file=F` в конце пишет курсор в F, создаёт файл (аудит
+    # 31.10.2026, проверено); `--cursor-` уже однозначное сокращение.
+    for i, a in enumerate(args):
+        name = a.split("=", 1)[0]
+        if long_flag(name, "--cursor-file", len("--cursor-")):
+            target = a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")
+            _write_target(target, v)
+            v.add(ORANGE, _("пишет вывод в файл"))
     # getopt принимает однозначное сокращение: `--rot` это `--rotate`
     # (ревью 11.10.2026).
     for a in args:
         name = a.split("=", 1)[0]
         if a.startswith(("--vacuum", "--rotate", "--flush", "--sync", "--relinquish-var",
                          "--smart-relinquish-var", "--setup-keys", "--update-catalog")) or (
-                len(name) >= 5 and any(o.startswith(name) for o in _JOURNAL_WRITE_OPTS)):
-            v.add(RED, _("удаляет или переписывает системные журналы"))
+                any(long_flag(name, o, 5) for o in _JOURNAL_WRITE_OPTS)):
+            vacuum = a.startswith("--vacuum") or any(
+                long_flag(name, o, 5) for o in _JOURNAL_WRITE_OPTS[:3])
+            v.add(RED, _("удаляет или переписывает системные журналы"), DELETE if vacuum else "")
             return
 
 
+# Глобальные флаги docker со значением: `docker --context prod volume rm x`
+# (ревью Codex 29.10).
+_DOCKER_VALUES = frozenset({"--context", "-c", "-H", "--host", "--config", "-l", "--log-level",
+                            "--tlscacert", "--tlscert", "--tlskey", "-f", "--file", "-p",
+                            "--project-name", "--project-directory", "--env-file", "--profile",
+                            "--ansi", "--progress", "--parallel"})
+
+
 def _h_docker(prog: str, args: list[str], v: Verdict, depth: int) -> None:
-    pos = _positionals(args)
+    pos = _operands(args, _DOCKER_VALUES)
     if prog == "docker-compose":
         pos = ["compose", *pos]
     if not pos:
@@ -1404,16 +2025,27 @@ def _h_docker(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         acts = {"up", "down", "rm", "stop", "restart", "kill", "pull", "build", "run", "exec",
                 "create", "start", "pause", "unpause", "push", "scale", "cp", "watch"}
         sub = next((w for w in pos[1:] if w in acts), "")
+        # Тома и данные в них: `down -v`, `rm -v`. Сами контейнеры
+        # пересоздаются, их удаление обычный шаг обновления (ревью Codex 29.10).
+        volumes = sub in ("down", "rm") and ({"-v", "--volumes"} & _flags(args))
         if sub:
-            v.add(RED, _("управляет контейнерами (docker compose {sub})").format(sub=sub))
+            v.add(RED, _("управляет контейнерами (docker compose {sub})").format(sub=sub),
+                  DELETE if volumes else PUBLISH if sub == "push" else "")
         return
     if pos[0] in ("volume", "network", "image", "container", "system", "builder", "buildx"):
         sub = pos[1] if len(pos) > 1 else ""
         if sub and sub not in {"ls", "list", "inspect", "logs", "ps", "top", "stats", "history",
                                "port", "diff", "df", "info"}:
-            v.add(RED, _("управляет ресурсами Docker ({pos0} {sub})").format(pos0=pos[0], sub=sub))
+            drops = (pos[0] in ("volume", "system", "container") and sub == "prune") or (
+                pos[0] == "volume" and sub in ("rm", "remove")) or (
+                pos[0] == "container" and sub in ("rm", "remove") and ({"-v", "--volumes"} & _flags(args)))
+            v.add(RED, _("управляет ресурсами Docker ({pos0} {sub})").format(pos0=pos[0], sub=sub),
+                  DELETE if drops else PUBLISH if (pos[0], sub) == ("image", "push") else "")
         return
-    if pos[0] not in read:
+    if (pos[0] == "rm" and ({"-v", "--volumes"} & _flags(args))) or pos[0] == "push":
+        v.add(RED, _("управляет контейнерами (docker {pos0})").format(pos0=pos[0]),
+              PUBLISH if pos[0] == "push" else DELETE)
+    elif pos[0] not in read:
         v.add(RED, _("управляет контейнерами (docker {pos0})").format(pos0=pos[0]))
 
 
@@ -1437,7 +2069,8 @@ def _h_kubectl(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     read = {"get", "describe", "logs", "top", "explain", "api-resources", "api-versions",
             "version", "cluster-info", "config", "auth", "diff", "events", "wait"}
     if pos and pos[0] not in read:
-        v.add(RED, _("меняет кластер Kubernetes (kubectl {pos0})").format(pos0=pos[0]))
+        v.add(RED, _("меняет кластер Kubernetes (kubectl {pos0})").format(pos0=pos[0]),
+              DELETE if pos[0] == "delete" or (pos[0] == "replace" and "--force" in args) else "")
 
 
 def _h_helm(prog: str, args: list[str], v: Verdict, depth: int) -> None:
@@ -1445,7 +2078,8 @@ def _h_helm(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     read = {"list", "ls", "status", "get", "history", "show", "search", "template", "lint",
             "version", "env", "repo", "dependency", "verify"}
     if pos and pos[0] not in read:
-        v.add(RED, _("меняет установку в кластере (helm {pos0})").format(pos0=pos[0]))
+        v.add(RED, _("меняет установку в кластере (helm {pos0})").format(pos0=pos[0]),
+              DELETE if pos[0] in ("uninstall", "delete", "del", "un") else "")
 
 
 def _h_terraform(prog: str, args: list[str], v: Verdict, depth: int) -> None:
@@ -1456,7 +2090,9 @@ def _h_terraform(prog: str, args: list[str], v: Verdict, depth: int) -> None:
                            "test")
                 or pos[:2] == ["workspace", "delete"]):
         what = " ".join(pos[:2]) if pos[0] == "workspace" else pos[0]
-        v.add(RED, _("меняет облачную инфраструктуру (terraform {what})").format(what=what))
+        v.add(RED, _("меняет облачную инфраструктуру (terraform {what})").format(what=what),
+              DELETE if pos[0] in ("destroy", "workspace") or pos[:2] in (["state", "rm"], ["state", "push"])
+              or (pos[0] == "apply" and any(a in ("-destroy", "--destroy") for a in args)) else "")
     elif pos[:1] == ["workspace"] and pos[1:2] and pos[1] in ("new", "select"):
         v.add(ORANGE, f"terraform workspace {pos[1]}")
     elif pos and pos[0] in ("init", "plan", "refresh"):
@@ -1471,9 +2107,36 @@ def _h_ansible(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         v.add(RED, _("меняет серверы через Ansible"))
 
 
+_REMOTE_RE = re.compile(r"(?:\w+://)?(?:[^@/:]+@)?(\[[^\]]+\]|[^@/:\[]+)(?::|/|$)")
+
+
+def _note_remote(target: str, v: Verdict) -> None:
+    """Запомнить хост цели `host:путь`, `user@host::модуль`, `scp://host/…`,
+    `[ipv6]:путь`. Цель из переменной не известна: запоминается как есть, такого
+    имени в плане нет, и она идёт карточкой."""
+    if "$" in target and not target.startswith(("$HOME", "${HOME}")):
+        v.remotes.add(target.lower())
+        return
+    if target.startswith(("/", "./", "../", "~", "$")) or ":" not in target:
+        return
+    m = _REMOTE_RE.match(target)
+    v.remotes.add(m.group(1).lower() if m else target)
+
+
+_SCP_VALUES = frozenset({"-P", "-i", "-l", "-o", "-F", "-J", "-S", "-c", "-D", "-X"})
+_SFTP_VALUES = _SCP_VALUES | {"-b", "-B", "-R", "-s"}
+
+
 def _h_remote(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if prog in ("scp", "sftp"):
         v.add(RED, _("копирует на удалённый сервер или с него"))
+        operands = _operands(args, _SFTP_VALUES if prog == "sftp" else _SCP_VALUES)
+        if prog == "sftp" and operands:
+            # Интерактивная сессия: что уйдёт, не видно, цель сам сервер.
+            _note_remote(operands[0] if ":" in operands[0] else operands[0] + ":", v)
+        else:
+            for target in operands[1:]:
+                _note_remote(target, v)
         return
     if prog == "mosh":
         v.add(RED, _("открывает сессию на удалённом сервере"))
@@ -1504,6 +2167,9 @@ def _h_remote(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         return
     inner = Verdict()
     _classify_bash(" ".join(remote), inner, depth + 1)
+    v.tags |= inner.tags
+    v.remotes |= inner.remotes
+    v.secret = v.secret or inner.secret
     for r in inner.red:
         v.add(RED, _("на сервере {host}: {r}").format(host=host, r=r))
     for r in inner.orange:
@@ -1540,6 +2206,21 @@ def _cloud_words(args: list[str]) -> list[str]:
 
 def _cloud_read_verb(word: str) -> bool:
     return word in _CLOUD_READ or word.startswith(("describe-", "list-", "get-"))
+
+
+def _note_s3(args: list[str], high_level: bool, verb: str, v: Verdict) -> None:
+    """Бакет и сервер, куда aws кладёт данные. Источник `-` и неизвестные флаги
+    сдвигают позиции, поэтому цель ищется по самому адресу: перед ней есть
+    операнд, значит это отправка, а не скачивание."""
+    tail = args[args.index(verb) + 1:] if verb in args else []
+    uris = [a for a in tail if a.startswith("s3://")]
+    if high_level and verb in ("cp", "sync", "mv") and uris and any(
+            a == "-" or not a.startswith("-") for a in tail[:tail.index(uris[-1])]):
+        v.remotes.add(uris[-1][5:].split("/")[0].lower())
+    elif verb in ("put-object", "upload-part", "copy-object"):
+        v.remotes.update(b.lower() for b in _option_values(args, "", "--bucket"))
+    if v.remotes:
+        v.remotes.update(u.lower() for u in _option_values(args, "", "--endpoint-url"))
 
 
 def _h_cloud(prog: str, args: list[str], v: Verdict, depth: int) -> None:
@@ -1586,7 +2267,16 @@ def _h_cloud(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if read:
         v.add(ORANGE, _("обращается к облаку (чтение)"))
         return
-    v.add(RED, _("меняет ресурсы в облаке ({prog} {args})").format(prog=prog, args=' '.join(pos[:2])))
+    # У aws глагол одно слово, файлы рядом не глаголы (`s3 cp delete s3://…`);
+    # у az, gcloud, doctl глагол бывает глубже групп (ревью Codex 29.10).
+    if prog == "aws":
+        _note_s3(args, pos[:1] == ["s3"], verb, v)
+    words = [verb] if prog == "aws" else pos
+    drops = "--delete" in args or any(
+        p in ("delete", "remove", "destroy", "terminate", "rm", "rb", "purge")
+        or p.startswith(("delete-", "remove-", "terminate-")) for p in words)
+    v.add(RED, _("меняет ресурсы в облаке ({prog} {args})").format(prog=prog, args=' '.join(pos[:2])),
+          DELETE if drops else "")
 
 
 # Опции curl, которые съедают следующее слово или хвост связки. Имена
@@ -1636,11 +2326,18 @@ def _h_http(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     for target in outputs:
         _write_target(target, v, N_("скачивает файл"))
     if method and method not in ("GET", "HEAD", "OPTIONS"):
-        v.add(RED, _("отправляет запрос {method} в сеть").format(method=method))
+        v.add(RED, _("отправляет запрос {method} в сеть").format(method=method), PUBLISH)
+    if any("$(" in a or "`" in a for a in args):
+        # Вывод команды в адресе или заголовке уходит и запросом GET (ревью 29.10.2026).
+        v.add(RED, _("отправляет данные в сеть"), PUBLISH)
     if any(a.startswith(send_flags) for a in args if a.startswith("-")) or any(
             a.startswith("-") and not a.startswith("--") and set(a[1:]) & {"d", "F", "T"}
-            for a in args):
-        v.add(RED, _("отправляет данные в сеть"))
+            for a in args) or (prog == "curl" and (
+                # Файл настроек curl (`-K`, `--config`) задаёт и данные, и
+                # загрузку: `data = "…"` это POST (аудит guard 31.10.2026).
+                _option_values(args, "K", "--config", _CURL_VALUE_FLAGS)
+                or any(a.startswith(("--expand-data", "--expand-json")) for a in args))):
+        v.add(RED, _("отправляет данные в сеть"), PUBLISH)
     if any(a in ("-o", "-O", "--output", "--remote-name", "-P", "--output-document") or
            a.startswith(("--output=", "--output-document=")) for a in args) or prog == "wget":
         v.add(ORANGE, _("скачивает файл"))
@@ -1684,8 +2381,12 @@ def _h_pkg(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     if prog == "npx":
         v.add(ORANGE, _("запускает пакет из npm (npx)"))
         return
+    if prog in ("npm", "pnpm", "yarn") and pos[:1] == ["version"] and len(pos) > 1:
+        v.add(ORANGE, _("меняет версию проекта и делает коммит ({prog} version)").format(prog=prog))
+        return
     if pos and pos[0] in _PKG_PUBLISH and prog not in ("apt", "apt-get", "dpkg", "snap"):
-        v.add(RED, _("публикует пакет или меняет доступ к нему ({prog} {pos0})").format(prog=prog, pos0=pos[0]))
+        v.add(RED, _("публикует пакет или меняет доступ к нему ({prog} {pos0})").format(prog=prog, pos0=pos[0]),
+              PUBLISH)
         return
     if pos and pos[0] in _PKG_RUN.get(prog, ()):
         v.add(ORANGE, _("собирает или запускает код проекта ({prog} {pos0})").format(prog=prog, pos0=pos[0]))
@@ -1737,8 +2438,13 @@ def _h_schedule(prog: str, args: list[str], v: Verdict, depth: int) -> None:
 
 def _h_db(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     text = " ".join(args).upper()
-    if re.search(r"\b(DROP|DELETE|TRUNCATE|UPDATE|ALTER|INSERT|GRANT|REVOKE|CREATE|FLUSHALL|FLUSHDB|DEL)\b", text):
-        v.add(RED, _("меняет базу данных"))
+    if re.search(r"\b(DROP|DELETE|TRUNCATE|UPDATE|ALTER|INSERT|GRANT|REVOKE|CREATE|FLUSHALL|FLUSHDB|DEL|"
+                 r"UNLINK|REPLACE|DELETEMANY|DELETEONE|DROPDATABASE|FINDONEANDDELETE|REMOVE)\b|\.DROP\(", text):
+        # Строковые литералы SQL не команды: `SELECT 'DELETE'` (ревью Codex 29.10).
+        drops = re.search(r"\b(DROP|DELETE|TRUNCATE|FLUSHALL|FLUSHDB|DEL|UNLINK|REPLACE|DELETEMANY|"
+                          r"DELETEONE|DROPDATABASE|FINDONEANDDELETE|REMOVE)\b|\.DROP\(",
+                          re.sub(r"'[^']*'", "''", text))
+        v.add(RED, _("меняет базу данных"), DELETE if drops else "")
     else:
         v.add(ORANGE, _("обращается к базе данных"))
 
@@ -1781,6 +2487,8 @@ def _h_gh(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         return
     group = pos[0]
     sub = pos[1] if len(pos) > 1 else ""
+    if any(a == "--web" or a.startswith("--web=") for a in args):
+        v.add(ORANGE, _("открывает браузер (gh --web)"))
     if group == "api":
         flags = _flags(args)
         if any(a == "--cache" or a.startswith("--cache=") for a in args):
@@ -1794,13 +2502,14 @@ def _h_gh(prog: str, args: list[str], v: Verdict, depth: int) -> None:
             elif a.startswith("-X") and len(a) > 2:
                 method = a[2:].upper()
         if (method and method != "GET") or ({"-f", "-F", "--field", "--raw-field", "--input"} & flags):
-            v.add(RED, _("действие на GitHub от твоего имени (gh api)"))
+            v.add(RED, _("действие на GitHub от твоего имени (gh api)"), PUBLISH)
         return
     generic_red = {"delete", "create", "edit", "close", "archive", "remove", "set", "add",
                    "merge", "transfer", "copy", "link", "unlink", "mark-template", "item-add",
                    "item-delete", "item-edit", "item-archive", "field-create", "field-delete"}
     if sub in _GH_RED.get(group, set()) or (group not in _GH_RED and sub in generic_red):
-        v.add(RED, _("действие на GitHub от твоего имени (gh {group} {sub})").format(group=group, sub=sub))
+        v.add(RED, _("действие на GitHub от твоего имени (gh {group} {sub})").format(group=group, sub=sub),
+              PUBLISH)
     elif group not in _GH_RED and group not in ("status", "browse", "search", "help", "version",
                                                 "completion"):
         v.add(ORANGE, _("gh {group} {sub}: команда не распознана").format(group=group, sub=sub))
@@ -1817,12 +2526,19 @@ def _h_memory(prog: str, args: list[str], v: Verdict, depth: int) -> None:
         elif a.startswith("--scope="):
             scope = a.split("=", 1)[1]
     if scope == "global":
-        v.add(RED, _("меняет общие правила всех сессий (память global)"))
+        v.add(RED, _("меняет общие правила всех сессий (память global)"), GUARD)
     else:
         v.add(ORANGE, _("пишет в память ({scope})").format(scope=scope or _("область не указана")))
 
 
+def _h_ss(prog: str, args: list[str], v: Verdict, depth: int) -> None:
+    flags = _flags(args)
+    if "-K" in flags or "--kill" in flags or any(a.startswith("-") and not a.startswith("--") and "K" in a for a in args):
+        v.add(RED, _("рвёт сетевые соединения (ss -K)"))
+
+
 _HANDLERS = {
+    "ss": _h_ss,
     "rm": _h_delete, "rmdir": _h_delete, "shred": _h_delete, "truncate": _h_delete,
     "unlink": _h_delete, "dd": _h_delete, "wipefs": _h_delete,
     "cp": _h_write, "mv": _h_write, "install": _h_write, "ln": _h_write, "rsync": _h_write,
@@ -1873,12 +2589,19 @@ _PROTECTED_DIRS = (
     # Решение владельца 12.10.2026: ~/.config/systemd/user уже внутри ~/.config/systemd.
     _HOME / ".local" / "share" / "systemd" / "user", _HOME / ".aws",
     _HOME / ".config" / "environment.d", _HOME / ".claude" / "skills",
+    # Аудит guard 31.10.2026: настройки git по XDG равны ~/.gitconfig, плагины
+    # Claude Code несут хуки, агенты и команды это указания, как CLAUDE.md.
+    _HOME / ".config" / "git", _HOME / ".claude" / "plugins", _HOME / ".claude" / "agents",
+    _HOME / ".claude" / "commands",
 )
 _PROTECTED_FILES = (
     _HOME / ".bashrc", _HOME / ".profile", _HOME / ".bash_profile", _HOME / ".zshrc",
     _HOME / ".gitconfig", _HOME / ".claude" / "settings.json",
     _HOME / ".claude" / "settings.local.json", _HOME / ".claude" / "CLAUDE.md",
     _HOME / ".claude.json", _HOME / ".zshenv",  # решение владельца 12.10.2026
+    # Оболочка читает их так же, как .bashrc и .zshrc (аудит guard 31.10.2026).
+    _HOME / ".bash_aliases", _HOME / ".bash_login", _HOME / ".bash_logout",
+    _HOME / ".zprofile", _HOME / ".zlogin", _HOME / ".zlogout",
 )
 
 
@@ -1934,6 +2657,12 @@ def _protected_path(raw: str) -> bool:
         return True
     if "/.git/hooks/" in str(p) or str(p).endswith("/.git/config"):
         return True
+    # Настройки Claude Code в проекте: хуки и MCP-сервер исполнятся при следующем
+    # ране, в том числе по одобренному плану. Память `.claude/projects/` не они.
+    if p.name == ".mcp.json" or any(
+            part == ".claude" and Path(*p.parts[:i]) != _HOME and p.parts[i + 1:i + 2] != ("projects",)
+            for i, part in enumerate(p.parts)):
+        return True
     if p == _BOT_ROOT or _BOT_ROOT in p.parents:
         drafts = _BOT_ROOT / "state" / "memory-drafts"
         return not (drafts in p.parents)
@@ -1951,7 +2680,7 @@ def _classify_path(raw: str, v: Verdict) -> None:
     if _secret_path(absolute):
         v.secret = True
     if _protected_path(raw):
-        v.add(RED, _("меняет ключи, настройки, память или код бота"))
+        v.add(RED, _("меняет ключи, настройки, память или код бота"), GUARD)
         return
     v.add(ORANGE, _("пишет файл {os}").format(os=os.path.basename(raw)))
     resolved = Path(absolute)
@@ -1960,7 +2689,7 @@ def _classify_path(raw: str, v: Verdict) -> None:
     except OSError:
         real = resolved
     if real != Path(os.path.normpath(resolved)) and _protected_path(str(real)):
-        v.add(RED, _("путь ведёт по ссылке к ключам, настройкам или коду бота"))
+        v.add(RED, _("путь ведёт по ссылке к ключам, настройкам или коду бота"), GUARD)
 
 
 _MCP_RED_WORDS = frozenset({
@@ -1974,6 +2703,6 @@ def _classify_mcp(tool_name: str, v: Verdict) -> None:
     short = tool_name.split("__", 2)[-1].lower()
     words = set(re.split(r"[_\-]+", short))
     if words & _MCP_RED_WORDS:
-        v.add(RED, _("действие во внешнем сервисе от твоего имени"))
+        v.add(RED, _("действие во внешнем сервисе от твоего имени"), PUBLISH)
     else:
         v.add(ORANGE, _("меняет данные во внешнем сервисе"))

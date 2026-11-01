@@ -48,7 +48,7 @@ def silence_alert(mins: int, last: str | None = None) -> str:
 def progress_note(mins: int, steps: int, last: str | None = None) -> str:
     """Заметка «Работаю N минут»; last None: действий ещё не было."""
     return _("Работаю {mins} {unit}, "
-             "шагов {steps}, сейчас: {last}").format(
+             "шагов {steps}, сейчас: {last}. Прервать: «стоп»").format(
         mins=mins, unit=plural(mins, ("минуту", "минуты", "минут"), ("minute", "minutes")),
         steps=steps, last=last if last is not None else _("ещё не было"))
 CHAT = -100
@@ -134,11 +134,6 @@ class StatusTextTests(_Base):
     async def test_no_status_message_before_first_tool(self) -> None:
         await self.at(60)
         self.assertEqual(self.wire.sent, [])
-
-    def test_plural(self) -> None:
-        forms = ("минута", "минуты", "минут")
-        self.assertEqual([botmod._RunStatus._plural(n, forms) for n in (1, 2, 5, 10, 11, 21, 22, 25)],
-                         ["минута", "минуты", "минут", "минут", "минут", "минута", "минуты", "минут"])
 
 
 class SilenceAlertTests(_Base):
@@ -508,13 +503,13 @@ class ButtonTests(_Base):
 
     async def test_stop_cancels_like_cancel_command(self) -> None:
         self.status._alert_ids = [555]
-        cancel = AsyncMock(return_value="SIGTERM отправлен (pid=4242). SIGKILL через 5с если не выйдет.")
+        cancel = AsyncMock(return_value="⛔ Остановлено")
         update, query = self.press("stop")
         with patch.object(botmod, "_cancel_running", cancel):
             await botmod.on_run_watch_pick(update, self.ctx)
         cancel.assert_awaited_once_with(self.ctx, self.status.chat_key, self.proc)
         text = query.edit_message_text.await_args.args[0]
-        self.assertIn("🛑 SIGTERM отправлен (pid=4242)", text)
+        self.assertTrue(text.endswith("\n\n⛔ Остановлено"), text)
         # Отвеченная тревога по завершении рана не удаляется.
         self.assertEqual(self.status._alert_ids, [])
 

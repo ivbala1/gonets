@@ -47,22 +47,16 @@ class HangLinesTests(unittest.TestCase):
         self.path.write_text("# Срочное\n\nСтрока `- ГГГГ-ММ-ДД ЧЧ:ММ | что`.\n", encoding="utf-8")
         self.assertEqual(hangs.hang_lines(self.path, TODAY), [])
 
-    def test_model_line_replaced_not_doubled(self) -> None:
-        reply = "Готово.\n⏳ Висит: ответить рекрутеру с 12:29\n"
-        out = hangs.with_hangs(reply, ["⏳ Висит: x (с 12:29)"])
-        self.assertEqual(out, "Готово.\n\n⏳ Висит: x (с 12:29)")
+    def test_model_lines_removed(self) -> None:
+        self.assertEqual(hangs.strip_model_lines("Готово.\n⏳ Висит: ответить рекрутеру с 12:29\n"),
+                         "Готово.")
+        self.assertEqual(hangs.strip_model_lines("ок\n- ⏳ Висит: a\n**⏳ Висит**: b"), "ок")
 
-    def test_list_and_bold_model_lines_removed_and_cap(self) -> None:
-        out = hangs.with_hangs("ок\n- ⏳ Висит: a\n**⏳ Висит**: b", ["⏳ Висит: x (с 12:29)"])
-        self.assertEqual(out, "ок\n\n⏳ Висит: x (с 12:29)")
+    def test_lines_cap(self) -> None:
         self.path.write_text("".join(f"- 2026-10-25 1{i}:00 | дело {i}\n" for i in range(8)), encoding="utf-8")
         lines = hangs.hang_lines(self.path, TODAY)
         self.assertEqual(len(lines), hangs.MAX_LINES + 1)
         self.assertEqual(lines[-1], "⏳ Висит: и ещё 3")
-
-    def test_empty_reply_stays_empty(self) -> None:
-        self.assertEqual(hangs.with_hangs("", ["⏳ Висит: x (с 12:29)"]), "")
-        self.assertEqual(hangs.with_hangs("ок", []), "ок")
 
 
 class HangsDispatchTests(_Base):
@@ -82,6 +76,21 @@ class HangsDispatchTests(_Base):
         self.assertTrue(sent.startswith("План на вечер готов."))
         self.assertTrue(sent.endswith(")"))
         self.assertIn("⏳ Висит: ответить рекрутеру (с ", sent)
+
+    async def test_model_line_replaced_not_doubled(self) -> None:
+        self.cfg.hangs_file.write_text("- 2026-10-25 12:29 | ответить рекрутеру\n", encoding="utf-8")
+        self.answer = "Готово.\n- ⏳ Висит: ответить рекрутеру с 12:29"
+        await self.dispatch("x")
+        sent = self._sent()
+        self.assertTrue(sent.startswith("Готово.\n\n⏳ Висит: ответить рекрутеру (с "), sent)
+        self.assertEqual(sent.count("Висит"), 1)
+
+    async def test_silent_run_stays_silent(self) -> None:
+        # Пустой ответ без вопроса сообщением не становится и со строками «Висит».
+        self.cfg.hangs_file.write_text("- 2026-10-25 12:29 | ответить\n", encoding="utf-8")
+        self.answer = ""
+        await self.dispatch("x")
+        self.assertFalse(any("Висит" in str(c.args) for c in self.send_reply_text.await_args_list))
 
     async def test_ask_only_reply_gets_hangs(self) -> None:
         self.cfg.hangs_file.write_text("- 2026-10-25 12:29 | ответить рекрутеру\n", encoding="utf-8")

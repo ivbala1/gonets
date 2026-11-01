@@ -1,6 +1,8 @@
 """Append-only журнал tool-approvals. Пишется строго JSONL, одна строка = одно событие.
 
 Формат строки: {"ts": "...", "aid": "...", "tool": "...", "decision": "...", "snippet": "..."}
+и, когда известны, "sid" (сессия), "run" (запуск процесса claude, runs.py) и
+"plan" (aid карточки плана, по которой действие пропущено).
 
 append-write в < PIPE_BUF атомарно на POSIX при open("a"), так что concurrent
 вызовы из разных async-тасков безопасны без locks.
@@ -38,17 +40,21 @@ def write_event(
     tool_name: str,
     tool_input: dict[str, Any],
     decision: str,
+    session_id: str = "",
+    run_id: str = "",
+    plan: str = "",
 ) -> None:
-    line = json.dumps(
-        {
-            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "aid": approval_id,
-            "tool": tool_name,
-            "decision": decision,
-            "snippet": _snippet(tool_input),
-        },
-        ensure_ascii=False,
-    )
+    event = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "aid": approval_id,
+        "tool": tool_name,
+        "decision": decision,
+        "snippet": _snippet(tool_input),
+    }
+    for key, value in (("sid", session_id), ("run", run_id), ("plan", plan)):
+        if value:
+            event[key] = value
+    line = json.dumps(event, ensure_ascii=False)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # 0o600: snippet содержит tool-input (команды/пути/url), который может

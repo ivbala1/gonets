@@ -17,19 +17,22 @@ import argparse
 import asyncio
 import contextlib
 import difflib
+import functools
 import glob
 import hmac
 import html
-import httpx
 import ipaddress
 import json
 import logging
+import os
 import re
 import shlex
+import sys
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -38,10 +41,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application
 
-from . import audit, danger, events, mailsend, otklik
+from . import audit, danger, events, mailsend, otklik, runs
 from .burst import burst_target_key
 from .config import LOOPBACK_HOSTS, Config
 from .i18n import _, N_
+from .replies import is_unconfirmed
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +77,10 @@ _BURST_DENY_TOOLS: frozenset[str] = frozenset()
 # не списком имён: у серверов есть send_voice, send_album, edit_message,
 # send_scheduled_message, slack_send_message (ревью Codex 12.10.2026).
 _OUTBOUND_SERVERS = frozenset({"telegram", "claude_ai_Gmail", "claude_ai_Slack"})
+# Те же почта и Slack из плагинов (`plugin_engineering_gmail`), аудит guard
+# 31.10.2026. Telegram плагина отвечает своим ботом в разрешённые чаты, а не
+# аккаунтом Ивана: не сюда.
+_OUTBOUND_PLUGIN_RE = re.compile(r"plugin_[\w.-]+_(?:gmail|slack)", re.IGNORECASE)
 _OUTBOUND_VERB_RE = re.compile(r"(?:[a-z]+_)?(?:send|reply|forward|edit|post|schedule)[a-z_]*")
 # Отправка, содержимое которой карточка показать не может: пересылка
 # (переслать можно что угодно из чужого чата) и письмо по номеру черновика
@@ -82,7 +90,8 @@ _OUTBOUND_FORWARD_RE = re.compile(r"(?:[a-z]+_)?forward[a-z_]*")
 
 def _is_outbound_send(tool_name: str) -> bool:
     parts = tool_name.split("__", 2)
-    return (len(parts) == 3 and parts[0] == "mcp" and parts[1] in _OUTBOUND_SERVERS
+    return (len(parts) == 3 and parts[0] == "mcp"
+            and (parts[1] in _OUTBOUND_SERVERS or bool(_OUTBOUND_PLUGIN_RE.fullmatch(parts[1])))
             and bool(_OUTBOUND_VERB_RE.fullmatch(parts[2])))
 
 
@@ -103,6 +112,12 @@ def _outbound_refusal(tool_name: str, tool_input: dict[str, Any]) -> str | None:
 # тем же хешем, поэтому правка текста или вложения после карточки и запуск
 # мимо карточки дают отказ.
 MAILSEND_CARD_KEY = "_mailsend"
+# Карточка плана (шаг 2 карточек, решение Ивана 29.10.2026): текст плана во
+# входе карточки под этим ключом. Агент просит её командой скилла plan; права
+# выдаёт только нажатие «✅ Делай план», и только запросившему запуску (runs.py).
+PLAN_CARD_KEY = "_plan"
+# План целиком на одной карточке: Иван одобряет то, что прочёл.
+PLAN_TEXT_MAX = 2500
 # Признак исполнения mailsend, а не упоминания: запуск модулем, файл модуля
 # скриптом интерпретатора, импорт в коде (python -c, heredoc).
 _MAILSEND_RUN_RE = re.compile(
@@ -118,7 +133,7 @@ _TEXT_TOOLS = frozenset({"git", "grep", "egrep", "fgrep", "rg", "echo", "printf"
                          "sed", "head", "tail", "less", "wc", "diff", "ls"})
 # Обёртки перед настоящей командой: `timeout 60 git ...` это git.
 _CMD_WRAPPERS = frozenset({"env", "timeout", "nice", "nohup", "sudo", "exec", "command",
-                           "time", "stdbuf", "setsid"})
+                           "time", "stdbuf", "setsid", "strace", "ltrace"})
 _HEREDOC_RE = re.compile(
     r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|\Z)|\Z)", re.S)
 _MAILSEND_MODULE = "claude_tg_bot.mailsend"
@@ -266,27 +281,40 @@ def _human_size(size: int) -> str:
     return _("{size:.1f} МБ").format(size=size / 1024 / 1024)
 
 
-def _format_mailsend(mail: dict[str, Any]) -> str:
-    """Карточка письма mailsend: адресаты, тема, вложения с размером, весь текст."""
+# Адресаты на карточке отправки: строка до этого предела, длиннее с пометкой.
+_RECIPIENTS_CAP = 300
+# Вложений поимённо на карточке письма, остальные числом (все по 📄).
+_MAIL_ATTACH_SHOWN = 5
+
+
+def _format_mailsend(mail: dict[str, Any], text_cap: int = TRUNCATE_PAYLOAD) -> str:
+    """Карточка письма mailsend: адресаты, тема, вложения с размером, текст
+    до text_cap (длинная карточка ужимает текст, а не теряет письмо)."""
     if mail.get("warning"):
         return (_("⚠️ <b>команда запускает mailsend не простой формой</b>: письмо так не уйдёт, "
                   "без ✅ на карточке письма mailsend откажет. Форма для письма: "
                   "<code>{form}</code>").format(form=_esc(_MAILSEND_FORM)))
+    to, cc = ", ".join(mail.get("to") or []), ", ".join(mail.get("cc") or [])
     lines = [_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"),
-             _("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(', '.join(mail.get('to') or []), 300))]
-    if mail.get("cc"):
-        lines.append(_("копия: <code>{cc}</code>").format(cc=_esc_truncate(', '.join(mail['cc']), 300)))
+             _("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(to, _RECIPIENTS_CAP))]
+    if cc:
+        lines.append(_("копия: <code>{cc}</code>").format(cc=_esc_truncate(cc, _RECIPIENTS_CAP)))
+    if max(len(_esc(to)), len(_esc(cc))) > _RECIPIENTS_CAP:
+        lines.append(_("⚠️ <b>адресатов больше, чем видно: список целиком по 📄</b>"))
     if mail.get("reply_to"):
         lines.append(_("ответ на письмо: <code>{reply_to}</code>").format(reply_to=_esc_truncate(str(mail['reply_to']), 300)))
     lines.append(_("тема письма: {subject}").format(subject=_esc_truncate(str(mail.get('subject') or ''), 300)))
     atts = mail.get("attachments") or []
     if atts:
-        lines.append(_("вложения: ") + ", ".join(
+        shown = ", ".join(
             f"<code>{_esc_truncate(str(a.get('name')), 200)}</code> ({_human_size(int(a.get('size') or 0))})"
-            for a in atts))
+            for a in atts[:_MAIL_ATTACH_SHOWN])
+        if len(atts) > _MAIL_ATTACH_SHOWN:
+            shown += _(" и ещё {n} (все по 📄)").format(n=len(atts) - _MAIL_ATTACH_SHOWN)
+        lines.append(_("вложения: ") + shown)
     body = str(mail.get("body") or "")
-    lines.append(_("текст письма:\n<pre>{body}</pre>").format(body=_esc_truncate(body, TRUNCATE_PAYLOAD)))
-    if len(_esc(body)) > TRUNCATE_PAYLOAD:
+    lines.append(_("текст письма:\n<pre>{body}</pre>").format(body=_esc_truncate(body, text_cap)))
+    if len(_esc(body)) > text_cap:
         lines.append(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"))
     return "\n".join(lines)
 
@@ -326,6 +354,12 @@ class Pending:
     # Рабочий каталог агента из входа хука: относительный путь в команде
     # оценивается от него (ревью 11.10.2026).
     cwd: str | None = None
+    # Запуск claude, который ждёт ответа (runs.py): разрешение на план выдаётся ему.
+    run_id: str = ""
+    # Срок нажатия (time.time()): его показывает карточка (ux2, 01.11.2026).
+    deadline: float = 0.0
+    # HTML отправленной карточки: итог срока дописывается в неё правкой.
+    card_html: str = ""
 
 
 class ApprovalRegistry:
@@ -341,6 +375,7 @@ class ApprovalRegistry:
         target_thread_id: int | None = None,
         cwd: str | None = None,
         origin_key: str = "",
+        run_id: str = "",
     ) -> Pending:
         aid = uuid.uuid4().hex[:12]
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -354,6 +389,7 @@ class ApprovalRegistry:
             target_thread_id=target_thread_id,
             cwd=cwd,
             origin_key=origin_key,
+            run_id=run_id,
         )
         self._items[aid] = p
         return p
@@ -505,6 +541,8 @@ def _full_view_main(tool_name: str, tool_input: Any) -> str:
 
 
 CARD_TEXT_CAP = 3800
+# Предел текста сообщения Telegram (знаков после разбора разметки; HTML длиннее, проверка с запасом).
+TELEGRAM_TEXT_LIMIT = 4096
 
 
 def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: str | None,
@@ -516,14 +554,26 @@ def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: st
     card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id)}"
     if len(card) <= CARD_TEXT_CAP:
         return card
+    # Отправка наружу: сырой текст вместо карточки терял заголовок «от твоего
+    # имени», текст письма и адресата в конце длинной команды (аудит outbound
+    # 31.10.2026). Ужимается текст сообщения, адресаты и тема остаются.
+    mail = tool_input.get(MAILSEND_CARD_KEY) if tool_name == "Bash" and isinstance(tool_input, dict) else None
+    if (isinstance(mail, dict) and not mail.get("warning")) or (
+            _is_outbound_send(tool_name) and isinstance(tool_input, dict)):
+        for cap in (1000, 400, 100):
+            card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id, text_cap=cap)}"
+            if len(card) <= CARD_TEXT_CAP:
+                return card
     raw = full_view_text(tool_name, tool_input)
     return (f"{head}\n🛠 <b>{_esc_truncate(str(tool_name), 100)}</b>  "
             + _("<i>карточка длинная, целиком по кнопке 📄</i>") + "\n"
             f"<pre>{_esc_truncate(raw, 2500)}</pre>")
 
 
-def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: str | None) -> str:
-    """Короткое человекочитаемое описание tool call для Telegram (HTML, всё escape-нуто)."""
+def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: str | None,
+                      text_cap: int = TRUNCATE_PAYLOAD) -> str:
+    """Короткое человекочитаемое описание tool call для Telegram (HTML, всё escape-нуто).
+    text_cap: предел текста письма и сообщения на карточке отправки."""
     name = _esc(tool_name)
     header = f"🛠 <b>{name}</b>"
     if session_id:
@@ -542,8 +592,8 @@ def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: st
         mail = tool_input.get(MAILSEND_CARD_KEY)
         if isinstance(mail, dict):
             # Письмо целиком важнее команды: команда коротко, полностью по 📄.
-            return (f"{header}\n{_format_mailsend(mail)}\n{note}\n"
-                    f"<pre>{_esc_truncate(cmd, 400)}</pre>")
+            return (f"{header}\n{_format_mailsend(mail, text_cap)}\n{note}\n"
+                    f"<pre>{_esc_truncate(cmd, 400 if text_cap >= TRUNCATE_PAYLOAD else 150)}</pre>")
         body = _esc_truncate(cmd, TRUNCATE_PAYLOAD)
         return f"{header}\n{note}\n<pre>{body}</pre>"
     if tool_name == "Write":
@@ -630,7 +680,7 @@ def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: st
         body = url + (f"\n\n{prompt}" if prompt else "")
         return f"{header}\n<pre>{_esc_truncate(body, TRUNCATE_PAYLOAD)}</pre>"
     if _is_outbound_send(tool_name):
-        return f"{header}\n{_format_outbound(tool_input)}"
+        return f"{header}\n{_format_outbound(tool_input, text_cap)}"
     # generic fallback
     dumped = json.dumps(tool_input, ensure_ascii=False, indent=2)
     return f"{header}\n<pre>{_esc_truncate(dumped, TRUNCATE_PAYLOAD)}</pre>"
@@ -640,7 +690,7 @@ _OUTBOUND_TEXT_FIELDS = (("message", N_("текст")), ("text", N_("текст"
                          ("body", N_("текст письма")), ("htmlBody", N_("HTML письма")))
 
 
-def _format_outbound(tool_input: dict[str, Any]) -> str:
+def _format_outbound(tool_input: dict[str, Any], text_cap: int = TRUNCATE_PAYLOAD) -> str:
     """Карточка отправки: кому, тема, файлы, все текстовые поля. Это то, на
     что Иван даёт «ок», поэтому поля называются словами, а не JSON, и ни одно
     отправляемое поле не прячется за другим (ревью Codex 12.10.2026)."""
@@ -676,8 +726,8 @@ def _format_outbound(tool_input: dict[str, Any]) -> str:
              if tool_input.get(key) not in (None, "")]
     clipped = False
     for label, text in texts:
-        lines.append(f"{label}:\n<pre>{_esc_truncate(text, TRUNCATE_PAYLOAD)}</pre>")
-        clipped = clipped or len(_esc(text)) > TRUNCATE_PAYLOAD
+        lines.append(f"{label}:\n<pre>{_esc_truncate(text, text_cap)}</pre>")
+        clipped = clipped or len(_esc(text)) > text_cap
     if not texts and not files and not attachments:
         lines.append(_("<i>текста нет</i>"))
     if clipped:
@@ -729,7 +779,10 @@ _BASH_DANGEROUS_ARGS: dict[str, frozenset[str]] = {
     # git grep -O/--open-files-in-pager отдаёт совпадения в pager, а pager
     # исполняется shell'ом; --textconv/--ext-diff зовут настроенные фильтры.
     "git": frozenset({
-        "-O", "--open-files-in-pager", "--textconv", "--ext-diff", "-c", "--config-env",
+        # `-c` после подкоманды это счёт у grep и сводный дифф у log, а
+        # настройка `git -c` бывает только до неё, и сюда такой вызов не
+        # доходит: шаблоны требуют подкоманду сразу после git (аудит guard 31.10.2026).
+        "-O", "--open-files-in-pager", "--textconv", "--ext-diff", "--config-env",
         # git diff/log/show --output=<файл> пишет вывод в файл.
         "--output",
         # --upload-pack/--exec у fetch и ls-remote запускают программу,
@@ -740,7 +793,8 @@ _BASH_DANGEROUS_ARGS: dict[str, frozenset[str]] = {
     }),
     # sort -o/--output перезаписывает файл, --compress-program запускает бинарь.
     "sort": frozenset({"-o", "--output", "--compress-program", "--files0-from"}),
-    "tree": frozenset({"-o"}),
+    # tree -H с -R пишет 00Tree.html в каждый подкаталог (аудит 31.10.2026).
+    "tree": frozenset({"-o", "-H"}),
     # file -C компилирует базу magic и пишет magic.mgc (ревью 11.10.2026).
     "file": frozenset({"-C", "--compile"}),
     # journalctl умеет удалять и переписывать журналы, а не только читать.
@@ -918,10 +972,16 @@ def _sed_address_end(script: str, i: int) -> int:
     return i
 
 
-def _sed_script_ok(script: str) -> bool:
+def _sed_script_ok(script: str, extended: bool = False) -> bool:
     """Скрипт из команд `p`, `d`, `=`, `q`/`Q` и `s///` с флагами без `w`
     и `e`, с адресами и `!`, через `;` или перевод строки. Всё остальное
-    (`w`, `r`, `e`, `{}`, `y`, адрес `\\%re%`) значит карточка."""
+    (`w`, `r`, `e`, `{}`, `y`, адрес `\\%re%`) значит карточка.
+
+    extended (чтение по разбору danger, `_sed_args_read_ok`): ещё `y///`,
+    блоки `{}`, метки (`:a`, `b`, `t`, `T`) и команды без аргумента
+    (`n N P D g G h H x l z F`), которые там и раньше шли без карточки.
+    Метку разбор берёт не длиннее, чем sed: всё, что sed считает командой,
+    проверяется и здесь (аудит 31.10.2026)."""
     n = len(script)
     i = 0
     while True:
@@ -929,6 +989,17 @@ def _sed_script_ok(script: str) -> bool:
             i += 1
         if i >= n:
             return True
+        if script[i] == ":" and extended:
+            # Метка: до пробела, `;`, `}` или конца строки.
+            i += 1
+            while i < n and script[i] in " \t":
+                i += 1
+            start = i
+            while i < n and script[i] not in " \t;\n}":
+                i += 1
+            if i == start:
+                return False
+            continue
         j = _sed_address_end(script, i)
         if j < 0:
             return False
@@ -952,9 +1023,13 @@ def _sed_script_ok(script: str) -> bool:
         if i >= n:
             return False
         c = script[i]
-        if c in "pd=":
+        if c == "{" and extended:
+            # Блок: следующая команда идёт сразу, без `;`.
             i += 1
-        elif c in "qQ":
+            continue
+        if c in "pd=" or (extended and c in "}nNPDgGhHxzF"):
+            i += 1
+        elif c in "qQ" or (extended and c == "l"):
             i += 1
             while i < n and script[i].isdigit():
                 i += 1
@@ -973,11 +1048,30 @@ def _sed_script_ok(script: str) -> bool:
             while j < n and script[j] in _SED_S_FLAGS:
                 j += 1
             i = j
+        elif c == "y" and extended:
+            if i + 1 >= n:
+                return False
+            d = script[i + 1]
+            if d.isalnum() or d.isspace() or d == "\\":
+                return False
+            j = _sed_regex_end(script, i + 2, d, False)
+            if j < 0:
+                return False
+            j = _sed_regex_end(script, j, d, False)
+            if j < 0:
+                return False
+            i = j
+        elif c in "btT" and extended:
+            i += 1
+            while i < n and script[i] in " \t":
+                i += 1
+            while i < n and script[i] not in " \t;\n}":
+                i += 1
         else:
             return False
         while i < n and script[i] in " \t":
             i += 1
-        if i < n and script[i] not in ";\n":
+        if i < n and script[i] not in (";\n}" if extended else ";\n"):
             return False
 
 
@@ -999,12 +1093,60 @@ def _sed_is_safe(parts: list[str], segment: str) -> bool:
     return script is not None and _sed_script_ok(script)
 
 
+def _sed_args_read_ok(args: list[str]) -> bool:
+    """sed для чтения по разбору danger (`_read_program_ok`): аргументы уже
+    без кавычек. Скрипты из `-e`/`--expression` или первое слово, каждый
+    проверяет `_sed_script_ok`; флаги только списком. Регулярки danger не
+    видели `w` и `e` за адресом диапазоном, с `I` или `\\%re%`: проверено,
+    `sed -n '/a/,/b/wout' f` пишет файл, `sed '/x/Ie id' f` запускает id
+    (аудит 31.10.2026)."""
+    scripts: list[str] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional += args[i + 1:]
+            break
+        if a in ("-e", "--expression"):
+            if i + 1 >= len(args):
+                return False
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+        elif a.startswith("-e") and not a.startswith("--"):
+            scripts.append(a[2:])
+        elif a.startswith("-") and a != "-":
+            if a not in _SED_FLAGS and (a.startswith("--") or not all("-" + c in _SED_FLAGS for c in a[1:-1])):
+                return False
+            if a[-1] == "e" and not a.startswith("--"):  # склейка `-ne скрипт`
+                if i + 1 >= len(args):
+                    return False
+                scripts.append(args[i + 1])
+                i += 1
+            elif a not in _SED_FLAGS and "-" + a[-1] not in _SED_FLAGS:
+                return False
+        else:
+            positional.append(a)
+        i += 1
+    if not scripts:
+        if not positional:
+            return False
+        scripts = positional[:1]
+    return all(_sed_script_ok(s, extended=True) for s in scripts)
+
+
 # systemctl только для просмотра и только по списку флагов: `--host`/`-H`/
 # `-M` уводят команду на другую машину по ssh, а глагол-действие (restart,
 # stop, edit) меняет службы. Неизвестный флаг значит карточка.
+# `cat` и `show` без `-p` выводят `Environment=` со значениями, а там бывают
+# токены службы: `cat` карточкой, `show` только с названными свойствами без
+# секретных (`danger.systemctl_prop_secret`; ревью 29.10.2026, как `_READ_SUB`).
 _SYSTEMCTL_READ_VERBS = frozenset({
     "status", "show", "list-units", "list-timers", "list-unit-files", "is-active",
-    "is-failed", "is-enabled", "cat",
+    "is-failed", "is-enabled",
 })
 _SYSTEMCTL_FLAGS = frozenset({
     "--user", "--no-pager", "--all", "-a", "--full", "-l", "--value", "--plain",
@@ -1017,6 +1159,7 @@ def _systemctl_read_ok(parts: list[str], segment: str) -> bool:
     if _has_unquoted_glob(segment):
         return False
     verbs = []
+    props: list[str] = []
     i = 1
     while i < len(parts):
         a = parts[i]
@@ -1024,15 +1167,23 @@ def _systemctl_read_ok(parts: list[str], segment: str) -> bool:
         if a in _SYSTEMCTL_FLAGS:
             i += 1
         elif name in _SYSTEMCTL_VALUE_FLAGS and "=" in a:
+            if name in ("--property", "-p"):
+                props += a.split("=", 1)[1].split(",")
             i += 1
         elif a in _SYSTEMCTL_VALUE_FLAGS:
+            if a in ("--property", "-p"):
+                props += (parts[i + 1] if i + 1 < len(parts) else "").split(",")
             i += 2
         elif a.startswith("-"):
             return False
         else:
             verbs.append(a)
             i += 1
-    return bool(verbs) and verbs[0] in _SYSTEMCTL_READ_VERBS
+    if not verbs or verbs[0] not in _SYSTEMCTL_READ_VERBS:
+        return False
+    if verbs[0] == "show":
+        return bool(props) and not any(danger.systemctl_prop_secret(p) for p in props)
+    return True
 
 
 # gh только для чтения: пары «группа подкоманда» списком. Без `--web`/`-w`
@@ -1336,6 +1487,10 @@ def _unwrap_segment(segment: str) -> str | None:
         rest = s[m.end():]
         if m.group(0) == "rtk " and rest.startswith("grep "):
             rest = "rg " + rest[len("grep "):]
+        # `rtk test x` запускает x оболочкой, а не встроенную `test` (аудит
+        # guard 31.10.2026): после снятия rtk совпало бы с `test .*`.
+        if m.group(0).startswith("rtk") and rest.split(" ", 1)[0] in danger._RTK_SHELL:
+            return None
         s = rest
     if s == "xargs" or s.startswith("xargs "):
         try:
@@ -1374,7 +1529,7 @@ _EXTRA_READ_RE = re.compile(
     r"|git (?:rev-parse|blame|shortlog|rev-list|merge-base|show-ref|for-each-ref|cat-file"
     r"|config --get(?:-all|-regexp)?)(?: .*)?"
     r"|sleep \d+(?:\.\d+)?[smh]?"
-    r"|(?:pgrep|dig|host|diff|cmp|comm|nl|paste|rev|tac|seq|md5sum|sha1sum|sha256sum"
+    r"|(?:pgrep|dig|host|diff|cmp|comm|nl|paste|join|fold|expand|rev|tac|seq|md5sum|sha1sum|sha256sum"
     r"|id|groups|nproc|lsblk|ps|strings|od|hexdump|printf|test|getent)(?: .*)?"
     r"|ping -c ?\d+(?: .*)?"
     r"|command -v \S+(?: \S+)*"
@@ -1472,6 +1627,60 @@ def _git_branch_read_ok(parts: list[str], segment: str) -> bool:
     return list_mode or not positionals
 
 
+def _planted_git_dir(start: str | None) -> bool:
+    """По пути поиска репозитория git (каталог и его родители) стоит
+    каталог, который git сам признает голым репозиторием: HEAD, objects/ и
+    refs/ без `.git`. Его config (core.fsmonitor, diff.external) запускает
+    команды уже на `git status` и `git diff`; такие файлы агент пишет Write
+    без карточки в путях из APPROVE_WHITELIST_PATHS, где закрыт только `.git`
+    (аудит 31.10.2026, проверено на git 2.43). Обычный репозиторий с `.git`
+    поиск останавливает раньше."""
+    try:
+        d = Path(start or os.getcwd()).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True
+    for p in (d, *d.parents):
+        try:
+            if (p / ".git").exists():
+                return False
+            if (p / "HEAD").is_file() and (p / "objects").is_dir() and (p / "refs").is_dir():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _git_start_dir(args: list[str], cwd: str | None) -> str | None:
+    """Каталог, откуда git ищет репозиторий: cwd и все `-C` до подкоманды."""
+    d = cwd or os.getcwd()
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-C" and i + 1 < len(args):
+            d = os.path.join(d, os.path.expanduser(args[i + 1]))
+            i += 2
+            continue
+        i += 1
+    return d
+
+
+# Модуль запуска `python3 -m` ищется сначала в текущем каталоге: `json/`,
+# `argparse.py` или их `.pyc` там исполнятся вместо стандартных (аудит
+# 31.10.2026, проверено). Имена берутся из списка стандартной библиотеки.
+def _shadows_stdlib(cwd: str | None) -> bool:
+    try:
+        names = os.listdir(cwd or os.getcwd())
+    except OSError:
+        return True
+    stdlib = sys.stdlib_module_names
+    for name in names:
+        stem, dot, ext = name.partition(".")
+        if dot and ext.split(".")[-1] in ("py", "pyc", "so", "pyd") and stem in stdlib:
+            return True
+        if not dot and name in stdlib and os.path.exists(os.path.join(cwd or os.getcwd(), name, "__init__.py")):
+            return True
+    return False
+
+
 def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
     """False, если сегмент зовёт команду из `_BASH_DANGEROUS_ARGS` с её
     исполняющим или мутирующим флагом (`find -delete`, `fd --exec`).
@@ -1490,10 +1699,16 @@ def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
         return False  # незакрытая кавычка: решать нельзя, значит карточка
     if not parts:
         return True
+    if parts[0] == "git" and _planted_git_dir(_git_start_dir(parts[1:], cwd)):
+        return False
+    if parts[:3] == ["python3", "-m", "json.tool"] and _shadows_stdlib(cwd):
+        return False
+    if len(parts) == 2 and parts[1] == "--version":
+        return True  # `_INFO_READ` уже проверил имя; `rg` и `gh` иначе идут своим разбором
     if parts[0] == "sed":
         return _sed_is_safe(parts, segment)
-    if parts[0] == "printf" and any(p == "-v" or (p.startswith("-") and not p.startswith("--") and "v" in p)
-                                    for p in parts[1:2]):
+    if parts[0] == "printf" and (any(p == "-v" or (p.startswith("-") and not p.startswith("--") and "v" in p)
+                                     for p in parts[1:2]) or any(_PRINTF_ASSIGN_RE.search(p) for p in parts[1:])):
         # `printf -v VAR` пишет переменную оболочки, в том числе таблицу
         # команд BASH_CMDS: `ls` следующего сегмента станет `rm` (ревью Codex 13.10).
         return False
@@ -1521,7 +1736,7 @@ def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
         return _remember_args(parts, segment, None) is not None
     if parts[0] == "systemctl":
         return _systemctl_read_ok(parts, segment)
-    if parts[0] == _TASKLIST:
+    if parts[0] in (_TASKLIST, "tasklist.exe"):
         return _tasklist_read_ok(parts, segment)
     if parts[0] == "iconv":
         return _iconv_read_ok(parts, segment)
@@ -1551,10 +1766,7 @@ def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
         # getopt_long и git parse-options принимают однозначное сокращение
         # длинного флага: `sort --out=f` это `--output=f`, `git grep --open=x`
         # это `--open-files-in-pager=x`. Поэтому запрещён и любой префикс.
-        name = p.split("=", 1)[0]
-        if name.startswith("--") and len(name) > 2 and any(
-            b.startswith(name) for b in banned if b.startswith("--")
-        ):
+        if any(danger.long_flag(p, b) for b in banned):
             return False
         if banned_short and p.startswith("-") and not p.startswith("--"):
             if any(c in banned_short for c in p[1:]):
@@ -1662,7 +1874,8 @@ def _segment_touches_secret(segment: str, cwd: str | None = None) -> bool:
             # (решение владельца 14.10.2026).
             if any(m.startswith("-") for m in matches):
                 return True
-            if any(danger._secret_path(p, cwd) for p in matches):
+            if any(danger._secret_path(p, cwd) for p in matches) and not (
+                    parts and danger._program(parts[0]) in danger.METADATA_ONLY):
                 return True
     return danger._reads_secret(parts, cwd) or danger._searches_tree(parts, cwd)
 
@@ -1781,7 +1994,7 @@ def _bash_auto_allowed(command: str, bash_re: re.Pattern[str] | None,
     чтения памяти, встроенного списка чтения (`_EXTRA_READ_RE`) и команд
     APPROVE_BASH_AUTO_ALLOW_REGEX (`bash_re`, если задан)."""
     patterns = [_SKILL_CALL_RE, _MEMORY_READ_RE, _SYSTEM_READ_RE, _EXTRA_READ_RE, _NET_READ_RE,
-                _TWO_MIND_RE]
+                _TWO_MIND_RE, _INFO_READ_RE]
     if bash_re is not None:
         patterns.append(bash_re)
     return _bash_command_is_safe(command, *patterns, cwd=cwd)
@@ -1846,15 +2059,11 @@ def _iconv_read_ok(parts: list[str], segment: str) -> bool:
 # Чтение этапа плана: свой неизменный список, без APPROVE_BASH_AUTO_ALLOW_REGEX
 # (настройка может разрешать и запись) и без вызовов скиллов бота (скилл
 # действует, а не читает). Ревью Codex 13.10.2026.
-_PLAN_READ_RE = re.compile(
-    r"(?:ls|pwd|cd|find|fd|fdfind|tree|realpath|readlink|basename|dirname|whoami|date|hostname"
-    r"|uname|uptime|head|tail|wc|cat|grep|rg|jq|which|type|echo|file|stat|du|df|free|cut|sort"
-    r"|uniq|column|tr|true|false|journalctl)(?: .*)?"
-    r"|systemctl --user (?:status|is-active|is-failed|list-units|list-timers|cat)(?: .*)?"
-    r"|git (?:status|diff|log|show|branch|remote -v|ls-files|describe|stash list|grep)(?: .*)?"
-    r"|tailscale (?:status|ip|version)(?: .*)?|ss(?: -[ltunpaeHmio]+)*"
+# Сведения о программах и системе с разбором флагов: этап плана их пускает,
+# и в обычном чате они шли карточкой (аудит guard 31.10.2026).
+_INFO_READ = (
     # Настройки serve/funnel только показом: `tailscale serve <порт>` публикует.
-    r"|tailscale (?:serve|funnel) status(?: --json)?"
+    r"tailscale (?:serve|funnel) status(?: --json)?"
     # Версия установленной программы: имя без пути, только `--version`
     # (`npm version` и `-V` у части программ значат другое).
     r"|[a-z][a-z0-9._+-]* --version"
@@ -1865,9 +2074,19 @@ _PLAN_READ_RE = re.compile(
     rf"|(?:(?:{_HOME_RE}/\.local|/usr(?:/local)?)/bin/)?"
     r"(?:agent-browser|chrome-relay|tailscale|claude|codex|restic) --(?:help|version)"
     # Список процессов Windows: флаги разбирает `_tasklist_read_ok`.
-    rf"|{re.escape(_TASKLIST)}(?: .*)?"
+    rf"|(?:{re.escape(_TASKLIST.rsplit('/', 1)[0])}/)?tasklist\.exe(?: .*)?"
     # Перекодировка в stdout: флаги разбирает `_iconv_read_ok` (без `-o`).
     r"|iconv(?: .*)?"
+)
+_INFO_READ_RE = re.compile(_INFO_READ)
+_PLAN_READ_RE = re.compile(
+    r"(?:ls|pwd|cd|find|fd|fdfind|tree|realpath|readlink|basename|dirname|whoami|date|hostname"
+    r"|uname|uptime|head|tail|wc|cat|grep|rg|jq|which|type|echo|file|stat|du|df|free|cut|sort"
+    r"|uniq|column|tr|true|false|journalctl)(?: .*)?"
+    r"|systemctl --user (?:status|is-active|is-failed|list-units|list-timers|cat)(?: .*)?"
+    r"|git (?:status|diff|log|show|branch|remote -v|ls-files|describe|stash list|grep)(?: .*)?"
+    r"|tailscale (?:status|ip|version)(?: .*)?|ss(?: -[ltunpaeHmio]+)*"
+    rf"|{_INFO_READ}"
     # GitHub только чтением: подкоманды разбирают `_gh_read_ok` и
     # `_gh_api_read_ok` (GET без полей и `--input`), как в обычном чате.
     r"|gh (?:pr|issue|run|release|repo|api) .*"
@@ -2174,6 +2393,379 @@ def _chat_auto_allowed(
     return target is not None and target_key in keys
 
 
+# Чтение без карточки (решение Ивана 29.10.2026: карточка на изменение и
+# отправку, а не на чтение). Мало разбора danger.py: его обработчики пускают
+# незнакомые подкоманды (`git branch x`, `docker context use`, `env -S...`),
+# поэтому каждая программа команды ещё сверяется со списком читающих ниже
+# (ревью Codex 29.10). Незнакомое идёт карточкой, как раньше.
+_READ_PLAIN = frozenset({
+    "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "wc", "cut", "tr", "sort",
+    "jq", "diff", "cmp", "stat", "du", "df", "free", "pwd", "cd", "date", "whoami",
+    "hostname", "uname", "uptime", "which", "type", "echo", "printf", "true", "false", "test",
+    "[", "realpath", "readlink", "basename", "dirname", "ps", "pgrep", "base64", "od",
+    "hexdump", "strings", "md5sum", "sha256sum", "column", "nl", "paste", "comm", "seq",
+    "find", "tree", "rtk", ":", "id", "groups", "nproc", "lscpu", "lsblk", "findmnt",
+    "locale", "getent", "zcat", "zgrep", "journalctl", "sleep",
+    # Аудит 31.10.2026: запись у xxd (второй операнд) и file -C разбор danger
+    # красит, они идут карточкой.
+    "file", "xxd", "lsof", "netstat",
+    # Сведения о системе (П2 из guard-2.md, задание guard2): только показ.
+    "w", "who", "last", "vmstat", "iostat", "lsusb", "lspci", "printenv",
+    # Обёртка: флаги разбирает danger._tracer_command, вложенную команду проверяет этот же список.
+    "strace", "ltrace",
+})
+# Пакеты и сеансы только показом, флаги списком: `--index-url`, `--registry`,
+# `--userconfig` уводят запрос или настройки, `-H` на другую машину.
+_READ_PKG = {
+    ("pip", "list"): frozenset({"-o", "--outdated", "-u", "--uptodate", "-l", "--local", "--user",
+                                "-e", "--editable", "--not-required", "--format=json",
+                                "--format=columns", "--format=freeze"}),
+    ("pip", "show"): frozenset({"-f", "--files", "-v", "--verbose"}),
+    ("pip", "freeze"): frozenset({"--all", "-l", "--local", "--user"}),
+    ("npm", "ls"): frozenset({"--all", "-a", "--json", "--long", "-l", "--parseable", "-p",
+                              "--global", "-g", "--depth=0", "--depth=1", "--depth=2"}),
+    ("npm", "list"): frozenset({"--all", "-a", "--json", "--long", "-l", "--parseable", "-p",
+                                "--global", "-g", "--depth=0", "--depth=1", "--depth=2"}),
+    ("npm", "view"): frozenset({"--json"}),
+    ("loginctl", "list-sessions"): frozenset({"--no-pager", "--no-legend"}),
+    ("loginctl", "list-users"): frozenset({"--no-pager", "--no-legend"}),
+    ("resolvectl", "status"): frozenset({"--no-pager"}),
+}
+# Присваивания перед командой, которые ничего не пишут и не запускают:
+# GIT_TRACE=файл пишет, HOME или XDG_CONFIG_HOME подменяют конфиг с командами.
+_READ_ASSIGN_OK = frozenset({"TZ", "LC_ALL", "LANG", "LC_MESSAGES", "RTK_DISABLED", "NO_COLOR"})
+# Секрет в выводе или в запросе: переменная с секретным именем и файлы с
+# ключами, которых разбор danger.py не знает (ревью 29.10.2026).
+_READ_SECRETISH_RE = re.compile(
+    r"\$\{?[A-Za-z_]*(?:TOKEN|KEY|SECRET|PASS|AUTH|CRED|COOKIE|SESSION)[A-Za-z_0-9]*"
+    r"|\.claude\.json|ssh_host_\w*key|wireguard|\.my\.cnf|bitwarden|\.age/|/sops/|k3s\.yaml"
+    r"|kubernetes/admin\.conf|k3s/server/token|\.msmtprc|gcloud|tfstate|service-account"
+    r"|\.netrc|\.pgpass|\.npmrc|\.pypirc|\.docker/config\.json|credentials|token\.json",
+    re.IGNORECASE)
+# Переменная в аргументах раскрывается после проверки: `sort $FLAGS f` при
+# FLAGS='-o x' пишет файл (ревью Codex 29.10). Пускаем только безобидные.
+_READ_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
+_READ_VARS_OK = danger.PLAIN_VARS
+# printf '%n' VAR присваивает переменной, как -v (ревью Codex 29.10).
+_PRINTF_ASSIGN_RE = re.compile(r"%[-+ #0-9.*]*n")
+_READ_SUB = {
+    "git": frozenset({"log", "status", "diff", "show", "blame", "rev-parse", "ls-files",
+                      "ls-tree", "cat-file", "grep", "describe", "shortlog", "rev-list",
+                      "merge-base", "show-ref", "count-objects"}),
+    # docker inspect и systemctl cat/show показывают окружение со значениями
+    # секретов, kubectl cluster-info dump пишет файлы (ревью 29.10.2026).
+    "docker": frozenset({"ps", "logs", "images", "version", "info", "port", "top"}),
+    "systemctl": frozenset({"status", "is-active", "is-enabled", "is-failed",
+                            "list-units", "list-timers", "list-unit-files"}),
+    "kubectl": frozenset({"get", "describe", "logs", "top", "version", "explain",
+                          "api-resources"}),
+}
+_DOCKER_COMPOSE_READ = frozenset({"ps", "logs", "ls", "version", "images", "top"})
+_GH_READ_GROUPS = frozenset({"pr", "issue", "run", "repo", "release", "workflow"})
+_GH_READ_ACTIONS = frozenset({"view", "list", "diff", "checks", "status"})
+# Флаги, которые у git запускают программы или пишут файлы.
+# `git -p` здесь не нужен: до подкоманды пускаем только -C и --no-pager, а
+# после неё -p это обычный `git log -p`.
+# `-c` до подкоманды отсекает проверка общих флагов ниже, после неё это
+# счёт и сводный дифф (аудит guard 31.10.2026).
+_GIT_UNSAFE = ("--config-env", "--exec-path", "--output", "-O", "--open-files-in-pager",
+               "--ext-diff", "--textconv", "--paginate")
+# `git ls-remote` только показывает ссылки; `--upload-pack` запускает программу.
+_GIT_LS_REMOTE_FLAGS = frozenset({"--heads", "--tags", "--refs", "--branches", "-h", "-t", "-b",
+                                  "-q", "--quiet", "--get-url", "--symref"})
+# git grep за пределами отслеживаемого читает `.env`, сокращения git принимает.
+_GIT_READS_UNTRACKED = ("--no-index", "--untracked")
+# curl без записи и отправки: только эти флаги (короткие можно склеивать).
+_READ_CURL_SAFE_SHORT = frozenset("sSLIifvk")
+_READ_CURL_SAFE_LONG = frozenset({"--silent", "--show-error", "--location", "--head", "--include",
+                             "--fail", "--verbose", "--insecure", "--compressed"})
+_READ_CURL_VALUE = frozenset({"-m", "--max-time", "--connect-timeout", "-w", "--write-out", "-H",
+                         "--header", "-A", "--user-agent", "--retry"})
+
+
+def _words(args: list[str], value_flags: frozenset[str] = frozenset()) -> list[str]:
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a in value_flags:
+            skip = True
+        elif not a.startswith("-"):
+            out.append(a)
+    return out
+
+
+def _curl_args_read_ok(args: list[str]) -> bool:
+    skip = False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a in _READ_CURL_VALUE:
+            skip = True
+            if args[i + 1:i + 2] and args[i + 1].startswith("@"):
+                return False  # -w @файл, -H @файл: содержимое файла не проверено
+        elif a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if name in _READ_CURL_VALUE and "=" in a:
+                if a.split("=", 1)[1].startswith("@"):
+                    return False
+                continue
+            if a not in _READ_CURL_SAFE_LONG:
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            if not set(a[1:]) <= _READ_CURL_SAFE_SHORT:
+                return False
+        elif any(c in a for c in "{}[]") or not _curl_url_ok(a):
+            return False  # curl раскрывает `{a,localhost}` сам, как в `_curl_read_ok`
+    return True
+
+
+def _read_program_ok(prog: str, args: list[str]) -> bool:
+    if prog == "=":
+        return args[0].split("=", 1)[0] in _READ_ASSIGN_OK
+    if prog == "printf" and any(a.startswith("-v") or _PRINTF_ASSIGN_RE.search(a) for a in args):
+        return False  # printf -v 'BASH_CMDS[ls]' и %n присваивают (ревью Codex 13.10, 29.10)
+    if prog == "sort" and any(danger.long_flag(a, "--compress-program", 5)
+                              or danger.long_flag(a, "--temporary-directory", 4)
+                              or (a.startswith("-") and not a.startswith("--") and "T" in a)
+                              for a in args):
+        return False  # сокращение --compress-program и временные файлы в чужом каталоге
+    if prog in _READ_PLAIN:
+        return True
+    if prog == "uv" and args[:1] == ["pip"]:
+        prog, args = "pip", args[1:]
+    if prog in ("pip", "pip3", "npm", "loginctl", "resolvectl") and args:
+        allowed = _READ_PKG.get(("pip" if prog == "pip3" else prog, args[0]))
+        if prog == "npm" and args[0] == "view" and not all(
+                re.fullmatch(r"(?:@[\w.-]+/)?\w[\w.-]*(?:@[\w.^~<>=*-]+)?", a) for a in args[1:] if not a.startswith("-")):
+            return False  # адрес, путь или git вместо имени пакета: npm пойдёт туда
+        return allowed is not None and all(a in allowed or not a.startswith("-") for a in args[1:])
+    if prog in ("timedatectl", "hostnamectl"):
+        # Действия красит danger; `--host` и `--machine` уводят на другую машину.
+        return not any((a.startswith(("--h", "--m")) and a != "--help")
+                       or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & {"H", "M"})
+                       for a in args)
+    if prog == "sed":
+        return _sed_args_read_ok(args)
+    if prog == "git":
+        if any(a == f or a.startswith(f + "=") for a in args for f in _GIT_UNSAFE):
+            return False
+        if any(danger.long_flag(a, flag, 6) for a in args for flag in _GIT_READS_UNTRACKED):
+            return False
+        # До подкоманды только -C и --no-pager: прочие общие флаги берут
+        # значение (`git --namespace log config x y` выполняет config).
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            if rest[0] == "-C" and len(rest) > 1:
+                rest = rest[2:]
+            elif rest[0] in ("--no-pager", "-P"):
+                rest = rest[1:]
+            else:
+                return False
+        if rest[:1] == ["ls-remote"]:
+            # Только имя настроенного удалённого: адрес в команде это сеть
+            # мимо `_curl_url_ok`, в том числе локальная (ревью слияния 01.11.2026).
+            # `--get-url` печатает адрес и в сеть не ходит.
+            words = [a for a in rest[1:] if not a.startswith("-") and "--get-url" not in rest]
+            return (all(a in _GIT_LS_REMOTE_FLAGS or a.startswith("--sort=") or not a.startswith("-")
+                        for a in rest[1:])
+                    and (not words or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", words[0]) is not None))
+        if rest[:1] in (["tag"], ["stash"], ["worktree"]):
+            return danger.git_listing(rest[0], rest[1:])
+        if rest[:1] == ["reflog"]:
+            # Только показ: подкоманды drop, write, expire, delete меняют журнал.
+            return rest[1:2] == ["show"] or not rest[1:] or rest[1].startswith("-")
+        return bool(rest) and rest[0] in _READ_SUB["git"]
+    if prog == "gh":
+        if any(a in ("-w", "--web") or a.startswith("--web=") for a in args):
+            return False
+        words = _words(args, frozenset({"-R", "--repo", "--jq", "-q", "-t", "--template",
+                                        "-H", "--header", "-L", "--limit", "-s", "--state",
+                                        "--json", "-A", "--author", "-b", "--branch"}))
+        if words[:1] == ["api"]:
+            return True
+        return len(words) >= 2 and words[0] in _GH_READ_GROUPS and words[1] in _GH_READ_ACTIONS
+    if prog == "docker" and any(a.startswith("--host") or (a.startswith("-H") and a != "-H") for a in args):
+        return False  # чужой демон
+    if prog == "docker" and _words(args)[:1] == ["compose"]:
+        if any("://" in a for a in args):
+            return False  # файл compose по адресу: чужое содержимое
+        words = _words(args, frozenset({"-f", "--file", "-p", "--project-name"}))
+        return len(words) >= 2 and words[1] in _DOCKER_COMPOSE_READ
+    if prog == "kubectl" and any(a.startswith(("--kubeconfig", "--raw", "--server"))
+                                 or (a.startswith("-s") and not a.startswith("--"))
+                                 or "secret" in a.lower() for a in args):
+        return False  # exec-плагин kubeconfig; секреты кластера; `--server` унёс бы токен на чужой адрес
+    if prog in _READ_SUB:
+        words = _words(args, frozenset({"-n", "--namespace", "-o", "--output", "-l",
+                                        "--selector", "--tail", "--since", "-p", "--property",
+                                        "--format", "-f"}) if prog != "git" else frozenset())
+        return bool(words) and words[0] in _READ_SUB[prog]
+    if prog == "curl":
+        return _curl_args_read_ok(args)
+    return False
+
+
+def _mask_single_quoted(command: str) -> str:
+    """Текст в одинарных кавычках заменён на `x`; в двойных `$` раскрывается
+    и остаётся как есть."""
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+                out.append(ch)
+            else:
+                out.append("x")
+        elif ch == "\\" and i + 1 < len(command):
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        else:
+            if ch == '"':
+                quote = None if quote == '"' else '"'
+            elif ch == "'" and quote is None:
+                quote = "'"
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _glob_hits_option(command: str, cwd: str | None) -> bool:
+    """Шаблон вне кавычек раскроется в имя, похожее на флаг: bash делает это
+    после проверки, и `find *` в каталоге с файлом `-fprint` затирает
+    соседний файл списком (аудит 31.10.2026, проверено). Без каталога агента
+    раскрытие не проверить, значит карточка. Операторы оболочки вне кавычек
+    заменены пробелами, чтобы `find *|head` дал слово `*`."""
+    mask = danger._quote_mask(command)
+    plain = "".join(" " if m == c and c in ";|&()<>" else c for m, c in zip(mask, command))
+    words = _bash_words(plain)
+    if words is None:
+        return True
+    for word in words:
+        if not any(ch in "*?[" and not quoted for ch, quoted in word):
+            continue
+        if not cwd:
+            return True
+        raw = "".join(ch for ch, _unused in word)
+        try:
+            matches = glob.glob(os.path.expanduser(raw), root_dir=cwd)
+        except (OSError, ValueError):
+            return True
+        if any(m.startswith("-") for m in matches):
+            return True
+    return False
+
+
+# Цикл целиком: `for x in слова; do тело; done`, за ним только конвейер. Слова
+# без подстановок, кавычки только парой вокруг всего слова. Разбор по маске
+# кавычек; перевод строки, `#` и `\\` разобрали бы оболочка и этот разбор
+# по-разному, такие циклы идут карточкой. Имя строчными: `for PATH in ./bin`
+# меняет, откуда запускаются программы тела.
+_FOR_LOOP_RE = re.compile(
+    r"for ([a-z]\w*) in ([^;]+?)\s*;\s*do\s+(.+?)\s*;\s*done"
+    r"(?:\s+2>/dev/null)?(?:\s*\|\s*(?P<pipe>.+))?")
+_FOR_WORD_RE = re.compile(r"[\w./@%+,:=-]+")
+_FOR_GLOB_RE = re.compile(r"[\w./@%+,:=*?-]+")
+# `cd` сдвинул бы каталог между проходами мимо проверки шаблонов; сеть вынесла бы
+# значения цикла (имена файлов) наружу обычным чтением.
+_FOR_INNER_RE = re.compile(r"\b(?:for|while|until|do|done|select|eval|cd|pushd|popd"
+                           r"|curl|wget|dig|host|nslookup|ping|gh|ssh|nc|ncat|kubectl|docker|git)\b")
+_FOR_MAX_STEPS = 64
+_FOR_ANY_RE = re.compile(r"\b(?:for|select)\s+\w+\s+in\b")
+
+
+def _for_loop_steps(command: str, cwd: str | None) -> list[str] | None:
+    """Цикл `for` с простым телом как обычные команды: тело с подставленным
+    значением на каждый проход и конвейер после `done`, каждую проверяет
+    `_danger_read_ok` как есть, с секретами и флагами в значениях. None: не
+    такой цикл, карточка. Значения только из безобидных знаков: подстановка
+    в кавычках и без них даёт одно и то же слово. Шаблон раскрывается здесь;
+    файл с другими знаками в имени цикл не пропускает. Имя переменной в теле
+    вне `$x` и `${x}` значит присваивание (`f=.env`, `read f`)."""
+    text = command.strip()
+    if any(c in text for c in "\n#\\"):
+        return None
+    m = _FOR_LOOP_RE.fullmatch(danger._quote_mask(text))
+    if m is None or m.group(1).endswith("_proxy") or _FOR_INNER_RE.search(m.group(3)):
+        return None
+    name, words, body = m.group(1), text[m.start(2):m.end(2)], text[m.start(3):m.end(3)]
+    use = re.compile(rf"\$(?:{name}\b|\{{{name}\}})")
+    if re.search(rf"\b{name}\b", use.sub("", body)):
+        return None
+    if len(use.findall(_mask_single_quoted(body))) != len(use.findall(body)):
+        return None  # `sed '$e'`: оболочка значение не подставит, проверка бы подставила
+    values: list[str] = []
+    for word in words.split():
+        quoted = len(word) > 2 and word[0] == word[-1] and word[0] in "'\""
+        if quoted:
+            word = word[1:-1]
+        if _FOR_WORD_RE.fullmatch(word):
+            values.append(word)
+        elif quoted or not _FOR_GLOB_RE.fullmatch(word):
+            return None
+        else:
+            values.extend(sorted(glob.glob(word, root_dir=cwd or os.getcwd())) or [word])
+    if not values or len(values) > _FOR_MAX_STEPS or not all(_FOR_GLOB_RE.fullmatch(v) for v in values):
+        return None
+    steps = [use.sub(value, body) for value in values]
+    return [*steps, text[m.start("pipe"):]] if m.group("pipe") else steps
+
+
+def _danger_read_ok(command: str, cwd: str | None = None) -> bool:
+    """Команда только читает: разбор danger.py не нашёл записи, запуска
+    незнакомого и отправки, секрет она не трогает, и каждая её программа из
+    списка читающих (`_read_program_ok`). Замер по 686 карточкам с апреля:
+    среди 198 команд уровня «опасного не нашёл» изменений и отправок нет."""
+    if _READ_SECRETISH_RE.search(command):
+        return False
+    loop = _for_loop_steps(command, cwd)
+    if loop:
+        return all(_danger_read_ok(step, cwd) for step in loop)
+    if _FOR_ANY_RE.search(danger._quote_mask(command)):
+        return False  # цикл, который разбор выше не взял: его переменные меняют чужое
+    # Внутри одинарных кавычек `$` не раскрывается: `sed -n '$p'` и
+    # `awk '{print $1}'` не переменные (аудит 31.10.2026).
+    unquoted = _mask_single_quoted(command)
+    used = {m.group(1) for m in _READ_VAR_RE.finditer(unquoted)}
+    if used - _READ_VARS_OK:
+        return False
+    # Значение задано в самой команде: `LANG=-delete; find . $LANG`,
+    # `for HOME in -delete; do find . $HOME; done` (ревью слияния 01.11.2026).
+    if used and re.search(rf"\b(?:{'|'.join(sorted(used))})=|\bfor\s+(?:{'|'.join(sorted(used))})\b", unquoted):
+        return False
+    # `${PWD@P}` раскрывает значение как приглашение, с $(…) из имени каталога;
+    # прочие операторы тоже не нужны чтению (аудит guard 31.10.2026).
+    if re.search(r"\$\{(?![A-Za-z_][A-Za-z0-9_]*\})", command):
+        return False
+    # ANSI-C и локализованные кавычки: shlex их не раскрывает (ревью Codex 29.10).
+    # По маске кавычек: `grep 'foo$' f` это конец шаблона, а не такая кавычка.
+    mask = danger._quote_mask(command)
+    if "$'" in mask or '$"' in mask:
+        return False
+    try:
+        verdict = danger.classify("Bash", {"command": command}, cwd)
+    except Exception:
+        log.exception("danger.classify failed in read check")
+        return False
+    if verdict.level != danger.YELLOW or verdict.secret or not verdict.programs:
+        return False
+    if {"strace", "ltrace"} & {prog for prog, _args in verdict.programs} and not all(
+            prog in _READ_PLAIN for prog, _args in verdict.programs):
+        return False  # в вывод попало бы чтение настроек: kubeconfig, .git/config
+    if _glob_hits_option(command, cwd):
+        return False
+    if _searches_tree(verdict, command, cwd):
+        return False  # обход дерева читает `.env` (решение владельца 14.10.2026)
+    if any(prog == "git" and _planted_git_dir(_git_start_dir(args, step_cwd))
+           for prog, args, step_cwd in _steps(verdict, cwd)):
+        return False
+    return all(_read_program_ok(prog, args) for prog, args in verdict.programs)
+
+
 def _touches_secret(tool_name: str, tool_input: dict, cwd: str | None) -> bool:
     """Команда или правка может прочитать или записать секрет (danger.Verdict.secret).
     Такое автоаппрув чата и выполнение задачи не пропускают: идёт карточкой
@@ -2198,8 +2790,16 @@ def _whitelist_target_ok(target: Path, state_dir: Path) -> bool:
     и плагины Obsidian (JavaScript, его исполняет приложение) это запуск
     кода, а не правка заметок. С 06.10.2026 в списке всё хранилище Obsidian.
     Так же `.codex`: настройки и хуки проекта Codex запускают команды, а
-    /2mind зовёт Codex без карточки (ревью Codex 14.10.2026)."""
-    if any(part in (".git", ".obsidian", ".codex") for part in target.parts):
+    /2mind зовёт Codex без карточки (ревью Codex 14.10.2026).
+
+    Так же `.claude` (настройки с хуками, агенты, команды, плагины проекта
+    исполняются при следующем ране) и `.mcp.json` (запуск MCP-сервера), кроме
+    `.claude/projects/`: там память, её пишут без карточки (задание guard2,
+    11.2026)."""
+    parts = target.parts
+    if any(part in (".git", ".obsidian", ".codex") for part in parts) or ".mcp.json" in parts:
+        return False
+    if any(part == ".claude" and parts[i + 1:i + 2] != ("projects",) for i, part in enumerate(parts)):
         return False
     if target != _BOT_ROOT and _BOT_ROOT not in target.parents:
         return True
@@ -2248,6 +2848,179 @@ def _otklik_match(cfg: Config, pending: Pending, chat_id: int,
     return None
 
 
+_PLAN_SKILL = "claude_tg_bot.skills.plan"
+# Ровно одна форма: путь питона, модуль и текст в одинарных кавычках до конца
+# команды. Внутри одинарных кавычек оболочка ничего не раскрывает, перевод
+# строки и прочие связки вне кавычек не проходят (ревью Codex 29.10: shlex
+# принимал `скилл\nпрограмма` за четыре слова).
+_PLAN_CALL_RE = re.compile(
+    re.escape(str(_SKILL_PYTHON)) + " -m " + re.escape(_PLAN_SKILL) + r" '([^']*)'"
+)
+
+
+def _plan_request(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str] | None:
+    """Запрос карточки плана: ("ok", текст плана) или ("bad", причина отказа).
+    None: команда скилл плана не запускает.
+
+    Текст на карточке тот же, что получит скилл, и ничего, кроме скилла, не
+    исполняется (ревью Codex 29.10)."""
+    if tool_name != "Bash":
+        return None
+    command = str(tool_input.get("command", ""))
+    try:
+        words = shlex.split(command, comments=False)
+    except ValueError:
+        words = []
+    # Запуск модуля после снятия кавычек (`skills.pl""an` тоже он); упоминание
+    # в поиске или пути файла не запрос.
+    runs_module = any(w == "-m" + _PLAN_SKILL or (w == _PLAN_SKILL and i and words[i - 1] == "-m")
+                      for i, w in enumerate(words))
+    if not runs_module and not (not words and f"-m {_PLAN_SKILL}" in command):
+        return None
+    m = _PLAN_CALL_RE.fullmatch(command.strip())
+    if m is None:
+        return ("bad", _("карточку плана проси одной отдельной командой: {python} -m {skill} "
+                         "'<текст плана>', текст в одинарных кавычках без одинарной кавычки "
+                         "внутри, без других команд").format(python=_SKILL_PYTHON, skill=_PLAN_SKILL))
+    text = m.group(1).strip()
+    if not text:
+        return ("bad", _("план пуст: напиши, что сделаешь, где и чем проверишь"))
+    # Карточка не длиннее предела Telegram после экранирования HTML.
+    if len(text) > PLAN_TEXT_MAX or len(_esc(text)) > PLAN_TEXT_MAX + 1000:
+        return ("bad", _("план длиннее {n} знаков: сократи до главного (что, где, чем проверишь)")
+                .format(n=PLAN_TEXT_MAX))
+    return ("ok", text)
+
+
+# Метки danger.py, с которыми действие и при одобренном плане идёт карточкой.
+_PLAN_CARD_TAGS = frozenset({danger.DELETE, danger.HISTORY, danger.PUBLISH, danger.POWER,
+                             danger.DISK, danger.GUARD, danger.FETCH_EXEC, danger.UNPARSED})
+
+
+def _absolute(word: str, cwd: str | None) -> str | None:
+    path = os.path.expanduser(danger._HOME_VAR_RE.sub(lambda _m: str(Path.home()), word))
+    if path.startswith("/"):
+        return path
+    return os.path.join(cwd, path) if cwd else None
+
+
+def _steps(verdict: danger.Verdict, cwd: str | None) -> Iterator[tuple[str, list[str], str | None]]:
+    """Программы команды с их каталогом: cd и pushd меняют его следующим звеньям."""
+    for prog, args in verdict.programs:
+        yield prog, args, cwd
+        if prog in ("cd", "pushd"):
+            target = next((a for a in args if a == "-" or not a.startswith("-")), "~")
+            cwd = None if target == "-" else _absolute(target, cwd)
+
+
+# rg без пути после конвейера читает поток, а не каталог: `ps aux | rg bot`.
+# `||` не конвейер: `true || rg foo` ищет по текущему каталогу (корпус guard2, 11.2026).
+_PIPED_RG_RE = re.compile(r"(?<!\|)\|(?!\|)&?\s*(?:rtk\s+(?:proxy\s+rg|rg|grep)|rg)\b")
+
+
+def _searches_tree(verdict: danger.Verdict, command: str, cwd: str | None) -> bool:
+    piped = len(_PIPED_RG_RE.findall(danger._quote_mask(command)))
+    for prog, args, step_cwd in _steps(verdict, cwd):
+        if prog in ("rg", "ripgrep") and piped and danger._rg_roots(args) == ["."]:
+            piped -= 1
+        elif danger._searches_tree(["grep" if prog == "zgrep" else prog, *args], step_cwd):
+            return True
+    return False
+
+
+_SSH_VALUE_FLAGS = frozenset({"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c",
+                              "-E", "-e", "-I", "-m", "-O", "-Q", "-S", "-w", "-B"})
+_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", "(", ")", ";;"})
+
+
+def _ssh_stdin_hosts(command: str) -> set[str]:
+    """Хосты ssh, которым команда отдаёт данные на вход: конвейером (`tar …
+    | ssh host 'cat > f'`) или перенаправлением (`ssh host psql < dump.sql`).
+    Это то же копирование на хост, что scp, и по плану без карточки идёт
+    только на названный в нём хост (аудит 31.10.2026)."""
+    tokens = danger._tokenize(danger._newlines_to_separators(command))
+    if tokens is None:
+        return set()
+    hosts: set[str] = set()
+    seg: list[str] = []
+    fed_by_pipe = False
+    for tok in [*tokens, ";"]:
+        if tok not in _SHELL_SEPARATORS:
+            seg.append(tok)
+            continue
+        words = [t for t in seg if not danger._ASSIGN_RE.match(t)] if seg else []
+        has_input = any(t in ("<", "<<", "<<<", "<>") for t in seg)
+        # ssh не обязательно первым словом: `env ssh`, `timeout 5 ssh`. Разбирается
+        # каждое такое слово: в `env -u ssh ssh host` первое это значение флага.
+        starts = [k for k, w in enumerate(words) if danger._program(w) in ("ssh", "autossh")]
+        for start in starts if fed_by_pipe or has_input else ():
+            i = start + 1
+            while i < len(words):
+                a = words[i]
+                if a in _SSH_VALUE_FLAGS:
+                    i += 2
+                elif a.startswith("-"):
+                    i += 1
+                else:
+                    m = danger._REMOTE_RE.match(a + ":")
+                    hosts.add((m.group(1) if m else a).lower())
+                    break
+        fed_by_pipe = tok in ("|", "|&")
+        seg = []
+    return hosts
+
+
+def _named_in_plan(remote: str, plan_text: str) -> bool:
+    return bool(remote) and re.search(rf"(?<![\w.-]){re.escape(remote)}(?![\w-]|\.\w)", plan_text, re.IGNORECASE) is not None
+
+
+def _plan_card_tags(tool_name: str, tool_input: dict[str, Any], cwd: str | None,
+                    plan_text: str = "") -> set[str]:
+    """Почему действие при одобренном плане всё равно идёт карточкой; пусто:
+    шаг плана, без карточки. Действия во внешних сервисах (MCP) карточкой
+    всегда: письмо, приглашение, удаление там не отличить от шага работы.
+    Копирование на хост или в бакет, названные в тексте плана, это шаг работы,
+    на неназванные это отправка наружу.
+    Перечень не полон: программа или скрипт проекта могут удалить и
+    отправить что угодно, и разбор этого не увидит (ревью Codex 29.10)."""
+    if tool_name.startswith("mcp__"):
+        return {"mcp"}
+    if tool_name == "WebFetch":
+        # Адреса, которые и без плана идут карточкой: localhost, IP, служебные.
+        return set() if _curl_url_ok(str(tool_input.get("url", ""))) else {"url"}
+    try:
+        verdict = danger.classify(tool_name, tool_input, cwd)
+        tags = verdict.tags & _PLAN_CARD_TAGS
+        if tool_name in ("Bash", "Monitor") and verdict.level != danger.YELLOW and _names_guarded(verdict, cwd):
+            # Любая не читающая команда над кодом, ключами или настройками бота:
+            # `sed -i`, `perl -pi`, `git apply` разбор правкой не видит (ревью 29.10).
+            tags.add(danger.GUARD)
+        if tool_name in ("Bash", "Monitor") and _searches_tree(
+                verdict, str(tool_input.get("command", "")), cwd):
+            tags.add("tree")
+        remotes = set(verdict.remotes)
+        if tool_name in ("Bash", "Monitor"):
+            remotes |= _ssh_stdin_hosts(str(tool_input.get("command", "")))
+        if any(not _named_in_plan(r, plan_text) for r in remotes):
+            tags.add("remote")
+    except Exception:
+        log.exception("plan: danger.classify failed tool=%s", tool_name)
+        return {"error"}
+    return tags
+
+
+def _names_guarded(verdict: danger.Verdict, cwd: str | None) -> bool:
+    for _prog, args, step_cwd in _steps(verdict, cwd):
+        for arg in args:
+            for word in (arg, arg.split("=", 1)[-1]):
+                if not word or word.startswith("-"):
+                    continue
+                path = _absolute(word, step_cwd)
+                if path is not None and danger._protected_path(path):
+                    return True
+    return False
+
+
 def _calls_bot_skill(command: str) -> bool:
     """Команда упоминает скилл бота после снятия кавычек оболочкой
     (`ski""lls` иначе прошёл бы, ревью Codex 29.10). Неразборчивое считается
@@ -2271,7 +3044,14 @@ async def send_approval_request(
     # session_id в hook payload не соответствует ни одной из активных сессий.
     chat_id = pending.target_chat_id if pending.target_chat_id is not None else cfg.primary_chat_id
     thread_id = pending.target_thread_id
-    text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
+    plan = pending.tool_input.get(PLAN_CARD_KEY)
+    if isinstance(plan, dict):
+        text = (_("📋 <b>План</b>") + "\n\n" + _esc(str(plan.get("text") or "")) + "\n\n<i>"
+                + _("✅: остальные шаги этого запуска без карточек. Карточкой остаются удаление "
+                    "данных, история git и push, отправка наружу, секреты, перезагрузка, "
+                    "внешние сервисы и правка механизма подтверждений.") + "</i>")
+    else:
+        text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
     if pending.origin_key:
         text = _("🛠 <b>Мастерская</b>") + "\n" + text
     try:
@@ -2289,15 +3069,26 @@ async def send_approval_request(
             note = _("✅ совпадает с одобренным откликом {id}; <b>сверь адресата с «Куда»</b>").format(
                 id=match["id"])
         text += "\n\n" + note
+    if pending.deadline:
+        # Сколько ждать и что будет по истечении: без этого Иван не знал, жив
+        # ли ещё вопрос, и узнавал о сроке новым сообщением (ux.md 10).
+        mins = max(1, round((pending.deadline - time.time()) / 60))
+        text += "\n\n" + _("⌛ жду до {until} ({mins} мин), потом отказ").format(
+            until=time.strftime("%H:%M", time.localtime(pending.deadline)), mins=mins)
     rows = [[
         InlineKeyboardButton("✅ Approve", callback_data=f"appr:{pending.approval_id}:allow"),
         InlineKeyboardButton("❌ Deny", callback_data=f"appr:{pending.approval_id}:deny"),
     ]]
+    if isinstance(plan, dict):
+        rows = [[
+            InlineKeyboardButton(_("✅ Делай план"), callback_data=f"appr:{pending.approval_id}:allow"),
+            InlineKeyboardButton(_("❌ Не надо"), callback_data=f"appr:{pending.approval_id}:deny"),
+        ]]
     # ⏩ burst-кнопки показываем для всех инструментов (см. _BURST_DENY_TOOLS):
     # окно auto-approve по решению Ивана покрывает любые действия.
     # Отправке от имени Ивана окно не положено: каждая идёт своей карточкой.
     if (pending.tool_name not in _BURST_DENY_TOOLS and not _is_outbound_send(pending.tool_name)
-            and MAILSEND_CARD_KEY not in pending.tool_input):
+            and MAILSEND_CARD_KEY not in pending.tool_input and not isinstance(plan, dict)):
         rows.append([
             InlineKeyboardButton("⏩ 15m", callback_data=f"appr:{pending.approval_id}:auto15"),
             InlineKeyboardButton("⏩ 1h", callback_data=f"appr:{pending.approval_id}:auto60"),
@@ -2318,6 +3109,55 @@ async def send_approval_request(
         write_timeout=CARD_SEND_TIMEOUT,
     )
     pending.telegram_message_id = msg.message_id
+    pending.card_html = text
+
+
+# bot_data[RUN_NOTES][ключ темы]: строки футера идущего хода темы (ux2, 01.11.2026).
+RUN_NOTES = "run_notes"
+
+
+def add_run_note(application: Application, target_key: str, kind: str, item: str) -> bool:
+    """Отметка «после факта» (запись без карточки, подача в память) строкой
+    футера хода вместо отдельного сообщения со звуком посреди рана (ux.md 11).
+    Ход темы бот открывает в bot_data[RUN_NOTES] на время рана; нет его (ран
+    не из чата, мастерская, сессия не узнана), False: зовущий шлёт сообщение."""
+    notes = application.bot_data.get(RUN_NOTES)
+    bucket = notes.get(target_key) if isinstance(notes, dict) else None
+    if bucket is None:
+        return False
+    bucket.append((kind, item))
+    return True
+
+
+async def _mark_card_timeout(application: Application, pending: Pending, chat_id: int,
+                             thread_id: int | None, wait_sec: float) -> None:
+    """Срок карточки истёк: итог дописывается в неё той же правкой, что снимает
+    кнопки, как решение по нажатию (ux.md 10). Не вышло: кнопки снимаются, итог
+    тихим сообщением ответом на карточку."""
+    line = _("⌛ без ответа {mins} мин: отказ").format(mins=max(1, round(wait_sec / 60)))
+    mid = pending.telegram_message_id
+    card = pending.card_html
+    if mid is not None and card and len(card) + len(line) + 2 <= TELEGRAM_TEXT_LIMIT:
+        try:
+            await application.bot.edit_message_text(
+                chat_id=chat_id, message_id=mid, text=f"{card}\n\n{line}",
+                parse_mode="HTML", reply_markup=None)
+            return
+        except Exception:
+            log.warning("approval card timeout edit failed aid=%s, reply instead",
+                        pending.approval_id, exc_info=True)
+    try:
+        if mid is not None:
+            await application.bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=mid, reply_markup=None)
+        await application.bot.send_message(
+            chat_id=chat_id, text=line, message_thread_id=thread_id,
+            disable_notification=True,
+            reply_to_message_id=mid,
+            allow_sending_without_reply=True,
+        )
+    except Exception:
+        log.exception("failed to mark timeout message")
 
 
 def warn_if_no_shared_secret(cfg: Config) -> bool:
@@ -2390,11 +3230,17 @@ async def handle_approve(request: web.Request) -> web.Response:
         return web.json_response({"error": "tool_name missing"}, status=400)
     if not isinstance(tool_input, dict):
         tool_input = {"_raw": tool_input}
+    # Вид карточки плана задаёт только бот: поле из входа агента отбрасывается
+    # (ревью Codex 29.10, как у MAILSEND_CARD_KEY).
+    tool_input = {k: v for k, v in tool_input.items() if k != PLAN_CARD_KEY}
 
     application: Application = request.app["application"]
     registry: ApprovalRegistry = request.app["registry"]
     session_targets: dict[str, tuple[int, int | None]] = request.app["session_targets"]
     audit_path = cfg.state_dir / AUDIT_LOG_NAME
+    # Сессия и запуск в каждой строке журнала: по ним меряются план и судья (шаг 3).
+    run_id = runs.current(session_id)
+    _audit = functools.partial(audit.write_event, session_id=session_id or "", run_id=run_id)
 
     # Резолвим destination по session_id: куда отправлять approve-карточку
     # и/или whitelist-уведомление. Если sid не найден (race / unknown hook),
@@ -2436,7 +3282,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve deny aid=%s tool=%s target=%s (untrusted)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2459,7 +3305,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         log.info("approve %s aid=%s tool=%s target=%s (agent role)",
                  "deny" if role_refusal else "allow", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event, audit_path, approval_id=aid, tool_name=tool_name, tool_input=tool_input,
+            _audit, audit_path, approval_id=aid, tool_name=tool_name, tool_input=tool_input,
             decision="deny:agent-role" if role_refusal else "allow:agent",
         )
         if role_refusal:
@@ -2467,12 +3313,16 @@ async def handle_approve(request: web.Request) -> web.Response:
         return web.json_response({"decision": "allow", "reason": "agent"})
     # Перезапуск или остановка самого бота из его рана обрывает этот ран и
     # чужие (restart.py): отказ до всех автоаппрувов, с подсказкой про заявку.
-    self_stop = _self_restart_refusal(tool_name, tool_input)
+    # Запрос карточки плана только показывает текст: слова в нём не команды, и
+    # отказы по виду команды к нему не относятся (_plan_request проверил форму).
+    plan_req = _plan_request(tool_name, tool_input)
+    plan_call = plan_req is not None and plan_req[0] == "ok"
+    self_stop = None if plan_call else _self_restart_refusal(tool_name, tool_input)
     if self_stop:
         aid = uuid.uuid4().hex[:12]
         log.info("approve deny aid=%s tool=%s target=%s (self-restart)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2483,12 +3333,12 @@ async def handle_approve(request: web.Request) -> web.Response:
     # Общие данные (журнал и таблицы Домового) пишет только команда под
     # замком синхронизации: Write и Edit по ним отказ до всех автоаппрувов,
     # иначе правка пропадала при rebase или перетирала соседнюю сессию.
-    guarded = _guarded_data_refusal(cfg, tool_name, tool_input, cwd)
+    guarded = None if plan_call else _guarded_data_refusal(cfg, tool_name, tool_input, cwd)
     if guarded:
         aid = uuid.uuid4().hex[:12]
         log.info("approve deny aid=%s tool=%s target=%s (guarded data)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event, audit_path, approval_id=aid, tool_name=tool_name,
+            _audit, audit_path, approval_id=aid, tool_name=tool_name,
             tool_input=tool_input, decision="deny:guarded-data",
         )
         return web.json_response({"decision": "deny", "reason": guarded})
@@ -2500,7 +3350,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve deny aid=%s tool=%s (outbound: %s)", aid, tool_name, refusal)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2515,6 +3365,30 @@ async def handle_approve(request: web.Request) -> web.Response:
     # бывает чужой текст источника (ревью Codex 13.10.2026).
     plan_sids: set[str] = application.bot_data.get("plan_stage_sids") or set()
     plan_stage = permission_mode == "plan" or (bool(session_id) and session_id in plan_sids)
+    exec_sids: set[str] = application.bot_data.get("task_exec_sids") or set()
+    # Запрос карточки плана: раньше этапа плана и всех автоаппрувов, иначе вызов
+    # скилла прошёл бы без карточки (_SKILL_CALL_RE, окно ⏩). Сам вызов прав
+    # не даёт; где план не положен, отказ с пояснением (ревью Codex 29.10).
+    plan_text = ""
+    if plan_req is not None:
+        why_not = ""
+        if plan_req[0] == "bad":
+            why_not = plan_req[1]
+        elif not cfg.plan_cards or not run_id or target is None or is_unattended or plan_stage:
+            why_not = _("карточка плана здесь не выдаётся (фоновый ран, этап плана или режим "
+                        "выключен): действуй по обычным правилам, каждое изменение карточкой")
+        elif (session_id in exec_sids
+              or _chat_auto_allowed(target, target_key, cfg.approve_auto_chat_keys)):
+            why_not = _("план не нужен: в этом чате действия уже разрешены")
+        if why_not:
+            aid = uuid.uuid4().hex[:12]
+            log.info("approve deny aid=%s tool=Bash (plan request: %s)", aid, why_not[:80])
+            await asyncio.to_thread(
+                _audit, audit_path, approval_id=aid, tool_name=tool_name,
+                tool_input=tool_input, decision="deny:plan-request",
+            )
+            return web.json_response({"decision": "deny", "reason": why_not})
+        plan_text = plan_req[1]
     # Обдумывание темы задачи с Иваном у карточек (переделка 18.10.2026): то
     # же чтение, плюс /2mind; прочее, кроме записи файлов и отправки наружу,
     # идёт карточкой мимо всех автоаппрувов ниже (force_card), а не отказом;
@@ -2531,6 +3405,8 @@ async def handle_approve(request: web.Request) -> web.Response:
             ok = await asyncio.to_thread(_plan_read_allowed, command, cwd)
             if not ok and task_think:
                 ok = await asyncio.to_thread(_plan_read_allowed, command, cwd, two_mind=True)
+            if not ok and not is_unattended:
+                ok = await asyncio.to_thread(_danger_read_ok, command, cwd)
         elif tool_name == "Write" and task_think:
             # Только новый файл запроса: Edit по нему уже не /2mind (ревью Codex 18.10).
             target_path = _target_path(tool_name, tool_input)
@@ -2550,7 +3426,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve %s aid=%s tool=%s (plan-stage)", "allow" if ok else "deny", aid, tool_name)
         await asyncio.to_thread(
-            audit.write_event, audit_path, approval_id=aid, tool_name=tool_name,
+            _audit, audit_path, approval_id=aid, tool_name=tool_name,
             tool_input=tool_input, decision="allow:plan-read" if ok else "deny:plan-stage",
         )
         if ok:
@@ -2569,13 +3445,14 @@ async def handle_approve(request: web.Request) -> web.Response:
     mail_kind, mail_info = "", None
     if tool_name == "Bash":
         tool_input = {k: v for k, v in tool_input.items() if k != MAILSEND_CARD_KEY}
-        mail_kind, mail_info = await asyncio.to_thread(
-            _mailsend_check, str(tool_input.get("command", "")), cwd)
+        if not plan_call:
+            mail_kind, mail_info = await asyncio.to_thread(
+                _mailsend_check, str(tool_input.get("command", "")), cwd)
         if mail_kind == "deny":
             aid = uuid.uuid4().hex[:12]
             log.info("approve deny aid=%s tool=Bash (mailsend: %s)", aid, mail_info)
             await asyncio.to_thread(
-                audit.write_event,
+                _audit,
                 audit_path,
                 approval_id=aid,
                 tool_name=tool_name,
@@ -2599,7 +3476,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (chat-auto)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2611,12 +3488,11 @@ async def handle_approve(request: web.Request) -> web.Response:
     # не теме (bot.py ставит и снимает метку по sid). Секреты, отправка от
     # имени Ивана и перезапуск бота идут своими путями выше и ниже (ревью
     # Codex 15.10: опасный шаг получает свою карточку, остальное идёт).
-    exec_sids: set[str] = application.bot_data.get("task_exec_sids") or set()
     if not outbound and not secret and target is not None and session_id and session_id in exec_sids:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (task-exec)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2624,6 +3500,27 @@ async def handle_approve(request: web.Request) -> web.Response:
             decision="allow:task-exec",
         )
         return web.json_response({"decision": "allow", "reason": "task:exec"})
+
+    # Одобренный план этого запуска (runs.plan_for): шаг работы без карточки.
+    # Отправка от имени Ивана, секреты и действия с метками _plan_card_tags идут
+    # дальше, на карточку; запрос нового плана тоже (ревью Codex 29.10).
+    grant = (runs.plan_for(session_id)
+             if target is not None and not is_unattended and not force_card and not plan_text else None)
+    if grant is not None and tool_name == "Bash" and memory_write_auto_allowed(
+            str(tool_input.get("command", "")), cfg.bash_auto_allow_re, cfg.state_dir / MEMORY_DRAFTS_DIRNAME):
+        # Запись в память идёт своей веткой ниже, с уведомлением «💾 подаю в память».
+        grant = None
+    if grant is not None and not outbound and not secret:
+        card_tags = await asyncio.to_thread(_plan_card_tags, tool_name, tool_input, cwd, grant.text)
+        if not card_tags:
+            aid = uuid.uuid4().hex[:12]
+            log.info("approve auto-allow aid=%s tool=%s target=%s (plan %s)",
+                     aid, tool_name, target_key, grant.plan_aid)
+            await asyncio.to_thread(
+                _audit, audit_path, approval_id=aid, tool_name=tool_name,
+                tool_input=tool_input, decision="allow:plan", plan=grant.plan_aid,
+            )
+            return web.json_response({"decision": "allow", "reason": "plan"})
 
     # Фоновый ран (/at, /event с wake, скилл по таймеру): без карточки, см.
     # _unattended_auto_allowed. Источники свои: /at пишет сам Иван, /event
@@ -2633,7 +3530,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (unattended)", aid, tool_name, target_key)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2648,6 +3545,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         # Скиллы бота (task_new заводит тему и запускает ран) до «Делай» только
         # карточкой: окно обдумывания для проверок, не для действий бота.
         and not (force_card and _calls_bot_skill(str(tool_input.get("command", ""))))
+        and not plan_text
     )
     if burst_eligible and time.time() < burst_until:
         aid = uuid.uuid4().hex[:12]
@@ -2656,7 +3554,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             aid, tool_name, target_key, burst_until,
         )
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2685,20 +3583,25 @@ async def handle_approve(request: web.Request) -> web.Response:
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=%s path=%s (whitelist)", aid, tool_name, target_path)
             await asyncio.to_thread(
-                audit.write_event,
+                _audit,
                 audit_path,
                 approval_id=aid,
                 tool_name=tool_name,
                 tool_input=tool_input,
                 decision="allow:whitelist",
             )
+            short = str(target_path)
+            if (target is not None and not origin_key and add_run_note(
+                    application, target_key, "auto",
+                    f"{tool_name} {short if len(short) <= 60 else '…' + short[-60:]}")):
+                return web.json_response({"decision": "allow", "reason": "whitelist"})
             try:
-                short = str(target_path)
                 if len(short) > 100:
                     short = "…" + short[-100:]
                 await application.bot.send_message(
                     chat_id=target_chat_id,
-                    text=f"✅ auto (whitelist) <b>{_esc(tool_name)}</b> <code>{_esc(short)}</code>",
+                    text=_("✍️ без карточки: <b>{tool}</b> <code>{path}</code>").format(
+                        tool=_esc(tool_name), path=_esc(short)),
                     parse_mode="HTML",
                     message_thread_id=target_thread_id,
                 )
@@ -2713,7 +3616,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # через approve. Notification в чат намеренно НЕ шлём: цель именно убрать
     # шум; видимость сохраняется через audit decision="allow:bash-safe".
     # Сюда же вызовы скиллов бота (_SKILL_CALL_RE). Для plan-рана ничего из этого.
-    if tool_name == "Bash" and not is_unattended and not outbound and not force_card:
+    if tool_name == "Bash" and not is_unattended and not outbound and not force_card and not plan_text:
         cmd = str(tool_input.get("command", ""))
         # Проверка раскрывает шаблоны и смотрит файлы: в отдельном потоке,
         # чтобы медленная файловая система не держала остальные запросы бота.
@@ -2721,7 +3624,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=Bash cmd=%s (regex)", aid, cmd[:80])
             await asyncio.to_thread(
-                audit.write_event,
+                _audit,
                 audit_path,
                 approval_id=aid,
                 tool_name=tool_name,
@@ -2729,13 +3632,25 @@ async def handle_approve(request: web.Request) -> web.Response:
                 decision="allow:bash-safe",
             )
             return web.json_response({"decision": "allow", "reason": "bash:safe"})
+        if await asyncio.to_thread(_danger_read_ok, cmd, cwd):
+            aid = uuid.uuid4().hex[:12]
+            log.info("approve auto-allow aid=%s tool=Bash cmd=%s (danger-read)", aid, cmd[:80])
+            await asyncio.to_thread(
+                _audit,
+                audit_path,
+                approval_id=aid,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                decision="allow:danger-read",
+            )
+            return web.json_response({"decision": "allow", "reason": "bash:read"})
         calls = memory_write_auto_allowed(
             cmd, cfg.bash_auto_allow_re, cfg.state_dir / MEMORY_DRAFTS_DIRNAME)
         if calls:
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=Bash cmd=%s (memory-write)", aid, cmd[:80])
             await asyncio.to_thread(
-                audit.write_event,
+                _audit,
                 audit_path,
                 approval_id=aid,
                 tool_name=tool_name,
@@ -2743,6 +3658,13 @@ async def handle_approve(request: web.Request) -> web.Response:
                 decision="allow:memory-write",
             )
             saved = [c for c in calls if not c["dry_run"]]
+            if saved and target is not None and not origin_key:
+                # Строкой футера хода, если он идёт (ux.md 11).
+                pending_names = [f"{c['scope']} · {c['name'] or '?'}" for c in saved]
+                if add_run_note(application, target_key, "memory", pending_names[0]):
+                    for name in pending_names[1:]:
+                        add_run_note(application, target_key, "memory", name)
+                    saved = []
             if saved:
                 try:
                     names = ", ".join(f"{c['scope']} · {c['name'] or '?'}" for c in saved)
@@ -2772,7 +3694,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=%s (mcp-readonly)", aid, tool_name)
             await asyncio.to_thread(
-                audit.write_event,
+                _audit,
                 audit_path,
                 approval_id=aid,
                 tool_name=tool_name,
@@ -2792,7 +3714,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         url = str(tool_input.get("url", "?"))
         log.info("approve auto-allow aid=%s tool=WebFetch url=%s (always)", aid, url)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2808,7 +3730,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-deny aid=%s tool=%s (scheduled, mode=%s)", aid, tool_name, permission_mode or "?")
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=aid,
             tool_name=tool_name,
@@ -2822,6 +3744,8 @@ async def handle_approve(request: web.Request) -> web.Response:
         card_input = {**tool_input, MAILSEND_CARD_KEY: mail_info}
     elif mail_kind == "mention":
         card_input = {**tool_input, MAILSEND_CARD_KEY: {"warning": True}}
+    if plan_text:
+        card_input = {**tool_input, PLAN_CARD_KEY: {"text": plan_text}}
     pending = registry.create(
         tool_name,
         card_input,
@@ -2830,6 +3754,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         target_thread_id=target_thread_id,
         cwd=cwd,
         origin_key=origin_key,
+        run_id=run_id,
     )
     log.info("approve request aid=%s tool=%s sid=%s", pending.approval_id, tool_name, (session_id or "?")[:8])
     # 2-3 попытки: секундный лаг Telegram/502 не должен молча превращаться в
@@ -2841,8 +3766,13 @@ async def handle_approve(request: web.Request) -> web.Response:
     # такие). Поэтому ждём нажатия, как после удачной отправки. Карточке
     # отправки от имени Ивана нужен номер её сообщения (нажатие сверяется с
     # ним), ей прежний повтор.
-    needs_message_id = _is_outbound_send(tool_name) or MAILSEND_CARD_KEY in card_input
+    needs_message_id = (_is_outbound_send(tool_name) or MAILSEND_CARD_KEY in card_input
+                        or PLAN_CARD_KEY in card_input)
     send_started = time.monotonic()
+    # getattr: в тестах cfg без срока, карточка тогда его не называет.
+    wait_sec = getattr(cfg, "approve_timeout_sec", 0)
+    if wait_sec:
+        pending.deadline = time.time() + wait_sec
     send_ok = False
     for attempt in range(3):
         try:
@@ -2852,7 +3782,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         except TimedOut as e:
             # PTB зовёт TimedOut и таймауты соединения и пула, где запрос не
             # ушёл: им повтор (ревью Codex 29.10).
-            if not needs_message_id and isinstance(e.__cause__, httpx.ReadTimeout):
+            if not needs_message_id and is_unconfirmed(e):
                 log.warning("approval card send timed out, waiting for a press anyway aid=%s",
                             pending.approval_id)
                 send_ok = True
@@ -2874,7 +3804,7 @@ async def handle_approve(request: web.Request) -> web.Response:
         # future никем не await-ится — просто убираем из registry.
         registry.expire(pending.approval_id)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=pending.approval_id,
             tool_name=tool_name,
@@ -2891,27 +3821,16 @@ async def handle_approve(request: web.Request) -> web.Response:
     except asyncio.TimeoutError:
         registry.expire(pending.approval_id)
         await asyncio.to_thread(
-            audit.write_event,
+            _audit,
             audit_path,
             approval_id=pending.approval_id,
             tool_name=tool_name,
             tool_input=tool_input,
             decision="deny:timeout",
         )
-        try:
-            if pending.telegram_message_id is not None:
-                await application.bot.edit_message_reply_markup(
-                    chat_id=target_chat_id,
-                    message_id=pending.telegram_message_id,
-                    reply_markup=None,
-                )
-            await application.bot.send_message(
-                chat_id=target_chat_id,
-                text=f"⌛ timeout approval aid={pending.approval_id} — deny",
-                message_thread_id=target_thread_id,
-            )
-        except Exception:
-            log.exception("failed to mark timeout message")
+        log.info("approve timeout aid=%s", pending.approval_id)
+        await _mark_card_timeout(application, pending, target_chat_id, target_thread_id,
+                                 cfg.approve_timeout_sec)
         return web.json_response({"decision": "deny", "reason": "user timeout"})
 
     # ✅ на карточке письма: билет на ровно это письмо (хеш снимка), его
@@ -2924,13 +3843,23 @@ async def handle_approve(request: web.Request) -> web.Response:
         except OSError:
             log.exception("mailsend ticket write failed aid=%s", pending.approval_id)
             decision, reason = "deny", _("бот не записал одобрение письма")
+    # ✅ на карточке плана: разрешение запуску, который её ждал, если он ещё идёт.
+    plan_granted = ""
+    if decision == "allow" and plan_text:
+        if runs.grant_plan(session_id, pending.run_id, pending.approval_id, plan_text):
+            plan_granted = pending.approval_id
+        else:
+            decision, reason = "deny", _("запуск, просивший план, уже закончился")
+    elif plan_text:
+        runs.revoke_plan(pending.run_id)
     await asyncio.to_thread(
-        audit.write_event,
+        _audit,
         audit_path,
         approval_id=pending.approval_id,
         tool_name=tool_name,
         tool_input=tool_input,
-        decision=decision,
+        decision="allow:plan-card" if plan_granted else decision,
+        plan=plan_granted,
     )
     log.info("approve resolved aid=%s decision=%s", pending.approval_id, decision)
     if reason:

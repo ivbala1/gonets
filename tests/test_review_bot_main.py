@@ -136,7 +136,8 @@ class _Base(unittest.IsolatedAsyncioTestCase):
             if self.run_hook is not None:
                 await self.run_hook(run)
             if self.result_error:
-                return ClaudeResult(text="⛔ отменено (signal -15)", session_id=sid, is_error=True)
+                return ClaudeResult(text="⛔ отменено (signal -15)", session_id=sid, is_error=True,
+                                    signalled=True)
             store.set(chat_key, sid)
             return ClaudeResult(text=self.answer, session_id=sid)
 
@@ -722,7 +723,7 @@ class CancelGatherTests(_Base):
             msg = _msg("/cancel")
             await botmod.on_cancel(_update(msg), self.ctx)
         self.assertTrue(batch.cancelled)
-        self.assertRegex(msg.reply_text.await_args.args[0], msg_re(" · отменено до отправки в Claude: {count} сообщ."))
+        self.assertRegex(msg.reply_text.await_args.args[0], msg_re(" · не ушло в Claude: {count} сообщ."))
 
 
 # ---- B27: пересланное «/login» не команда ----
@@ -1250,3 +1251,220 @@ class SecretNameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- Пачка хода: написанное, пока тема занята, уходит одним ходом (29.10.2026) ----
+
+class TurnPackTests(_Base):
+    async def busy(self, *coros) -> list[asyncio.Task]:
+        """Тема занята прошлым раном: запросы встают, потом замок отпускается."""
+        lock = botmod._chat_lock(self.ctx, str(GROUP))
+        await lock.acquire()
+        started = []
+        for coro in coros:
+            started.append(asyncio.ensure_future(coro))
+            await asyncio.sleep(0.01)
+        lock.release()
+        await asyncio.gather(*started)
+        return started
+
+    def pick(self, answer: str, **extra) -> dict:
+        ref = {"chat_key": str(GROUP), "answer": answer, "question": "Как проверяем?",
+               "epoch": botmod._session_epoch(self.ctx, str(GROUP)), "permission_mode": "bypassPermissions"}
+        ref.update(extra)
+        return ref
+
+    def pick_dispatch(self, ref: dict, msg: SimpleNamespace | None = None):
+        async def go():
+            with botmod._ask_answer_queued(self.ctx, str(GROUP), ref):
+                await self.dispatch(f"[Ответ на вопрос «{ref['question']}»]: {ref['answer']}",
+                                    msg or _msg("card"), from_callback=True,
+                                    expect_epoch=ref["epoch"], ask_ref=ref)
+        return go()
+
+    async def test_texts_while_busy_go_in_one_turn_with_note(self) -> None:
+        one, two, three = _msg("A"), _msg("B"), _msg("C")
+        await self.busy(self.dispatch("первое", one), self.dispatch("второе", two),
+                        self.dispatch("третье", three))
+        self.assertEqual(len(self.runs), 1)
+        prompt = self.runs[0]["prompt"]
+        self.assertTrue(prompt.startswith(botmod._(botmod.PACK_NOTE)))
+        self.assertLess(prompt.index("первое"), prompt.index("второе"))
+        self.assertLess(prompt.index("второе"), prompt.index("третье"))
+        # Ответ один, на первое сообщение пачки; «встанет в очередь» тоже одно.
+        busy = [c for m in (one, two, three) for c in m.reply_text.await_args_list
+                if str(c.args[0]).startswith("⏳")]
+        self.assertEqual(len(busy), 1)
+        self.assertEqual(self.bot_data.get("turn_packs"), {})
+
+    async def test_free_topic_has_no_note(self) -> None:
+        await self.dispatch("просто так")
+        self.assertEqual(self.runs[0]["prompt"], "просто так")
+
+    async def test_pick_and_text_in_one_turn_marks_held(self) -> None:
+        seen: list = []
+
+        async def during(_run) -> None:
+            seen.append(set(botmod._ask_picks_queued(self.ctx, str(GROUP))))
+        self.run_hook = during
+        self.answer = "Итог.\n<<ASK: Дальше? | да | нет>>"
+        text_msg = _msg("txt")
+        text_msg.reply_text = AsyncMock(return_value=SimpleNamespace(chat_id=GROUP, message_id=90,
+                                                                     message_thread_id=None))
+        await self.busy(self.dispatch("а ещё проверь логи", text_msg), self.pick_dispatch(self.pick("не надо")))
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("а ещё проверь логи", self.runs[0]["prompt"])
+        self.assertIn("не надо", self.runs[0]["prompt"])
+        # Отметка «ответ в очереди» жива весь ход пачки и снята после.
+        self.assertEqual(len(seen[0]), 1)
+        self.assertEqual(botmod._ask_picks_queued(self.ctx, str(GROUP)), set())
+        # Вопрос хода пачки знает ответ из неё: кнопки есть.
+        self.assertIn("reply_markup", text_msg.reply_text.await_args.kwargs)
+
+    async def test_pick_of_old_session_refused_text_still_goes(self) -> None:
+        old = self.pick("не надо")
+        card = _msg("card")
+
+        async def reset_then_pick():
+            botmod._bump_session_epoch(self.ctx, str(GROUP))
+            await self.pick_dispatch(old, card)
+        await self.busy(self.dispatch("текст Ивана"), reset_then_pick())
+        self.assertEqual(len(self.runs), 1)
+        self.assertNotIn("не надо", self.runs[0]["prompt"])
+        self.assertIn("текст Ивана", self.runs[0]["prompt"])
+        self.assertEqual(card.reply_text.await_args.args[0], botmod._ask_pick_refusal(old))
+
+    async def test_plan_mode_pick_and_background_wait_on_their_own(self) -> None:
+        plan_pick = self.pick("да", permission_mode="plan")
+
+        async def plan_go():
+            await self.dispatch("[Ответ]: да", _msg("card"), from_callback=True, permission_mode="plan",
+                                expect_epoch=plan_pick["epoch"], ask_ref=plan_pick)
+        await self.busy(self.dispatch("текст"), plan_go(), self.dispatch("событие", unattended=True))
+        self.assertEqual(len(self.runs), 3)
+
+    async def test_cancel_drops_waiting_pack(self) -> None:
+        lock = botmod._chat_lock(self.ctx, str(GROUP))
+        await lock.acquire()
+        a = asyncio.ensure_future(self.dispatch("раз"))
+        await asyncio.sleep(0.01)
+        b = asyncio.ensure_future(self.dispatch("два"))
+        await asyncio.sleep(0.01)
+        stop = _msg("стоп")
+        await botmod.on_text(_update(stop), self.ctx)
+        lock.release()
+        await asyncio.gather(a, b)
+        self.assertEqual(self.runs, [])
+        self.assertIn("2", stop.reply_text.await_args.args[0])
+
+    def test_urgent_words(self) -> None:
+        for text, kind in (("стоп", "stop"), ("Стоп!", "stop"), ("  ничего   не отправляй. ", "nosend"),
+                           ("стоп, сначала проверь логи", None), ("не стоп", None)):
+            with self.subTest(text=text):
+                self.assertEqual(botmod._urgent_word(_msg(text)), kind)
+        self.assertIsNone(botmod._urgent_word(_msg("стоп", reply_to_message=_msg("x"))))
+
+    async def test_cancel_after_take_before_process_drops_pack(self) -> None:
+        # Окно между взятием пачки и созданием процесса (ревью Codex 29.10).
+        async def hold(*_a, **_kw):
+            await botmod.on_cancel(_update(_msg("/cancel")), self.ctx)
+            return False
+        with patch.object(botmod, "_limit_hold", hold):
+            await self.busy(self.dispatch("раз"), self.dispatch("два"))
+        self.assertEqual(self.runs, [])
+
+    async def test_mixed_pack_refused_if_session_changes_after_take(self) -> None:
+        async def hold(*_a, **_kw):
+            botmod._bump_session_epoch(self.ctx, str(GROUP))
+            return False
+        with patch.object(botmod, "_limit_hold", hold):
+            await self.busy(self.dispatch("текст"), self.pick_dispatch(self.pick("prod")))
+        self.assertEqual(self.runs, [])
+
+    async def test_refused_pick_mark_does_not_strip_buttons(self) -> None:
+        old = self.pick("не надо")
+        self.answer = "Итог.\n<<ASK: Дальше? | да | нет>>"
+        text_msg = _msg("txt")
+        text_msg.reply_text = AsyncMock(return_value=SimpleNamespace(chat_id=GROUP, message_id=91,
+                                                                     message_thread_id=None))
+
+        async def reset_then_pick():
+            botmod._bump_session_epoch(self.ctx, str(GROUP))
+            await self.pick_dispatch(old)
+        await self.busy(self.dispatch("текст", text_msg), reset_then_pick())
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("reply_markup", text_msg.reply_text.await_args.kwargs)
+
+    async def test_joined_messages_told_when_turn_refused_under_lock(self) -> None:
+        lock = botmod._chat_lock(self.ctx, str(GROUP))
+        await lock.acquire()
+        one, two, three = _msg("A"), _msg("B"), _msg("C")
+        tasks = [asyncio.ensure_future(self.dispatch(t, m))
+                 for t, m in (("первое", one), ("второе", two), ("третье", three))]
+        await asyncio.sleep(0.01)
+        self.bot_data["draining"] = True
+        lock.release()
+        await asyncio.gather(*tasks)
+        self.assertEqual(self.runs, [])
+        # С 01.11.2026 (queue2) пачка не теряется, а уходит после рестарта.
+        for joined in (two, three):
+            joined.reply_text.assert_awaited_once()
+            self.assertIn("уйдёт", str(joined.reply_text.await_args.args[0]))
+        import json
+        [entry] = self.bot_data["at_jobs"].data.values()
+        prompt = json.loads(entry["v"])["prompt"]
+        self.assertLess(prompt.index("первое"), prompt.index("третье"))
+
+    async def test_nosend_with_nothing_stopped_does_not_claim_stop(self) -> None:
+        self.cfg.allowed_chat_ids = {GROUP}
+        lock = botmod._chat_lock(self.ctx, str(GROUP))
+        await lock.acquire()  # замок занят, процесса ещё нет
+        msg = _msg("не отправляй")
+        await botmod.on_text(_update(msg), self.ctx)
+        lock.release()
+        texts = [str(c.args[0]) for c in msg.reply_text.await_args_list]
+        self.assertFalse(any("остановлено" in t for t in texts), texts)
+
+    async def test_urgent_word_with_nothing_running_goes_to_claude(self) -> None:
+        self.cfg.allowed_chat_ids = {GROUP}
+        msg = _msg("не отправляй")
+        with patch.object(botmod, "GATHER_WINDOW_SEC", 0):
+            await botmod.on_text(_update(msg), self.ctx)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("не отправляй", self.runs[0]["prompt"])
+
+    async def test_correction_joins_waiting_pack(self) -> None:
+        lock = botmod._chat_lock(self.ctx, str(GROUP))
+        await lock.acquire()
+        a = asyncio.ensure_future(self.dispatch("раз"))
+        await asyncio.sleep(0.01)
+        b = asyncio.ensure_future(botmod.on_text(_update(_msg("!не так, иначе")), self.ctx))
+        await asyncio.sleep(0.01)
+        lock.release()
+        await asyncio.gather(a, b)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("не так, иначе", self.runs[0]["prompt"])
+
+
+# ---- аудит удобства 31.10.2026: ран, снятый Иваном, второй раз не отвечает ----
+
+class UserStopReplyTests(_Base):
+    async def _stopped_run(self, *, by_user: bool) -> None:
+        async def hook(run):
+            if by_user:
+                botmod._mark_user_stop(self.ctx, str(GROUP))
+
+        self.run_hook = hook
+        self.result_error = True
+        await self.dispatch("сделай")
+
+    async def test_user_stop_sends_no_second_message(self) -> None:
+        await self._stopped_run(by_user=True)
+        self.send_reply_text.assert_not_awaited()
+        # Отметка снята концом рана: следующая остановка не Иваном слышна.
+        self.assertNotIn(str(GROUP), self.bot_data.get("run_stops", {}))
+
+    async def test_other_stop_still_reported(self) -> None:
+        await self._stopped_run(by_user=False)
+        self.send_reply_text.assert_awaited_once()
+        self.assertIn("⛔", self.send_reply_text.await_args.args[2])

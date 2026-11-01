@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import dataclasses
-import hashlib
 import io
 import json
 import logging
@@ -15,19 +13,16 @@ import signal
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from datetime import time as dtime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
-import aiohttp
-from aiohttp import web
-from telegram import (BotCommand, Chat, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
+from telegram import (Chat, InlineKeyboardButton, InlineKeyboardMarkup,
                       LinkPreviewOptions, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
                       ReplyParameters, Update)
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -41,14 +36,17 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 from .approval import (
+    AUDIT_LOG_NAME,
     MAILSEND_CARD_KEY,
+    PLAN_CARD_KEY,
+    RUN_NOTES,
+    _SKILL_PYTHON,
     ApprovalRegistry,
     _is_outbound_send,
     build_aiohttp_app,
     full_view_text,
-    warn_if_no_shared_secret,
 )
-from .auth import LoginManager, looks_like_auth_code
+from .auth import LoginManager
 from .burst import (
     BURST_DEFAULT_SEC,
     burst_clear,
@@ -61,19 +59,19 @@ from .burst import (
 )
 from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_tree, run_claude
 from .overrides import PersistentDict
-from .codex_runner import run_codex
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, deals, events, handoff, hangs, limits, otklik, restart, tasks, transcripts, warm
-from .skills.news_digest import backlog as news_backlog
+from . import bigfile, deals, handoff, hangs, inflight, limits, restart, tasks, transcripts
 from .skills.news_digest import core as news
 from .replies import (
-    _send_retrying,
     extract_ask_marker,
     extract_loud_marker,
+    extract_quiet_marker,
     extract_send_file_markers,
+    is_unconfirmed,
     load_full_text,
     plan_voice_series,
     save_full_text,
+    format_run_notes,
     send_cost_footer,
     send_file_whitelist,
     send_files,
@@ -85,8 +83,84 @@ from .replies import (
     with_counter,
 )
 from .dashes import soften_dashes
-from .voice import make_client, synthesize, transcribe
-from .i18n import _, N_, plural
+from .voice import synthesize, transcribe
+from .i18n import _, N_
+from .compose import (  # noqa: F401  перенесено из bot.py
+    ComposeBuffer, Reservation, _compose_add, _compose_buffers, _compose_cancelled,
+    _compose_current, _compose_fill, _compose_release, _compose_reserve,
+)
+from .codex_fallback import (  # noqa: F401  перенесено из bot.py
+    _build_codex_prompt, _codex_as_claude_result, _is_claude_unavailable,
+)
+from .tg_otklik import (  # noqa: F401  перенесено из bot.py
+    _OTKLIK_SHOW_LOCKS, _otklik_close_attempts, _otklik_edit, _otklik_markup, _otklik_show,
+    _otklik_sync, _otklik_target, _otklik_unknown_notice, on_otklik_all_pick, on_otklik_pick,
+)
+from .tg_deals import (  # noqa: F401  перенесено из bot.py
+    DEAL_FIRST_NOTE, _deal_finish, _deal_open, _deal_reply_target, _deal_settle, _deal_swipe,
+    _deal_turn, _deal_update, _deals_base, _deals_resume, _news_edit, _news_file_to_backlog,
+    _send_deal_card, on_deal_pick, on_news_pick,
+)
+from .tg_tasks import (  # noqa: F401  перенесено из bot.py
+    ADD_PENDING, _StaleCard, _edit_settled, _is_task_ask_reply, _markup, _reply_quietly, _task_add,
+    _task_add_cost, _task_add_run, _task_add_settle, _task_assign_name, _task_base_name, _task_card,
+    _task_command, _task_cost_seen, _task_create, _task_do, _task_exec, _task_exec_admit,
+    _task_exec_finish, _task_exec_release, _task_for, _task_forget, _task_from_http, _task_intro,
+    _task_live, _task_new, _task_new_card, _task_news_item, _task_note, _task_offer_do,
+    _task_post_result, _task_release_after_exit, _task_seen_sha, _task_start, _task_start_admitted,
+    _task_text, _task_thought, _task_topic_icon, _task_touch, _task_touch_now, _task_turn,
+    _task_unborn, _task_update, _tasks_chat_id, _tasks_housekeeping, _tasks_recover, _tasks_startup,
+    on_task, on_task_pick,
+)
+from .tg_at import (  # noqa: F401  перенесено из bot.py
+    _at_fire, _at_fire_dispatch, _at_fire_running, on_at, _parse_at_when, _schedule_at_job,
+)
+from .tg_warm import (  # noqa: F401  перенесено из bot.py
+    _warm_after_run, _warm_cancel, WARM_EARLY_SEC, _warm_forget, _warm_prompt, WARM_RUNTIME_SEC,
+    _warm_schedule, _warm_signature, _warm_skip_reason, _warm_tick,
+)
+from .tg_download import (  # noqa: F401  перенесено из bot.py
+    _DOWNLOAD_READ_TIMEOUT, _DOWNLOAD_RETRY_DELAYS, _download_retrying, DownloadJob,
+    _downloads_cancel, _fetch_attachment, _fetch_big, _mtproto, _PROGRESS_EVERY_SEC,
+    _progress_ticker, _quiet_edit, _slot_holders,
+)
+from .tg_login import (  # noqa: F401  перенесено из bot.py
+    _login_keyboard, _offer_login, on_auth_update, on_login_callback, _start_login,
+)
+from .tg_limits import (  # noqa: F401  перенесено из bot.py
+    _limit_after_error, _limit_defer, _limit_follow_up, _limit_handle, _limit_hold,
+    _limit_movable, _limit_note_once, LIMIT_RETRY_HEAD, _limit_retry_pending, _limit_talk_prompt,
+    LIMIT_TODO_MARK,
+)
+from .tg_events import (  # noqa: F401  перенесено из bot.py
+    _event_expired_note, _event_mark, _event_ref, _event_show_target, _events_resume,
+    _make_event_wake,
+)
+from .lifecycle import (  # noqa: F401  перенесено из bot.py
+    _compose_lost_notice, _on_error, _on_post_init, _on_post_shutdown, _on_post_stop,
+    on_restart_pick, _on_stop_signal, _parse_chat_key, _restart_abort, _restart_active,
+    _restart_announce, _restart_begin, _restart_begin_locked, _restart_exit, _restart_keyboard,
+    _restart_notify, _restart_reschedule_at, _restart_wait_workshop,
+    _send_shutdown_notice_via_api, _STOP_GRACE_SEC, _terminate_and_wait, _terminate_runs,
+    _workshop_busy,
+)
+from .tg_queue import (  # noqa: F401  перенесено из bot.py
+    _busy_notice, _drop_busy_notice, _gather_cancel, _gather_close, _gather_fill, _gather_flush,
+    _gather_flush_impl, GATHER_LATE_LOG_SEC, GATHER_MAX_WAIT_SEC, _gather_pending, _gather_react,
+    _gather_release, _gather_reserve, _gather_send_now, _gather_stop_defer, _gather_take,
+    GATHER_WINDOW_SEC, GatherBatch, GatherSlot, _pack_cancel, PACK_NOTE, _pack_prompt, PackItem,
+    _prestart_cancel, RunPrestart, _turn_packs, TurnPack,
+)
+from .tg_cards import (  # noqa: F401  перенесено из bot.py
+    _ask_answer_queued, _ASK_BUTTON_CAP, _ask_button_label, _ask_cards_changed, _ask_cards_of,
+    _ask_pick_finish, _ask_pick_refusal, _ask_picks_queued, ASK_REPEAT_HOLD_SEC, ASK_TTL_SEC,
+    _ask_waiting, _bump_plan_generation, _card_msg_matches, _dispatch_ask_answer,
+    _dropped_plan_note, on_ask_pick, on_plan_pick, _plan_generation, _plan_snapshot,
+    _retire_ask_cards, _send_ask_card, _send_plan_card, _take_ask_cards,
+)
+from .tg_runstatus import (  # noqa: F401  перенесено из bot.py
+    on_run_watch_pick, _run_waits_approval, _RunStatus, _typing_indicator, _typing_loop,
+)
 
 log = logging.getLogger(__name__)
 
@@ -144,7 +218,7 @@ def _chat_key(update: Update) -> tuple[str, int, int | None]:
     """
     chat = update.effective_chat
     chat_id = chat.id if chat else 0
-    msg = update.message
+    msg = update.message or getattr(update, "edited_message", None)
     thread_id = getattr(msg, "message_thread_id", None) if msg is not None else None
     # is_topic_message=False для General topic в forum-супергруппе — там
     # message_thread_id может быть, но по смыслу это «общий» поток, не тема.
@@ -165,6 +239,24 @@ def _session_epoch(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
     """
     epochs: dict[str, int] = ctx.application.bot_data.setdefault("session_epochs", {})
     return epochs.get(chat_key, 0)
+
+
+def _keep_failed_session(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, result: Any,
+                         store: SessionStore, *, own: bool, epoch: int) -> None:
+    """Первый ран новой сессии оборвался (таймаут, /cancel, «стоп», сбой API,
+    лимит, рестарт бота): run_claude пишет sid только при удачном итоге, и
+    следующее сообщение начинало разговор без сделанной работы (аудит 10.2026).
+    Сессия есть на диске, если ран дошёл до модели (requests). Не трогаем:
+    ран в чужой сессии (сторож, дело), сохранённую сессию и сброс посреди рана
+    (/reset force, /resume: эпоха сменилась), а также отказ API на сам запрос
+    (HTTP 4xx, кроме лимита): такую сессию следующий ран тоже не продолжит."""
+    status = getattr(result, "api_error_status", None)
+    if isinstance(status, int) and 400 <= status < 500 and status != 429:
+        return
+    if (own and result.is_error and result.session_id and getattr(result, "requests", 0)
+            and not store.get(chat_key) and _session_epoch(ctx, chat_key) == epoch):
+        log.info("failed run session kept chat=%s sid=%s", chat_key, result.session_id[:8])
+        store.set(chat_key, result.session_id)
 
 
 def _bump_session_epoch(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
@@ -321,6 +413,18 @@ async def _cleanup_abandoned_approvals(
     for p in abandoned:
         chat_id = p.target_chat_id if p.target_chat_id is not None else cfg.primary_chat_id
         thread_id = p.target_thread_id
+        card = getattr(p, "card_html", "")
+        if p.telegram_message_id is not None and card and len(card) + len(notice) + 2 <= TELEGRAM_MESSAGE_LIMIT:
+            # Пометка в самой карточке той же правкой, что снимает кнопки: без
+            # нового сообщения, и видно, какая карточка снята (ux2, 01.11.2026).
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id, message_id=p.telegram_message_id,
+                    text=f"{card}\n\n{notice}", parse_mode="HTML", reply_markup=None)
+                log.info("abandoned approval aid=%s %s (card edited)", p.approval_id, reason_tag)
+                continue
+            except Exception:
+                log.warning("abandoned card edit failed aid=%s, reply instead", p.approval_id, exc_info=True)
         try:
             # Номера нет после таймаута отправки карточки: кнопки не снять,
             # но пояснение всё равно нужно.
@@ -330,11 +434,20 @@ async def _cleanup_abandoned_approvals(
                     message_id=p.telegram_message_id,
                     reply_markup=None,
                 )
+                if reason_tag == "deny:cancelled-by-user":
+                    # Число снятых карточек называет ответ /cancel: отдельное
+                    # сообщение на каждую лишнее (аудит удобства 31.10.2026).
+                    continue
             # PTB сам опускает message_thread_id=None — танец с kwargs не нужен.
+            log.info("abandoned approval aid=%s %s", p.approval_id, reason_tag)
             await ctx.bot.send_message(
                 chat_id=chat_id,
-                text=_("{notice} · aid={aid}").format(notice=notice, aid=p.approval_id),
+                text=notice,
                 message_thread_id=thread_id,
+                # Ответом на карточку: видно, о какой речь (номер в журнале).
+                reply_to_message_id=p.telegram_message_id,
+                allow_sending_without_reply=True,
+                disable_notification=True,
             )
         except Exception:
             log.exception("failed to clear abandoned approval message aid=%s", p.approval_id)
@@ -527,14 +640,19 @@ async def _workshop_forward(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_ke
 
 @contextlib.asynccontextmanager
 async def _counted_lock(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
-                        lock: asyncio.Lock, prompt_text: str):
-    """Замок темы с учётом для /status: сколько ждут и чем занята мастерская."""
+                        lock: asyncio.Lock, prompt_text: str, long_wait: Awaitable[None] | None = None):
+    """Замок темы с учётом для /status: сколько ждут и чем занята мастерская.
+    long_wait: задача на время ожидания, замок получен или ожидание отменено,
+    она снимается."""
     waiting: dict[str, int] = ctx.application.bot_data.setdefault("lock_waiting", {})
     waiting[chat_key] = waiting.get(chat_key, 0) + 1
+    timer = asyncio.ensure_future(long_wait) if long_wait is not None else None
     try:
         await lock.acquire()
     finally:
         waiting[chat_key] -= 1
+        if timer is not None:
+            timer.cancel()
     workshop = _is_workshop(cfg, chat_key)
     try:
         if workshop:
@@ -544,6 +662,25 @@ async def _counted_lock(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: s
         if workshop:
             ctx.application.bot_data.pop("workshop_run", None)
         lock.release()
+
+
+# Сколько сообщение личной темы ждёт очереди, пока бот сам не скажет почему.
+WAIT_NOTE_SEC = 180.0
+
+
+async def _wait_note(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, msg: Any, pack: Any) -> None:
+    """Долгое ожидание замка личной темы: одна тихая строка, что её держит.
+    Та же строка в журнале бота объясняет ожидание задним числом (бэклог
+    Домового, разбор W44: 736 минут не объяснить по метаданным)."""
+    await asyncio.sleep(WAIT_NOTE_SEC)
+    if pack is not None and pack.cancelled:
+        return
+    watch: dict[str, Any] = ctx.application.bot_data.get("run_watch") or {}
+    status = next((s for s in list(watch.values()) if s.chat_key == chat_key), None)
+    what = status.headline().removeprefix("▶️ ") if status is not None else _("прошлый ход")
+    log.info("queue wait over %.0fs chat=%s holder=%s", WAIT_NOTE_SEC, chat_key, what)
+    with contextlib.suppress(Exception):
+        await msg.reply_text(_("⏳ жду: {what}, «!» прервёт").format(what=what), disable_notification=True)
 
 
 def _cost_day_add(ctx: ContextTypes.DEFAULT_TYPE, cost: float | None) -> None:
@@ -625,6 +762,31 @@ def _memory_scope_hint(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: st
     return proj.key if proj is not None else ""
 
 
+# Правило карточки плана (шаг 2 карточек, решение Ивана 29.10.2026). Путь
+# питона тот же, что ждёт approval._plan_request.
+PLAN_NOTE = N_(
+    "Карточки подтверждения: чтение идёт без карточки. Перед первым изменяющим "
+    "действием (правка файлов, команды с записью, работа на серверах) запроси у "
+    "Ивана план одной отдельной командой Bash: {python} -m claude_tg_bot.skills.plan "
+    "'<что сделаешь, где (хосты, каталоги, службы), чем проверишь>'. Текст в "
+    "одинарных кавычках без одинарной кавычки внутри, до 2500 знаков. После «✅ Делай "
+    "план» шаги этого запуска идут без карточек, кроме удаления данных, истории git "
+    "и push, отправки наружу, секретов, перезагрузки, внешних сервисов и правки "
+    "механизма подтверждений. Хосты и бакеты для rsync, scp и aws s3 называй в плане: "
+    "копирование на неназванные идёт карточкой. Новое сообщение Ивана значит новый "
+    "запуск: нужен новый план. Ответ «план не нужен» значит, что действия здесь уже "
+    "разрешены. Мелкая разовая правка обходится без плана, своей карточкой. По "
+    "каталогу ищи инструментом Grep: grep -r и rg по каталогу в Bash идут карточкой."
+)
+
+
+def _plan_note(cfg: Config, chat_key: str, task_topic: bool = False) -> str:
+    # В темах задач свои правила (обдумывание, «Делай»): план там не выдаётся.
+    if not getattr(cfg, "plan_cards", False) or chat_key in cfg.approve_auto_chat_keys or task_topic:
+        return ""
+    return _(PLAN_NOTE).format(python=_SKILL_PYTHON)
+
+
 def _persona_for(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str) -> str:
     """Persona + блок скоупинга темы.
 
@@ -638,6 +800,14 @@ def _persona_for(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str) -> 
     else:
         proj = _project_for(ctx, cfg, chat_key)
         block = proj.append_prompt if proj is not None else ""
+    chat_s, _sep, thread_s = chat_key.partition(":")
+    try:
+        task_topic = bool(thread_s) and _task_for(cfg, int(chat_s), int(thread_s), ctx) is not None
+    except ValueError:
+        task_topic = False
+    plan = _plan_note(cfg, chat_key, task_topic)
+    if plan:
+        block = f"{block}\n\n{plan}" if block else plan
     if not block:
         return cfg.persona_text
     if cfg.persona_text:
@@ -730,2310 +900,6 @@ async def on_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
           "сессией по первому сообщению и внутри неё не меняется, поэтому новый "
           "скоуп требует новой сессии.")
     )
-
-
-_ASK_BUTTON_CAP = 28
-
-
-def _ask_button_label(n: int, option: str) -> str:
-    """«1 · начало варианта…», не длиннее _ASK_BUTTON_CAP символов."""
-    label = f"{n} · {option}"
-    return label if len(label) <= _ASK_BUTTON_CAP else label[: _ASK_BUTTON_CAP - 1].rstrip() + "…"
-
-
-# Тот же вопрос с теми же вариантами, пока прежняя карточка ждёт ответа,
-# заново не шлётся (разбор недели W43, предложение 3: 38 повторов за 6 часов
-# на 173 вопроса; решение Ивана 25.10.2026).
-ASK_REPEAT_HOLD_SEC = 6 * 3600
-
-
-def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, list[str]], *,
-                 permission_mode: str, untrusted: bool, epoch: int) -> bool:
-    """Карточка этого вопроса с теми же вариантами в этом чате доставлена и
-    ждёт ответа: не нажата, та же сессия и тот же режим рана, моложе
-    ASK_REPEAT_HOLD_SEC. Нажатая карточка из реестра уходит, после рестарта
-    реестр пуст: тогда вопрос шлётся как обычно. Ответ словами карточку не
-    гасит: она по-прежнему нажимается, а повторы шли и после слов Ивана
-    (решение по предложению 3 разбора W43). epoch: эпоха сессии рана с
-    вопросом, снятая под замком темы."""
-    question, options = ask
-    pending: dict[str, dict] = ctx.application.bot_data.get("ask_options", {})
-    cards: dict[str, list[dict]] = {}
-    for v in pending.values():
-        if (v.get("chat_key") == chat_key and v.get("question") == question and v.get("msg")
-                and v.get("epoch") == epoch and v.get("permission_mode") == permission_mode
-                and bool(v.get("untrusted")) == untrusted):
-            cards.setdefault(v.get("card"), []).append(v)
-    now = time.time()
-    return any([v.get("answer") for v in vs] == list(options)
-               and float(vs[0].get("at") or 0) > now - ASK_REPEAT_HOLD_SEC for vs in cards.values())
-
-
-def _ask_picks_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> set[str]:
-    """Принятые ответы кнопкой этого чата, чей ход ещё не закончился. Ран,
-    закончившийся при непустом наборе (кроме своего ответа), задал вопрос, не
-    зная ответа Ивана."""
-    return ctx.application.bot_data.setdefault("ask_picks_queued", {}).setdefault(chat_key, set())
-
-
-def _ask_cards_changed(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
-    """Поколение карточек чата: растёт при каждой замене и принятом ответе.
-    Сбой отправки возвращает прежние карточки, только если поколение то же:
-    пустой реестр не значит, что между ними не было другой карточки."""
-    gens: dict[str, int] = ctx.application.bot_data.setdefault("ask_card_gen", {})
-    gens[chat_key] = gens.get(chat_key, 0) + 1
-    return gens[chat_key]
-
-
-def _take_ask_cards(pending: dict[str, dict], keep: Callable[[dict], bool]) -> list[dict]:
-    """Снимает из реестра все варианты карточек, у которых keep(вариант)
-    истинно, без единого await: нажатие, пришедшее следом, их уже не найдёт.
-    Возвращает по записи на карточку: сообщение, вопрос и варианты по порядку."""
-    taken = {t: v for t, v in pending.items() if keep(v)}
-    for t in taken:
-        pending.pop(t, None)
-    return _ask_cards_of(taken)
-
-
-def _ask_cards_of(options: dict[str, dict]) -> list[dict]:
-    """Варианты реестра по карточкам: сообщение, вопрос, варианты по порядку."""
-    cards: dict[Any, dict] = {}
-    for v in options.values():
-        c = cards.setdefault(v.get("card"), {"msg": v.get("msg"), "question": v.get("question", ""),
-                                             "options": []})
-        c["options"].append(v.get("answer", ""))
-    return list(cards.values())
-
-
-@contextlib.contextmanager
-def _ask_answer_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ref: dict):
-    """Ответ на вопрос ждёт замка темы и идёт своим ходом: пока ход не
-    кончился, вопрос другого рана сочинён без этого ответа и кнопками не
-    уходит (_send_ask_card; случай 29.10.2026: Иван нажал и его, второй ход
-    повторил первый). Снимается в конце хода, а не под замком: ран до него
-    шлёт карточку уже после замка, и ход ответа успел бы его взять."""
-    queued = uuid.uuid4().hex[:8]
-    ref["queued"] = queued
-    _ask_picks_queued(ctx, chat_key).add(queued)
-    try:
-        yield
-    finally:
-        _ask_picks_queued(ctx, chat_key).discard(queued)
-
-
-async def _retire_ask_cards(ctx: ContextTypes.DEFAULT_TYPE, cards: list[dict], note: str) -> None:
-    """Снятые карточки правятся на месте: кнопки убраны, внизу пометка. Без
-    отдельного сообщения на каждую замену (ревью Codex 29.10.2026)."""
-    for c in cards:
-        where = c.get("msg")
-        if not where:
-            continue
-        listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(c["options"], 1))
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_text(f"❓ {c['question']}\n\n{listing}\n\n{note}",
-                                            chat_id=where[0], message_id=where[1], reply_markup=None)
-
-
-async def _send_ask_card(
-    ctx: ContextTypes.DEFAULT_TYPE, update: Update, chat_key: str,
-    ask: tuple[str, list[str]], *, permission_mode: str, epoch: int,
-    untrusted: bool = False, own_queued: str | None = None,
-) -> None:
-    """Уточняющий вопрос Claude кнопками. Выбор уходит следующим сообщением
-    в ту же сессию — за рулём это тап вместо печати.
-
-    Вместе с ответом запоминаем режим рана и поколение сессии: иначе вопрос,
-    заданный внутри /plan, продолжался бы уже в обычном режиме (мутации без
-    решения по плану), а кнопка, нажатая после /reset, отвечала бы в чужую
-    сессию. Вопрос из рана по чужому тексту (untrusted) продолжается тоже
-    только на чтение: вариант ответа сочинён по этому тексту. Фоновость рана
-    не запоминается: нажатие делает Иван (on_ask_pick). Эпоха снята под
-    замком темы в конце рана: карточка уходит после сетевых ожиданий, и
-    /reset за это время дал бы ей эпоху новой сессии (ревью /2mind 25.10.2026).
-    """
-    question, options = ask
-    pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
-    # Telegram обрезает подпись кнопки по ширине экрана, и вариант читался
-    # наполовину. Полный текст вариантов идёт в самом сообщении с номерами,
-    # кнопка несёт номер и начало: выбор виден целиком до нажатия.
-    listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(options, 1))
-    # Вопрос, сочинённый без ответа Ивана из очереди или в прежней сессии,
-    # уходит без кнопок и ничьих карточек не гасит: карточка идёт уже после
-    # замка темы, и за это время мог прийти ответ или /reset (ревью 29.10.2026).
-    if _ask_picks_queued(ctx, chat_key) - {own_queued}:
-        stale = _("без кнопок: ты уже ответил на прежний вопрос, ответ в очереди")
-    elif epoch != _session_epoch(ctx, chat_key):
-        stale = _("без кнопок: сессия темы сменилась")
-    else:
-        stale = ""
-    if stale:
-        log.info("ask without buttons chat=%s", chat_key)
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(f"❓ {question}\n\n{listing}\n\n({stale})")
-        return
-    # Один текущий вопрос на чат (проект Домового 22.10.2026, 1.5; случай
-    # 29.10.2026: тот же вопрос другими словами дал две живые карточки, Иван
-    # нажал обе): любая прежняя карточка этого чата гаснет, а не только с тем
-    # же текстом, в том числе от фонового рана: варианты остаются в тексте,
-    # ответить можно словами. Вопросы дел живут в своём реестре и не задеваются.
-    # Снимаются до отправки, без await: иначе старую нажимали, пока шла новая,
-    # и обе давали ход. Сбой отправки возвращает их.
-    old = {t: v for t, v in pending.items() if v.get("chat_key") == chat_key}
-    for t in old:
-        pending.pop(t, None)
-    gen = _ask_cards_changed(ctx, chat_key)
-    # Токен вместо текста: callback_data ограничена 64 байтами.
-    rows = []
-    card_id = uuid.uuid4().hex[:8]
-    for opt in options:
-        token = uuid.uuid4().hex[:8]
-        pending[token] = {
-            "chat_key": chat_key,
-            "answer": opt,
-            "question": question,
-            "permission_mode": permission_mode,
-            "untrusted": untrusted,
-            "epoch": epoch,
-            "card": card_id,
-            "at": time.time(),
-        }
-        rows.append([InlineKeyboardButton(_ask_button_label(len(rows) + 1, opt),
-                                          callback_data=f"ask:{token}")])
-    try:
-        sent = await update.message.reply_text(
-            f"❓ {question}\n\n{listing}", reply_markup=InlineKeyboardMarkup(rows),
-        )
-        if isinstance(getattr(sent, "message_id", None), int):
-            where = (sent.chat_id, sent.message_id, getattr(sent, "message_thread_id", None))
-            mine = [v for v in pending.values() if v.get("card") == card_id]
-            for v in mine:
-                v["msg"] = where
-            if not mine:
-                # Пока карточка отправлялась, её уже сменила следующая (отправка
-                # идёт после замка темы): без сообщения та её не поправила.
-                await _retire_ask_cards(ctx, [{"msg": where, "question": question, "options": list(options)}],
-                                        _("↓ вопрос заменён новым ниже"))
-    except Exception:
-        log.exception("ask card failed")
-        for t, v in list(pending.items()):
-            if v.get("card") == card_id:
-                pending.pop(t, None)
-        if ctx.application.bot_data.get("ask_card_gen", {}).get(chat_key) == gen:
-            pending.update(old)
-            return
-    await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
-
-
-ASK_TTL_SEC = 12 * 3600
-
-
-def _card_msg_matches(picked: dict, message: Any) -> bool:
-    """Нажатие пришло под тем сообщением, куда ушла карточка. Токен живёт в
-    callback_data, и подставленный под другое сообщение разрешённого чата он
-    иначе сработал бы там (проект шага 1, 2.4). Карточка без запомненного
-    сообщения (не доставилась с message_id) не сверяется."""
-    where = picked.get("msg")
-    if not where:
-        return True
-    # chat.id, а не chat_id: у InaccessibleMessage (старше 48 ч) есть только chat.
-    chat_id = getattr(getattr(message, "chat", None), "id", None)
-    if chat_id is None:
-        chat_id = getattr(message, "chat_id", None)
-    return message is not None and chat_id == where[0] and getattr(message, "message_id", None) == where[1]
-
-
-def _ask_pick_refusal(picked: dict) -> str:
-    """Отказ называет вопрос и ответ: «сессия сменилась» без них не давало
-    понять, какая кнопка не сработала (задача Ивана 23.10.2026)."""
-    text = _("⚠️ сессия темы сменилась, ответ «{answer}» на вопрос «{question}» не отправлен: "
-             "если он ещё нужен, напиши его текстом").format(
-        answer=picked.get("answer", ""), question=picked.get("question", ""))
-    if picked.get("dropped_plan"):
-        # Нажатие сняло проект сразу, как текст Ивана (on_ask_pick).
-        text += "\n" + _("Проект решения снят, как после твоего сообщения; ответь текстом.")
-    return text
-
-
-async def _dropped_plan_note(msg: Any, ask_ref: dict | None) -> None:
-    """Нажатие уже сняло проект темы задачи (on_ask_pick), а ход отвергнут
-    лимитом или входом: сказать, что проекта больше нет."""
-    if ask_ref is not None and ask_ref.get("dropped_plan"):
-        with contextlib.suppress(Exception):
-            await msg.reply_text(_("Проект решения снят, как после твоего сообщения; ответь текстом."))
-
-
-async def on_ask_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    # Чат проверяется, как у текста: кнопка из группы вне разрешённых не
-    # должна отвечать в сессию (проект шага 1, 2.4).
-    if not _is_allowed(cfg, update):
-        return
-    token = (query.data or "").split(":", 1)[-1]
-    pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
-    if token in pending and not _card_msg_matches(pending[token], query.message):
-        # Чужое сообщение: вариант остаётся у своей карточки.
-        await _answer_quietly(query, _("Ответ не принят: кнопка не от этого вопроса."), show_alert=True)
-        return
-    picked = pending.pop(token, None)
-    if picked is not None:
-        # Соседние варианты гаснут вместе с выбранным, до первого await:
-        # иначе второй вариант, нажатый следом, проходил проверку и запускал
-        # второй ход (ревью Codex 29.10.2026).
-        _take_ask_cards(pending, lambda v: v.get("card") == picked.get("card"))
-    if picked is not None and picked.get("at") is not None and time.time() - float(picked["at"]) > ASK_TTL_SEC:
-        # Карточка пережила полдня (и сжатие сессии, эпоха при нём та же):
-        # ответ на неё уже не о том (проект 22.10.2026, 1.5).
-        picked = None
-    # Сверка эпохи одна на всё нажатие: /reset во время await ниже не должен
-    # дать снять проект, а потом отказать (ревью 25.10.2026).
-    same_session = picked is not None and picked.get("epoch") == _session_epoch(
-        ctx, str(picked.get("chat_key", "")))
-    if picked is not None and same_session:
-        # Ответ кнопкой в теме задачи снимает проект сразу, до первого await:
-        # иначе «Делай» успел бы выполнить снимаемое (ревью Codex 16.10).
-        # Кнопка сменившейся сессии ниже получит отказ и проект не трогает
-        # (ревью /2mind 25.10.2026).
-        ask_chat, _sep, ask_thread = str(picked.get("chat_key", "")).partition(":")
-        with contextlib.suppress(ValueError):
-            act, _was, _snap = _task_touch_now(ctx, int(ask_chat), int(ask_thread) if ask_thread else None, None)
-            if act in ("dropped", "cancelled"):
-                picked["dropped_plan"] = True
-    if picked is None:
-        # Реестр вариантов живёт в памяти: после рестарта бота кнопка молча
-        # теряла ответ. Ответ на нажатие один, поэтому причина в нём, а не
-        # после пустого query.answer() (ревью 12.10.2026).
-        await _answer_quietly(
-            query, _("Ответ не принят: вопрос устарел (старше 12 часов, заменён новым, бот "
-            "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."), show_alert=True,
-        )
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-    if not same_session:
-        await _ask_pick_finish(update, ctx, query, picked, same_session)
-        return
-    # Ответ встаёт в очередь чата до первого await: иначе вопрос другого рана,
-    # ушедший в это окно, получал кнопки, и его нажатие давало второй ход
-    # (ревью Codex 29.10.2026).
-    _ask_cards_changed(ctx, str(picked["chat_key"]))
-    with _ask_answer_queued(ctx, str(picked["chat_key"]), picked):
-        await _ask_pick_finish(update, ctx, query, picked, same_session)
-
-
-async def _ask_pick_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: Any, picked: dict,
-                           same_session: bool) -> None:
-    try:
-        await query.answer()
-    except Exception:
-        log.debug("callback answer failed (ignored)", exc_info=True)
-    chat_key = picked["chat_key"]
-    answer = picked["answer"]
-    card = query.message
-    if not same_session:
-        # Между вопросом и тапом был /reset, /resume или idle-сброс: отвечать
-        # в другую сессию бессмысленно и вводит в заблуждение. Новая сессия
-        # контекста вопроса не знает, а по его тексту роутер памяти мог бы
-        # закрепить её за другим заказчиком (ревью /2mind 25.10.2026).
-        try:
-            await query.edit_message_text(f"🗳 {card.text}\n\n{_ask_pick_refusal(picked)}")
-        except Exception:
-            pass
-        return
-    try:
-        await query.edit_message_text(f"🗳 {card.text}\n\n→ {answer}")
-    except Exception:
-        log.debug("ask card finalize failed (ignored)", exc_info=True)
-    # Время принятого нажатия для разбора недели (ожидание кнопки до старта
-    # рана); отказ по сроку и по смене сессии сюда не доходит.
-    log.info("ask pick chat=%s", chat_key)
-    # Ответ уходит вместе с вопросом: без него в сессии, где ран уже завершён,
-    # видно только голое «prod» без контекста.
-    prompt = _("[Ответ на вопрос «{question}»]: {answer}").format(question=picked.get('question', ''), answer=answer)
-    untrusted = bool(picked.get("untrusted"))
-    if untrusted:
-        prompt = _(UNTRUSTED_PROMPT_NOTE) + prompt
-    await _dispatch_ask_answer(update, ctx, card, prompt, picked, untrusted)
-
-
-async def _dispatch_ask_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, card: Any, prompt: str,
-                               picked: dict, untrusted: bool) -> None:
-    # update у callback-апдейта не имеет .message — заворачиваем сообщение
-    # карточки, у него реальный message_id и та же тема.
-    await _dispatch_to_claude(
-        Update(update_id=update.update_id, message=card), ctx, prompt,
-        send_voice_reply=False,
-        # Режим наследуется от рана, задавшего вопрос: уточнение внутри /plan
-        # обязано остаться в plan-режиме, а не начать мутации.
-        permission_mode=picked.get("permission_mode", "bypassPermissions"),
-        # Нажатие делает Иван, поэтому права как у его сообщения, даже если
-        # вопрос задал фоновый ран: сессия, где побывал чужой текст, не
-        # сбрасывается, как и после его текста (решение Ивана 25.10.2026;
-        # 23.10 сброс после сторожа выбросил ответ утреннему плану). Ответ на
-        # вопрос из рана по чужому тексту остаётся только на чтение.
-        unattended=False,
-        from_callback=True,
-        untrusted=untrusted,
-        # Сессия могла смениться, пока ответ ждал замка темы.
-        expect_epoch=picked.get("epoch"),
-        ask_ref=picked,
-    )
-
-
-# ---- Дела: вопросы утреннего плана (опыт В1, docs/design-2026-10-26-v1.md) ----
-
-DEAL_FIRST_NOTE = N_(
-    "[Это дело: ответвление утреннего плана с момента вопроса ниже. Главный разговор "
-    "лички идёт отдельно и получит строку итога. Данные Домового могли измениться "
-    "после вопроса: перед правкой перечитай их.]\n\n")
-
-
-def _deals_base(app: Any) -> Path:
-    return deals.deals_dir(app.bot_data["cfg"].state_dir)
-
-
-def _deal_update(app: Any, deal_id: str, fn: Callable[[dict], Any]) -> Any:
-    """fn(запись дела) под замком реестра. None: дела нет или реестр не
-    читается (это в журнал: ответ тогда не принимается, а не теряется молча)."""
-    try:
-        with deals.locked(_deals_base(app)) as data:
-            deal = data.get(deal_id)
-            return None if deal is None else fn(deal)
-    except (OSError, ValueError):
-        log.exception("deal registry failed id=%s", deal_id)
-        return None
-
-
-async def _send_deal_card(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, deal: dict) -> bool:
-    """Карточка вопроса дела: ярлык первой строкой, варианты из реестра на
-    диске (кнопка живёт и после рестарта). Прежняя карточка дела гаснет."""
-    rows = [[InlineKeyboardButton(_ask_button_label(i, opt), callback_data=f"deal:{deal['id']}:{i}")]
-            for i, opt in enumerate(deal["options"], 1)]
-    listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(deal["options"], 1))
-    try:
-        sent = await msg.reply_text(f"{deals.head(deal)}\n❓ {deal['question']}\n\n{listing}",
-                                    reply_markup=InlineKeyboardMarkup(rows))
-    except Exception:
-        log.exception("deal card failed id=%s", deal["id"])
-        return False
-    mid = getattr(sent, "message_id", None)
-
-    def remember(d: dict) -> Any:
-        old = d.get("card_msg")
-        d["card_msg"] = mid
-        return old
-
-    old = _deal_update(ctx.application, deal["id"], remember)
-    if old and old != mid:
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_reply_markup(chat_id=deal["chat_id"], message_id=old, reply_markup=None)
-    log.info("deal card id=%s chat=%s", deal["id"], deal["chat_id"])
-    return True
-
-
-async def _deal_open(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, chat_id: int, thread_id: int | None,
-                     ask: tuple[str, list[str]], *, qsid: str, quuid: str, qepoch: int) -> bool:
-    """Вопрос рана с флагом утра становится делом. False: дел уже DEAL_CAP,
-    реестр не пишется или карточка не ушла; тогда вопрос идёт обычной карточкой."""
-    try:
-        with deals.locked(_deals_base(ctx.application)) as data:
-            # Вчерашние дела не занимают места новому утру (ревью 26.10).
-            deals.close_stale(data, chat_id, thread_id)
-            if any(d.get("chat_id") == chat_id and d.get("thread_id") == thread_id and d.get("state") == "asked"
-                   and d.get("question") == ask[0] and deals.is_open(d) for d in data.values()):
-                # Тот же вопрос уже ждёт в деле: второе дело не заводится (ревью 26.10).
-                log.info("deal skipped why=same chat=%s", chat_id)
-                return True
-            if deals.open_count(data, chat_id, thread_id) >= deals.DEAL_CAP:
-                log.info("deal skipped why=cap chat=%s", chat_id)
-                return False
-            deal = deals.new_deal(chat_id=chat_id, thread_id=thread_id, qsid=qsid, quuid=quuid,
-                                  question=ask[0], options=ask[1])
-            # Эпоха сессии вопроса: запасной путь, если ответвиться не вышло.
-            deal["qepoch"] = qepoch
-            data[deal["id"]] = deal
-    except (OSError, ValueError):
-        log.exception("deal registry failed, ordinary card chat=%s", chat_id)
-        return False
-    if await _send_deal_card(ctx, msg, deal):
-        return True
-    _deal_update(ctx.application, deal["id"], lambda d: d.update(state="closed", error="card"))
-    return False
-
-
-def _deal_finish(app: Any, deal: dict, result: ClaudeResult, reply: str,
-                 ask: tuple[str, list[str]] | None) -> dict | None:
-    """Итог хода дела в реестр: idle или failed, строка итога для главного
-    разговора, новый вопрос того же дела. Запись дела для карточки или None."""
-    def finish(d: dict) -> dict | None:
-        if d.get("state") != "running":
-            return None
-        now = time.time()
-        log.info("deal done id=%s ok=%d sec=%.0f", d["id"], 0 if result.is_error else 1,
-                 now - float(d.get("answered_at") or now))
-        if result.is_error:
-            d.update(state="failed", error=(result.text or "")[:200], last_at=now)
-            return None
-        deals.add_note(d, deals.note_text(d, str(d.get("answer") or ""), reply), now)
-        if ask is None:
-            d.update(state="idle", last_at=now)
-            return None
-        deals.ask_again(d, ask[0], ask[1], now)
-        return dict(d)
-
-    return _deal_update(app, deal["id"], finish)
-
-
-def _deal_reply_target(ctx: ContextTypes.DEFAULT_TYPE, msg: Any) -> str | None:
-    """Дело, на сообщение которого ответили свайпом: сообщение самого бота с
-    ярлыком «🧵 <id> · …» в первой строке, дело этого чата. Пересланное это
-    чужой текст, а не ответ Ивана."""
-    reply = getattr(msg, "reply_to_message", None)
-    if reply is None or getattr(msg, "forward_origin", None) is not None:
-        return None
-    sender = getattr(reply, "from_user", None)
-    if sender is None or not getattr(sender, "is_bot", False):
-        return None
-    try:
-        if sender.id != ctx.bot.id:
-            return None
-    except Exception:
-        return None
-    did = deals.id_from_text(getattr(reply, "text", None) or getattr(reply, "caption", None))
-    if did is None:
-        return None
-    deal = deals.load(_deals_base(ctx.application)).get(did)
-    # Закрытое дело: обычный путь со склейкой и цитатой (ревью 26.10).
-    return did if (deal is not None and deal.get("chat_id") == getattr(msg, "chat_id", None)
-                   and deals.is_open(deal)) else None
-
-
-async def _deal_swipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: str, text: str) -> bool:
-    """Свайп-ответ в дело. False: дело закрыто, сообщение идёт обычным путём."""
-    msg = update.message
-    text = text.strip()
-    if text.startswith("!"):
-        # Поправка в деле это обычный ход дела: ран лички она не прерывает.
-        text = text[1:].strip()
-    if not text:
-        return True
-    seen: dict = {}
-
-    def take(d: dict) -> bool:
-        seen.update(state=d.get("state"), label=d.get("label"), card=d.get("card_msg"), chat=d.get("chat_id"))
-        return deals.accept(d, text, states=deals.SWIPE_STATES)
-
-    if not _deal_update(ctx.application, deal_id, take):
-        if seen.get("state") in ("accepted", "running"):
-            await msg.reply_text(_("🧵 дело «{label}» ещё отвечает: дождись ответа и ответь на него").format(
-                label=seen.get("label", "")))
-            return True
-        log.info("deal refused id=%s why=closed", deal_id)
-        await msg.reply_text(_("🧵 дело закрыто, пишу в главный разговор"))
-        return False
-    if seen.get("state") == "asked" and seen.get("card"):
-        # Ответ словами на вопрос дела: кнопки его карточки гаснут.
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_reply_markup(chat_id=seen["chat"], message_id=seen["card"], reply_markup=None)
-    log.info("deal pick id=%s via=swipe", deal_id)
-    await _deal_turn(update, ctx, deal_id, from_callback=False)
-    return True
-
-
-async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: str, *,
-                     from_callback: bool) -> None:
-    """Ход дела по принятому ответу (accepted). Первый ход идёт в ответвление
-    сессии вопроса с точки его ответа, следующие в сессию дела. Исход хода
-    всегда видим: ответ, отказ с причиной или «уйдёт после рестарта»."""
-    app = ctx.application
-    deal = deals.load(_deals_base(app)).get(deal_id)
-    if deal is None or deal.get("state") != "accepted":
-        return
-    answer = str(deal.get("answer") or "")
-    # Метка хода: тот же текст следующим свайпом это уже другой ход (ревью 26.10).
-    turn_at = deal.get("answered_at")
-    first = not deal.get("sid")
-    prompt = (_("[Ответ на вопрос «{question}»]: {answer}").format(question=deal.get("question", ""), answer=answer)
-              if deal.get("answering") else answer)
-    if first:
-        prompt = _(DEAL_FIRST_NOTE) + prompt
-    ref = {"id": deal_id, "sid": deal.get("sid"), "head": deals.head(deal),
-           "fork_at": (deal["qsid"], deal["quuid"]) if first else None, "fork_failed": False,
-           "started": False}
-    kind = "fork" if first else "resume" if from_callback else "reply"
-
-    def started() -> None:
-        # Процесс создан, промпт не подан: ошибка записи гасит его (run_claude).
-        if not _deal_update(app, deal_id, lambda d: d.get("answered_at") == turn_at and deals.start(d, answer)):
-            raise RuntimeError(f"deal {deal_id} changed before start")
-        ref["started"] = True
-        log.info("deal turn id=%s kind=%s", deal_id, kind)
-
-    refused: bool | None = None
-    crashed = True
-    try:
-        refused = await _dispatch_to_claude(
-            update, ctx, prompt, send_voice_reply=False, from_callback=from_callback, deal=ref,
-            on_run_start=started, allow_codex_fallback=False, deferred=True)
-        crashed = False
-    finally:
-        # Исход и при исключении или отмене посреди обработки: дело не
-        # остаётся «отвечает» до следующего рестарта (ревью 26.10).
-        if not ref["fork_failed"]:
-            await _deal_settle(app, update, deal_id, turn_at, answer, ref["head"],
-                               waits=not crashed and (refused is True or bool(app.bot_data.get("stopping"))))
-    if ref["fork_failed"]:
-        # Точки вопроса нет (сессию сжали или её файла нет): ответ на вопрос
-        # уходит по-старому, в главный разговор со сверкой эпохи вопроса.
-        _deal_update(app, deal_id, lambda d: d.update(state="closed", error="fork", last_at=time.time()))
-        log.info("deal refused id=%s why=fork", deal_id)
-        if deal.get("answering"):
-            ask_ref = {"question": deal.get("question", ""), "answer": answer}
-            with _ask_answer_queued(ctx, _chat_key(update)[0], ask_ref):
-                await _dispatch_to_claude(
-                    update, ctx, _("[Ответ на вопрос «{question}»]: {answer}").format(
-                        question=deal.get("question", ""), answer=answer),
-                    # Запреты дела остаются: без GPT и переноса в /at (ревью 26.10).
-                    send_voice_reply=False, from_callback=True, allow_codex_fallback=False,
-                    expect_epoch=deal.get("qepoch"), ask_ref=ask_ref)
-        else:
-            with contextlib.suppress(Exception):
-                await update.message.reply_text(ref["head"] + "\n" + _(
-                    "⚠️ дело закрыто: его разговор не открылся (сессию сжали или её нет), ответ «{answer}» "
-                    "не выполнен; напиши его в главный разговор").format(answer=answer))
-
-
-async def _deal_settle(app: Any, update: Update, deal_id: str, turn_at: Any, answer: str, head: str, *,
-                       waits: bool) -> None:
-    """Ход кончился без итога в реестре: не начинался (лимит, вход, отказ) или
-    оборвался (исключение, отмена). Ожидание перезапуска оставляет accepted."""
-    def settle(d: dict) -> str | None:
-        if d.get("answered_at") != turn_at:
-            return None
-        if d.get("state") == "accepted":
-            if waits:
-                return "kept"
-            d.update(state="failed", error="not started", last_at=time.time())
-            return "not started"
-        if d.get("state") == "running":
-            d.update(state="failed", error="run aborted", last_at=time.time())
-            return "aborted"
-        return None
-
-    outcome = _deal_update(app, deal_id, settle)
-    if outcome in ("not started", "aborted"):
-        log.info("deal done id=%s ok=0 why=%s", deal_id, outcome.replace(" ", "-"))
-        with contextlib.suppress(Exception):
-            await update.message.reply_text(
-                head + "\n" + (
-                    _("⚠️ ответ «{answer}» не выполнен (лимит, вход или сбой до старта); ответь здесь "
-                      "свайпом, когда будет можно") if outcome == "not started" else
-                    _("⚠️ ход по ответу «{answer}» оборвался, исход неизвестен; если нужно, ответь здесь "
-                      "свайпом")).format(answer=answer))
-
-
-async def on_deal_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка вопроса дела: вариант из реестра на диске, принимается один раз."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None or not _is_allowed(cfg, update):
-        return
-    parts = (query.data or "").split(":")
-    try:
-        deal_id, n = parts[1], int(parts[2])
-    except (IndexError, ValueError):
-        await _answer_quietly(query, _("Кнопка не разобрана."), show_alert=True)
-        return
-    card = query.message
-    chat_id = getattr(getattr(card, "chat", None), "id", None)
-    mid = getattr(card, "message_id", None)
-    seen: dict = {}
-
-    def take(d: dict) -> bool:
-        opts = d.get("options") or []
-        seen.update(state=d.get("state"), asked_at=float(d.get("asked_at") or 0))
-        if d.get("chat_id") != chat_id or d.get("card_msg") != mid or not 1 <= n <= len(opts):
-            seen["why"] = "card"
-            return False
-        if time.time() - seen["asked_at"] > ASK_TTL_SEC:
-            seen["why"] = "old"
-            return False
-        seen["answer"] = opts[n - 1]
-        if not deals.accept(d, opts[n - 1]):
-            seen["why"] = "taken"
-            return False
-        return True
-
-    if not _deal_update(ctx.application, deal_id, take):
-        why = seen.get("why")
-        log.info("deal refused id=%s why=%s", deal_id, why or "missing")
-        await _answer_quietly(query, {
-            "card": _("Ответ не принят: кнопка не от этого вопроса."),
-            "old": _("Ответ не принят: вопросу больше 12 часов. Если нужно, ответь на него свайпом."),
-            "taken": _("На этот вопрос уже ответили или дело ещё отвечает."),
-        }.get(why or "", _("Ответ не принят: дело не найдено.")), show_alert=True)
-        if why in ("old", "taken", None):
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
-        return
-    with contextlib.suppress(Exception):
-        await query.answer()
-    with contextlib.suppress(Exception):
-        # Ярлык остаётся первой строкой: свайп на карточку тоже идёт в дело.
-        await query.edit_message_text(f"{card.text}\n\n🗳 → {seen['answer']}")
-    log.info("deal pick id=%s via=button wait=%.0fs", deal_id, time.time() - seen["asked_at"])
-    await _deal_turn(Update(update_id=update.update_id, message=card), ctx, deal_id, from_callback=True)
-
-
-async def _deals_resume(app: Application) -> None:
-    """После рестарта: принятый и не начатый ответ уходит, оборванный ход
-    называется в чате (без повтора: он мог успеть что-то сделать)."""
-    try:
-        with deals.locked(_deals_base(app)) as data:
-            wake, cut = deals.startup(data)
-    except (OSError, ValueError):
-        log.exception("deal registry scan failed")
-        return
-    for d in cut:
-        log.info("deal done id=%s ok=0 why=restart", d["id"])
-        with contextlib.suppress(Exception):
-            await app.bot.send_message(
-                d["chat_id"], deals.head(d) + "\n" + (_(
-                    "⚠️ ответ «{answer}» не выполнен: бот не работал больше суток; если нужно, ответь "
-                    "здесь свайпом") if d.get("error") == "expired" else _(
-                    "⚠️ ответ «{answer}» прерван перезапуском бота, исход неизвестен; если нужно, ответь "
-                    "здесь свайпом")).format(answer=d.get("answer", "")),
-                message_thread_id=d.get("thread_id"))
-    tasks_set: set[asyncio.Task] = app.bot_data.setdefault("deal_tasks", set())
-    for d in wake:
-        ctx = ContextTypes.DEFAULT_TYPE(application=app)
-        task = asyncio.create_task(_deal_turn(_synthetic_update(app.bot, d["chat_id"], d.get("thread_id")),
-                                              ctx, d["id"], from_callback=True))
-        tasks_set.add(task)
-        task.add_done_callback(tasks_set.discard)
-
-
-# ---- Утренняя подборка новостей (skills/news_digest) ----
-
-async def on_news_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопки пункта подборки: «📌 В список» (строка в бэклог проекта, проект
-    выбирает модель, см. news_digest/backlog.py), «✖ Мимо» (пункт
-    сворачивается, отзыв для следующих отборов), «↩ Вернуть» (отмена «мимо»). Пункт берётся из выпуска на диске: подборку
-    шлёт таймер, а кнопку жмут и после рестарта бота. Ставить что-то по кнопке
-    нельзя (решение Ивана 08.10.2026): только ответом на пункт, через агента темы."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
-        return
-    base = news.news_dir(cfg.state_dir)
-    parsed = news.parse_callback(query.data or "")
-    item = news.load_item(base, parsed[0], parsed[1]) if parsed else None
-    if parsed is None or item is None:
-        await _answer_quietly(query, _("Кнопка от старого выпуска, она больше не работает"))
-        return
-    digest_id, _unused, action = parsed
-    now = datetime.now().astimezone()
-    if action == "p":
-        await _news_file_to_backlog(query, cfg, ctx, digest_id, item, now)
-        return
-    if action == "w":
-        await _task_start(query, cfg, ctx, digest_id, item, now)
-        return
-    if action == "x":
-        view, toast = "skipped", _("Учту: такое не нужно")
-    else:
-        view, toast = "open", _("Вернул")
-    try:
-        news.append_feedback(base, digest_id, item, action, now)
-    except OSError as e:
-        log.warning("news feedback write failed: %s", e)
-    await _answer_quietly(query, toast)
-    await _news_edit(query, item, digest_id, view)
-
-
-async def _news_edit(query, item, digest_id: str, view: str, where: str = "") -> None:
-    rows = news.item_buttons(item, digest_id, view)
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row] for row in rows]
-    ) if rows else None
-    try:
-        await query.edit_message_text(
-            news.render_item(item, view, where), parse_mode="HTML", reply_markup=markup,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-    except Exception:
-        log.debug("news item edit failed (ignored)", exc_info=True)
-
-
-async def _news_file_to_backlog(query, cfg: Config, ctx: ContextTypes.DEFAULT_TYPE,
-                                digest_id: str, item, now: datetime) -> None:
-    """«📌 В список»: модель выбирает проект, пункт уходит в его BACKLOG.md.
-    Пока идёт выбор, кнопок нет; повторное нажатие того же пункта не запускает
-    второй выбор. Не нашёлся проект или не записалось: кнопки возвращаются,
-    причина отдельным сообщением ответом на пункт."""
-    busy: set = ctx.application.bot_data.setdefault("news_filing", set())
-    key = (digest_id, item.n)
-    if key in busy:
-        await _answer_quietly(query, _("Уже выбираю бэклог"))
-        return
-    busy.add(key)
-    try:
-        await _answer_quietly(query, _("Выбираю бэклог"))
-        await _news_edit(query, item, digest_id, "busy")
-        base = news.news_dir(cfg.state_dir)
-        filed = await asyncio.to_thread(news_backlog.file_item, item, now.strftime("%Y-%m-%d"), base)
-        if filed.status in ("added", "dup"):
-            if filed.note:
-                log.warning("news backlog %s: %s", filed.name, filed.note)
-            where = filed.name + (f" ({filed.note})" if filed.note else "")
-            try:
-                news.append_feedback(base, digest_id, item, "p", now)
-            except OSError as e:
-                log.warning("news feedback write failed: %s", e)
-            await _news_edit(query, item, digest_id, "saved", where)
-            return
-        await _news_edit(query, item, digest_id, "open")
-        if filed.status == "none":
-            text = (_("Не нашёл проект для этого пункта: {note}. Ответь на пункт, куда его положить, или заведём новый проект.").format(note=filed.note)
-                    if filed.note else
-                    _("Не нашёл проект для этого пункта. Ответь на пункт, куда его положить, или заведём новый проект."))
-        else:
-            log.warning("news backlog failed: %s %s", filed.name, filed.note)
-            text = _("Не записалось в бэклог: {note}. Нажми ещё раз.").format(note=filed.note or _("см. журнал бота"))
-        msg = query.message
-        if msg is not None:
-            try:
-                await msg.reply_text(text, disable_notification=True)
-            except Exception:
-                log.debug("news backlog note failed (ignored)", exc_info=True)
-    finally:
-        busy.discard(key)
-
-
-# ---- Темы задач (tasks.py, переделка 16.10.2026) ----
-
-def _markup(rows: list[list[dict]]) -> InlineKeyboardMarkup | None:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row] for row in rows]
-    ) if rows else None
-
-
-def _task_for(cfg: Config, chat_id: int, thread_id: int | None,
-              ctx: ContextTypes.DEFAULT_TYPE | None = None) -> dict | None:
-    """Задача темы. Реестр не читается, а тема помечена как тема задачи:
-    задача без номера в обдумывании, чтобы ран шёл только чтением (ревью
-    Codex 13.10)."""
-    if thread_id is None:
-        return None
-    try:
-        return tasks.by_thread(tasks.load(tasks.registry_dir(cfg.state_dir), strict=True),
-                               chat_id, thread_id)
-    except (OSError, ValueError) as e:
-        log.error("news tasks registry unreadable: %s", e)
-        scopes = ctx.application.bot_data.get("scopes") if ctx is not None else None
-        if scopes is not None and (scopes.get(f"{chat_id}:{thread_id}") or "").startswith(_(tasks.SCOPE_PREFIX)):
-            return {"id": "", "status": "thinking", "chat_id": chat_id, "thread_id": thread_id}
-        return None
-
-
-def _task_update(cfg: Config, tid: str, expect: tuple[str, ...] | None = None,
-                 expect_sha: str | None = None, expect_exec: dict | None = None,
-                 **fields) -> dict | None:
-    """Правка задачи под замком реестра. expect: только из этих статусов;
-    expect_sha: только при этом отпечатке проекта; expect_exec: только пока
-    идёт это выполнение (tasks.exec_ref). Иначе None и ничего не меняется
-    (переходы без гонок, ревью Codex 13.10)."""
-    with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-        task = data.get(tid)
-        if task is None or (expect is not None and task.get("status") not in expect):
-            return None
-        if expect_sha is not None and task.get("plan_sha") != expect_sha:
-            return None
-        if expect_exec is not None and not tasks.exec_current(task, expect_exec):
-            return None
-        task.update(fields)
-        return dict(task)
-
-
-def _task_add_cost(cfg: Config, task: dict | None,
-                   result: ClaudeResult) -> tuple[dict, float, float] | None:
-    """Расход рана в задачу темы сразу после рана, под замком темы (проект
-    шага 3, 1.6): cost[сессия] = максимум прежнего и суммы сессии. (задача,
-    сумма до, после) или None вне темы задачи и у ответа без расхода (GPT,
-    отмена до ответа)."""
-    if not task or not task.get("id") or not result.session_id or result.session_cost_usd <= 0:
-        return None
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            current = data.get(task["id"])
-            if current is None:
-                return None
-            before, after = tasks.add_cost(current, result.session_id, result.session_cost_usd)
-            return dict(current), before, after
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, cost of %s not counted: %s", task["id"], e)
-        return None
-
-
-async def _task_cost_seen(ctx: ContextTypes.DEFAULT_TYPE, task: dict, before: float, after: float) -> None:
-    """Строка расхода на карточке, когда сдвинулась показанная сумма.
-    Предупреждение о пороге $5 убрано (решение Ивана 19.10.2026)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    # Зовётся после отправки ответа, вне замка темы: задачу могли закрыть,
-    # снимок рана затёр бы её карточку. Поэтому свежая запись, закрытая не
-    # трогается (ревью 14.10). До правки карточки await нет.
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            current = data.get(task["id"])
-            if current is None or current.get("status") not in tasks.OPEN_STATUSES:
-                return
-            task = dict(current)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, cost of %s not shown: %s", task["id"], e)
-        return
-    if tasks.cost_moved(before, after):
-        await _task_card(ctx, task)
-
-
-async def _task_card(ctx: ContextTypes.DEFAULT_TYPE, task: dict, status_line: str | None = None,
-                     buttons: bool = True) -> bool:
-    """Карточка задачи (первое сообщение темы): строка этапа и кнопка
-    «Закрыть». False, если правку стоит повторить (_edit_settled)."""
-    if not task.get("card_id"):
-        return True
-    status = task.get("status", "")
-    cfg: Config = ctx.application.bot_data["cfg"]
-    registry = tasks.load(tasks.registry_dir(cfg.state_dir))
-    line = _(status_line) if status_line else status_line
-    if not line:
-        line = tasks.stage_line(task)
-    # Расход из реестра, а не из переданной записи: её часто взяли до рана.
-    cost = tasks.cost_total(registry.get(task.get("id")) or task)
-    seen = (registry.get(task.get("id")) or {}).get("status")
-    attempts = 0
-
-    async def edit():
-        nonlocal attempts
-        attempts += 1
-        if attempts > 1:
-            # Повтор после паузы 429: за неё задачу могли сдвинуть, устаревшая
-            # правка вернула бы прежнюю строку (ревью Codex 14.10).
-            try:
-                fresh = tasks.load(tasks.registry_dir(cfg.state_dir), strict=True).get(task.get("id"))
-            except (OSError, ValueError):
-                fresh = None
-            if seen is not None and fresh is not None and fresh.get("status") != seen:
-                raise _StaleCard
-        return await ctx.bot.edit_message_text(
-            tasks.card_text(tasks.item_of(task), line, tasks.source_of(task), cost),
-            chat_id=task["chat_id"], message_id=task["card_id"],
-            reply_markup=_markup(tasks.card_buttons(task["id"], status)) if buttons else None,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-
-    try:
-        # 429 пережидается (живая проверка 14.10.2026). Правка идемпотентна.
-        await _send_retrying(edit)
-    except _StaleCard:
-        return True
-    except Exception as e:
-        log.debug("news task card edit failed (ignored)", exc_info=True)
-        return _edit_settled(e)
-    return True
-
-
-class _StaleCard(Exception):
-    """Правка карточки устарела за паузу 429: новее уже сделала своя."""
-
-
-def _edit_settled(e: Exception) -> bool:
-    """Правку повторять незачем: Telegram отказал явно (сообщения нет, текст
-    тот же, нет прав). Таймаут, сбой сети и 429 повторяются (ревью Codex 14.10)."""
-    return isinstance(e, (BadRequest, Forbidden))
-
-
-async def _task_news_item(ctx: ContextTypes.DEFAULT_TYPE, task: dict, where: str) -> bool:
-    """Пункт в теме «Новости»: ссылка на тему задачи или её итог. False, если
-    правку стоит повторить."""
-    mid = task.get("news_message_id")
-    if not mid:
-        return True
-    try:
-        await ctx.bot.edit_message_text(
-            news.render_item(tasks.item_of(task), "work", where), chat_id=task["chat_id"],
-            message_id=mid, parse_mode="HTML", reply_markup=None,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-    except Exception as e:
-        log.debug("news item edit failed (ignored)", exc_info=True)
-        return _edit_settled(e)
-    return True
-
-
-def _task_text(update: Update, text: str | None) -> str | None:
-    """Слова Ивана для разбора «делай»: пересланное это чужой текст."""
-    msg = update.message
-    if msg is not None and getattr(msg, "forward_origin", None) is not None:
-        return None
-    return text
-
-
-async def _task_touch(ctx: ContextTypes.DEFAULT_TYPE, update: Update, text: str | None = None,
-                      seen_sha: str | None = None) -> bool:
-    """Сообщение Ивана в теме задачи, сразу при получении (до склейки и
-    очереди темы), у голосового после расшифровки. «Делай» под проектом
-    одобряет его и в Claude не идёт: тогда True. Иное снимает проект:
-    обдумывание продолжается (ревью Codex 15.10: поправка перед
-    стартом не даёт выполнить старое одобрение). Во время выполнения
-    сообщение ждёт его конца; получение подтверждает общее «claude ещё
-    работает» очереди темы."""
-    _unused, chat_id, thread_id = _chat_key(update)
-    act, was, task = _task_touch_now(ctx, chat_id, thread_id, _task_text(update, text), seen_sha)
-    msg = update.message
-    if act == "go":
-        await _task_do(ctx, task["id"], task.get("plan_sha", ""), reply_to=msg)
-        return True
-    # Дальше сообщение идёт в Claude: подсказки и карточка фоном, без await
-    # до очереди темы, иначе следующее сообщение обогнало бы это (ревью Codex 16.10).
-    if act == "cancelled":
-        ctx.application.create_task(_reply_quietly(msg, _(
-            "Выполнение ещё не началось, одобрение снял: обдумываем дальше, "
-            "выполнение после нового «Делай».")))
-    if act in ("cancelled", "dropped") or (act == "thinking" and was in ("done", "failed")):
-        ctx.application.create_task(_task_card(ctx, task))
-    return False
-
-
-def _task_seen_sha(ctx: ContextTypes.DEFAULT_TYPE, update: Update) -> str:
-    """Отпечаток проекта под «Делай» в теме задачи сейчас, пусто: проекта нет."""
-    _unused, chat_id, thread_id = _chat_key(update)
-    if thread_id is None:
-        return ""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    task = tasks.by_thread(tasks.load(tasks.registry_dir(cfg.state_dir)), chat_id, thread_id)
-    return task.get("plan_sha", "") if task is not None and task.get("status") == "proposed" else ""
-
-
-def _task_touch_now(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, thread_id: int | None,
-                    text: str | None, seen_sha: str | None = None) -> tuple[str, str | None, dict | None]:
-    """tasks.touch под замком реестра, без await: (что случилось, прежний
-    статус, снимок задачи). Кнопка вопроса зовёт до первого await, чтобы
-    снимаемый проект не успели выполнить (ревью Codex 16.10)."""
-    if thread_id is None:
-        return "", None, None
-    cfg: Config = ctx.application.bot_data["cfg"]
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            task = tasks.by_thread(data, chat_id, thread_id)
-            if task is None:
-                return "", None, None
-            was = task.get("status")
-            act = tasks.touch(task, text, seen_sha)
-            return act, was, dict(task)
-    except (OSError, ValueError) as e:
-        log.error("news tasks registry unreadable: %s", e)
-        return "", None, None
-
-
-async def _reply_quietly(msg: Any, text: str) -> None:
-    with contextlib.suppress(Exception):
-        await msg.reply_text(text, disable_notification=True)
-
-
-def _task_turn(cfg: Config, task: dict) -> tuple[int | None, dict | None]:
-    """tasks.turn под замком реестра; нечитаемый реестр: без проекта. Второе:
-    снимок, если ход сменил этап (карточку надо поправить: сообщение или
-    добавка дождались конца выполнения, ревью Codex 19.10)."""
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            current = data.get(task["id"])
-            if current is None:
-                return None, None
-            was = current.get("status")
-            rev = tasks.turn(current)
-            return rev, dict(current) if current.get("status") != was else None
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, turn of %s not counted: %s", task["id"], e)
-        return None, None
-
-
-def _task_forget(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> None:
-    for store_name in ("sessions", "scopes", "topic_names", "scope_fingerprints"):
-        store = ctx.application.bot_data.get(store_name)
-        if store is not None:
-            store.remove(chat_key)
-
-
-async def _task_start(query, cfg: Config, ctx: ContextTypes.DEFAULT_TYPE,
-                      digest_id: str, item, now: datetime) -> None:
-    """«🛠 В работу» под новостью: тема на задачу и сразу обдумывание. Место
-    в реестре занимается до запроса к Telegram: двойное нажатие и два пункта
-    разом не создадут лишних тем."""
-    msg = query.message
-    if msg is None:
-        return
-    bd = ctx.application.bot_data
-    if bd.get("draining") or bd.get("stopping"):
-        await _answer_quietly(query, _("♻️ бот готовится к перезапуску, задача не заведена: "
-                              "повтори через пару минут"), show_alert=True)
-        return
-    # Заведение темы это работа для перезапуска (ревью 14.10). Без await после проверки.
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    try:
-        await _task_start_admitted(query, cfg, ctx, digest_id, item, now)
-    finally:
-        bd["active_work"] -= 1
-
-
-async def _task_start_admitted(query, cfg: Config, ctx: ContextTypes.DEFAULT_TYPE,
-                               digest_id: str, item, now: datetime) -> None:
-    msg = query.message
-    base = tasks.registry_dir(cfg.state_dir)
-    chat_id = msg.chat_id
-    try:
-        with tasks.locked(base) as data:
-            kind, task = tasks.reserve(data, tasks.task_id(digest_id, item.n), item, chat_id, now,
-                                       digest=digest_id)
-            if kind == "new":
-                task["news_message_id"] = msg.message_id
-            task = dict(task) if task else None
-            opened = [dict(t) for t in tasks.taken(data)]
-    except (OSError, ValueError) as e:
-        log.error("news tasks registry unreadable: %s", e)
-        await _answer_quietly(query, _("Реестр задач не читается, см. журнал бота"), show_alert=True)
-        return
-    if kind == "exists":
-        if task.get("status") in tasks.OPEN_STATUSES and task.get("thread_id"):
-            await _answer_quietly(query, _("Задача по этому пункту уже в работе"))
-            await _news_edit(query, item, digest_id, "work",
-                             tasks.topic_link(chat_id, task["thread_id"]))
-        elif task.get("status") == "creating":
-            await _answer_quietly(query, _("Тема задачи по этому пункту уже заводится"))
-        else:
-            await _answer_quietly(query, _("Задача по этому пункту уже была"))
-        return
-    if kind == "full":
-        await _answer_quietly(query, _("Открыто {count} задач: сначала закрой одну").format(count=tasks.MAX_OPEN),
-                              show_alert=True)
-        with contextlib.suppress(Exception):
-            await msg.reply_text(_("Открытые задачи:\n{lines}").format(lines=tasks.open_list(opened)),
-                                 disable_notification=True,
-                                 link_preview_options=LinkPreviewOptions(is_disabled=True))
-        return
-    await _answer_quietly(query, _("Завожу тему задачи"))
-    try:
-        thread_id, _unused = await _task_create(ctx, cfg, task, tasks.intro_prompt(item))
-    except Exception as e:
-        _task_unborn(cfg, task["id"])
-        log.warning("news task topic create failed: %s", e)
-        with contextlib.suppress(Exception):
-            await msg.reply_text(
-                _("Тема задачи не создалась ({error}). Если тема всё же появилась, "
-                  "удали её и нажми «В работу» ещё раз.").format(error=type(e).__name__), disable_notification=True)
-        return
-    try:
-        news.append_feedback(news.news_dir(cfg.state_dir), digest_id, item, "w", now)
-    except OSError as e:
-        log.warning("news feedback write failed: %s", e)
-    await _news_edit(query, item, digest_id, "work", tasks.topic_link(chat_id, thread_id))
-
-
-async def _task_base_name(item) -> str:
-    """Имя темы до цифры. Слова Ивана называет дешёвая модель в потоке (бот
-    не стоит, замок реестра не держится); сбой, таймаут или мусорный ответ:
-    первые слова кодом. У новостей имя от модели отбора (решение Ивана 14.10.2026)."""
-    fallback = tasks.fallback_name(item)
-    if item.kind != "task":
-        return fallback
-    try:
-        return await asyncio.to_thread(tasks.model_name, item.text) or fallback
-    except Exception as e:
-        log.warning("task name by model failed, taking first words: %s", e)
-        return fallback
-
-
-def _task_assign_name(cfg: Config, tid: str, base_name: str) -> str:
-    """Номер и имя в запись задачи: выбор и запись одним блоком под замком
-    реестра, две одновременные задачи не получат один номер."""
-    with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-        return tasks.assign_name(data, tid, base_name)
-
-
-async def _task_topic_icon(ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """custom_emoji_id значка темы задачи среди разрешённых Telegram значков
-    тем (tasks.pick_icon), None если подходящего нет: тогда значок идёт в имени.
-    Набор спрашивается один раз за работу бота. Сбой запроса не запоминается:
-    следующая тема спросит снова."""
-    bd = ctx.application.bot_data
-    if "task_topic_icon" in bd:
-        return bd["task_topic_icon"]
-    try:
-        icon = tasks.pick_icon(await ctx.bot.get_forum_topic_icon_stickers())
-    except Exception as e:
-        log.warning("forum topic icons not loaded, icon goes in the name: %s", e)
-        return None
-    bd["task_topic_icon"] = icon
-    return icon
-
-
-async def _task_create(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, task: dict, prompt: str,
-                       note: str | None = None) -> tuple[int, str]:
-    """Тема по занятой записи реестра (статус creating): имя, тема, сразу номер
-    темы в реестр, пометка темы, обдумывание, карточка с закреплением, ран
-    обдумывания фоном. Вернёт номер темы и её имя. Тема не создалась: запись
-    снимается, исключение уходит вызывающему, он и объясняет Ивану."""
-    base = tasks.registry_dir(cfg.state_dir)
-    tid, chat_id = task["id"], task["chat_id"]
-    item = tasks.item_of(task)
-    short = _task_assign_name(cfg, tid, await _task_base_name(item))
-    # Значок темы настоящий, если Telegram такой разрешает; иначе цвет, а в
-    # имени значка нет: номер впереди важнее (решение Ивана 14.10.2026).
-    icon = await _task_topic_icon(ctx)
-    try:
-        if icon:
-            topic = await ctx.bot.create_forum_topic(chat_id, short, icon_custom_emoji_id=icon)
-        else:
-            topic = await ctx.bot.create_forum_topic(chat_id, short, icon_color=tasks.TOPIC_ICON_COLOR)
-    except Exception:
-        # Ответ мог потеряться, а тема создаться: повторять вслепую нельзя.
-        with tasks.locked(base) as data:
-            data.pop(tid, None)
-        raise
-    thread_id = topic.message_thread_id
-    # Номер темы в реестр первым делом: упади бот дальше, уборка найдёт и удалит её.
-    task = _task_update(cfg, tid, thread_id=thread_id) or task
-    chat_key = f"{chat_id}:{thread_id}"
-    # Имя пишем сами: событие создания темы ботом в кэш не попадает. Пометка
-    # темы без имён проектов: память закрепит первое сообщение рана (у слов
-    # Ивана к ней дописана исходная тема, решение Ивана 13.10.2026).
-    if note is None:
-        note = tasks.scope_note()
-    for store_name, value in (("topic_names", short), ("scopes", note)):
-        store: SessionStore | None = ctx.application.bot_data.get(store_name)
-        if store is not None:
-            store.set(chat_key, value)
-    task = _task_update(cfg, tid, expect=("creating",), status="thinking") or task
-    task = await _task_new_card(ctx, task, tasks.STAGE_LINES["creating"], "thinking")
-    # Обдумывание до его конца это работа для перезапуска по заявке (ревью
-    # 14.10). Счёт до create_task: вызывающий держит свой, снимает _task_intro.
-    bd = ctx.application.bot_data
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    try:
-        ctx.application.create_task(_task_intro(ctx, task, prompt))
-    except BaseException:
-        bd["active_work"] -= 1
-        raise
-    return thread_id, short
-
-
-async def _task_new_card(ctx: ContextTypes.DEFAULT_TYPE, task: dict, line: str, status: str) -> dict:
-    """Карточка задачи новым сообщением с закреплением: при заведении темы и
-    при старте бота у живой задачи, чья карточка тогда не ушла (ревью Codex
-    14.10). Вернёт запись с номером карточки или прежнюю, если не ушла."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    tid, chat_id = task["id"], task["chat_id"]
-    source = tasks.source_of(task)
-    try:
-        card = await _send_retrying(lambda: ctx.bot.send_message(
-            chat_id, tasks.card_text(tasks.item_of(task), _(line), source, tasks.cost_total(task)),
-            message_thread_id=task["thread_id"],
-            reply_markup=_markup(tasks.card_buttons(tid, status)), disable_notification=True,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        ))
-        task = _task_update(cfg, tid, card_id=card.message_id) or task
-        with contextlib.suppress(Exception):
-            await ctx.bot.pin_chat_message(chat_id, card.message_id, disable_notification=True)
-    except Exception:
-        log.warning("news task card failed", exc_info=True)
-    return task
-
-
-def _task_unborn(cfg: Config, tid: str) -> None:
-    """Сбой до запроса темы: запись снимается, как при сбое
-    create_forum_topic (ревью 14.10). Запись с номером темы остаётся: тему
-    найдёт и удалит уборка."""
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            task = data.get(tid)
-            if task is not None and task.get("status") == "creating" and not task.get("thread_id"):
-                data.pop(tid)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, %s not freed: %s", tid, e)
-
-
-def _tasks_chat_id() -> int | None:
-    """Группа тем задач: та же, что у «Новостей» (проект шага 3, 1.4)."""
-    try:
-        return int(os.environ.get("NEWS_TG_CHAT_ID", "").strip())
-    except ValueError:
-        return None
-
-
-def _is_task_ask_reply(ctx: ContextTypes.DEFAULT_TYPE, msg: Any) -> bool:
-    """Ответ на подсказку пустой /task. Состояние не хранится: узнаём по
-    сообщению бота с началом tasks.ASK, на которое ответили (проект шага 3,
-    1.4). Пересланное это чужой текст, а не ответ Ивана."""
-    reply = getattr(msg, "reply_to_message", None)
-    if reply is None or getattr(msg, "forward_origin", None) is not None:
-        return False
-    sender = getattr(reply, "from_user", None)
-    if sender is None or not getattr(sender, "is_bot", False):
-        return False
-    try:
-        if sender.id != ctx.bot.id:
-            return False
-    except Exception:
-        # Бот без get_me не знает своего id: подсказку не узнать.
-        return False
-    return (getattr(reply, "text", None) or "").startswith(_(tasks.ASK))
-
-
-async def on_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/task <что сделать>: тема задачи в группе «Новостей» и сразу обдумывание."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    if not _is_allowed(cfg, update):
-        return
-    msg = update.message
-    parts = (msg.text or "").split(maxsplit=1)
-    words = parts[1].strip() if len(parts) > 1 else ""
-    if not words:
-        # На телефоне команда из меню уходит сразу, без текста: подсказка с
-        # принудительным ответом, Telegram сам откроет поле ответа.
-        await msg.reply_text(_(tasks.ASK), reply_markup=ForceReply(selective=True,
-                                                                 input_field_placeholder=_("что сделать")))
-        return
-    await _task_command(update, ctx, words)
-
-
-async def _task_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE, words: str) -> None:
-    """Задача по словам Ивана: из /task или из ответа на её подсказку. Ответ
-    в теме, где набрали, правится в ссылку на новую тему."""
-    msg = update.message
-    chat_key, chat_id, thread_id = _chat_key(update)
-    no_preview = LinkPreviewOptions(is_disabled=True)
-    origin = None
-    with contextlib.suppress(Exception):
-        origin = await msg.reply_text(_("Завожу тему задачи…"), disable_notification=True)
-    # ask_id: на это сообщение Ивана ответит строка итога после закрытия,
-    # если задача из лички (решение Ивана 19.10.2026).
-    text = await _task_new(ctx, words, tasks.command_id(chat_id, msg.message_id), origin_key=chat_key,
-                           origin={"chat_id": chat_id, "thread_id": thread_id, "ask_id": msg.message_id,
-                                   "message_id": origin.message_id if origin is not None else None})
-    with contextlib.suppress(Exception):
-        if origin is not None:
-            await ctx.bot.edit_message_text(text, chat_id=chat_id, message_id=origin.message_id,
-                                            link_preview_options=no_preview)
-        else:
-            await msg.reply_text(text, link_preview_options=no_preview)
-
-
-async def _task_new(ctx: ContextTypes.DEFAULT_TYPE, words: str, tid: str, origin_key: str | None = None,
-                    origin: dict | None = None, context: str = "") -> str:
-    """Задача по словам Ивана из любого входа (/task, Домовой через POST
-    /task). Вернёт строку для ответа: ссылку на тему или причину отказа.
-    tid: повторная доставка того же входа найдёт занятую запись, второй темы
-    не будет. origin_key: тема, чья память переходит в задачу (решение Ивана
-    13.10.2026, вопрос 3а)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    group = _tasks_chat_id()
-    if group is None:
-        return _("Темы задач заводятся в группе с «Новостями», а она не задана "
-                 "(NEWS_TG_CHAT_ID в .env бота).")
-    bd = ctx.application.bot_data
-    if bd.get("draining") or bd.get("stopping"):
-        return _("♻️ бот готовится к перезапуску, задача не заведена: повтори через пару минут")
-    # Заведение темы это работа для перезапуска (ревью 14.10). Без await после проверки.
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    try:
-        item = tasks.command_item(words)
-        try:
-            with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-                kind, task = tasks.reserve(data, tid, item, group, datetime.now().astimezone(),
-                                           source="command", trusted=True, origin=origin,
-                                           context=context.strip()[:tasks.COMMAND_TEXT_MAX])
-                task = dict(task) if task else None
-                opened = [dict(t) for t in tasks.taken(data)]
-        except (OSError, ValueError) as e:
-            log.error("tasks registry unreadable: %s", e)
-            return _("Реестр задач не читается, см. журнал бота")
-        if kind == "exists":
-            if task.get("status") == "creating":
-                return _("Тема этой задачи уже заводится")
-            if task.get("status") in tasks.OPEN_STATUSES and task.get("thread_id"):
-                return _("Задача уже заведена: {link}").format(link=tasks.topic_link(task['chat_id'], task['thread_id']))
-            return _("Эта задача уже была и закрыта")
-        if kind == "full":
-            return (_("Открыто {count} задач, сначала закрой одну:\n").format(count=tasks.MAX_OPEN)
-                    + tasks.open_list(opened))
-        note = tasks.scope_note(_memory_scope_hint(ctx, cfg, origin_key) if origin_key else "")
-        try:
-            new_thread, short = await _task_create(
-                ctx, cfg, task, tasks.command_intro_prompt(item.text, context), note)
-        except Exception as e:
-            _task_unborn(cfg, tid)
-            log.warning("task topic create failed %s: %s", tid, e)
-            return (_("Тема задачи не создалась ({error}). Если тема всё же появилась, "
-                      "удали её и повтори.").format(error=type(e).__name__))
-        return _("Задача «{short}»: {link}").format(short=short, link=tasks.topic_link(group, new_thread))
-    finally:
-        bd["active_work"] -= 1
-
-
-async def _task_from_http(ctx: ContextTypes.DEFAULT_TYPE, words: str, context: str, key: str,
-                          chat_key: str = "", ask_id: int | None = None, to: str = "") -> str:
-    """Вход POST /task (Домовой, скилл task_new): задача как из /task в
-    личном чате, память этого чата переходит в задачу. chat_key и ask_id из
-    окружения позвавшего рана: откуда звали и на какое сообщение Ивана
-    ответит строка итога после закрытия (решение Ивана 19.10.2026). Без темы
-    рана (вызов из терминала): личка, без ответа. to: слова добавляются в
-    открытую задачу (_task_add)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    if to:
-        if chat_key != str(cfg.primary_chat_id):
-            # Добавлять в задачу из лички, то есть Домовому; от случайного
-            # вызова агентом другой темы, не от умысла (ревью Codex 19.10).
-            return _("Добавить в задачу можно только из личного чата с ботом")
-        return await _task_add(ctx, to, words, context, key)
-    tid = f"h{key}" if key else f"h{int(time.time() * 1000)}"
-    chat, _sep, thread = (chat_key or str(cfg.primary_chat_id)).partition(":")
-    origin = {"chat_id": int(chat), "thread_id": int(thread) if thread else None, "ask_id": ask_id}
-    return await _task_new(ctx, words, tid, origin_key=str(cfg.primary_chat_id), origin=origin,
-                           context=context)
-
-
-async def _task_add(ctx: ContextTypes.DEFAULT_TYPE, tid: str, words: str, context: str = "",
-                    key: str = "") -> str:
-    """Слова Ивана через Домового в открытую задачу (решение Ивана 19.10.2026):
-    видны в теме и идут ходом обдумывания, как его сообщение там. «Делай» так
-    не одобряется (касание без текста), закрыть нельзя: это только в теме.
-    Идущее выполнение добавка ждёт, как сообщение в теме. key: повтор того
-    же запроса (Домовой не дождался ответа) второй раз не добавляет. Вернёт
-    строку для ответа: что добавлено и куда, или причину отказа.
-
-    Добавки к одной задаче идут по очереди (замок задачи), проект снимается
-    до первого ожидания сети, отметка «обдумывание идёт» и учёт работы
-    ставятся сразу: авария после приёма видна в теме при старте (ревью Codex
-    19.10)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    bd = ctx.application.bot_data
-    locks: dict[str, asyncio.Lock] = bd.setdefault("task_add_locks", {})
-    async with locks.setdefault(tid, asyncio.Lock()):
-        if bd.get("draining") or bd.get("stopping"):
-            return _("♻️ бот готовится к перезапуску, в задачу не добавлено: повтори через пару минут")
-        try:
-            task = tasks.load(tasks.registry_dir(cfg.state_dir), strict=True).get(tid)
-        except (OSError, ValueError) as e:
-            log.error("tasks registry unreadable: %s", e)
-            return _("Реестр задач не читается, см. журнал бота")
-        if task is None:
-            return _("Задачи {tid} нет: открытые показывает task_new --open").format(tid=tid)
-        if task.get("status") == "creating" or not task.get("thread_id"):
-            return _("Тема задачи ещё заводится: повтори через минуту")
-        if task.get("status") not in tasks.OPEN_STATUSES:
-            return _("Задача «{name}» закрыта: заведи новую и в пояснении сошлись на неё").format(
-                name=tasks.short_name(task))
-        link = tasks.topic_link(task["chat_id"], task["thread_id"])
-        if key and key in (task.get("add_keys") or ()):
-            return _("Уже добавлено в задачу «{name}»: {link}").format(name=tasks.short_name(task), link=link)
-        # До первого await: касание без текста снимает проект и не начатое
-        # одобрение («делай» в словах одобрением не считается), отметка и
-        # учёт работы: перезапуск по заявке ждёт этот ход.
-        act, was, snap = _task_touch_now(ctx, task["chat_id"], task["thread_id"], None)
-        with contextlib.suppress(OSError, ValueError):
-            _task_update(cfg, tid, expect=tasks.OPEN_STATUSES, think_open=ADD_PENDING)
-        bd["active_work"] = bd.get("active_work", 0) + 1
-        try:
-            if snap is not None and (act in ("cancelled", "dropped")
-                                     or (act == "thinking" and was in ("done", "failed"))):
-                ctx.application.create_task(_task_card(ctx, snap))
-            try:
-                await _send_retrying(lambda: ctx.bot.send_message(
-                    task["chat_id"], tasks.addition_echo(words), message_thread_id=task["thread_id"],
-                    link_preview_options=LinkPreviewOptions(is_disabled=True)))
-            except Exception as e:
-                log.warning("task addition echo failed %s", tid, exc_info=True)
-                _task_add_settle(cfg, tid)
-                bd["active_work"] -= 1
-                return _("В тему задачи не ушло ({error}), не добавлено").format(error=type(e).__name__)
-            ctx.application.create_task(_task_add_run(ctx, task, tasks.addition_prompt(words, context)))
-        except BaseException:
-            bd["active_work"] -= 1
-            raise
-        if key:
-            with contextlib.suppress(OSError, ValueError):
-                with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-                    if tid in data:
-                        tasks.remember_add_key(data[tid], key)
-    if act == "busy":
-        return _("Добавил в задачу «{name}», агент ответит после идущего выполнения: {link}").format(
-            name=tasks.short_name(task), link=link)
-    return _("Добавил в задачу «{name}»: {link}").format(name=tasks.short_name(task), link=link)
-
-
-# Отметка think_open от приёма добавки до старта её рана: ран ставит свой
-# номер хода, а оставшаяся после аварии видна при старте (_tasks_recover).
-ADD_PENDING = "add"
-
-
-def _task_add_settle(cfg: Config, tid: str) -> None:
-    """Снять отметку приёма добавки, если её не сменил ран."""
-    with contextlib.suppress(OSError, ValueError):
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            if (data.get(tid) or {}).get("think_open") == ADD_PENDING:
-                data[tid]["think_open"] = None
-
-
-async def _task_add_run(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -> None:
-    """Ход обдумывания по словам из _task_add; учёт работы снимается здесь."""
-    try:
-        upd = _synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
-        await _dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True)
-    except Exception:
-        log.exception("task addition run failed %s", task["id"])
-    finally:
-        _task_add_settle(ctx.application.bot_data["cfg"], task["id"])
-        ctx.application.bot_data["active_work"] -= 1
-
-
-async def _task_intro(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -> None:
-    """Первое обдумывание темы задачи. Учёт работы взял _task_create, здесь он
-    снимается. Работу приняли до заявки на перезапуск, поэтому admitted: её
-    доводят, а не отклоняют (ревью 14.10)."""
-    try:
-        upd = _synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
-        try:
-            await _dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, permission_mode="plan",
-                                      admitted=True)
-        except Exception:
-            log.exception("news task intro failed %s", task["id"])
-        # Задачу могли закрыть, пока уходил ответ: снимок с заведения темы затёр
-        # бы её карточку. Свежая запись, закрытая не трогается (ревью 14.10).
-        try:
-            current = tasks.load(tasks.registry_dir(ctx.application.bot_data["cfg"].state_dir),
-                                 strict=True).get(task["id"])
-        except (OSError, ValueError) as e:
-            log.error("tasks registry unreadable, intro card of %s by snapshot: %s", task["id"], e)
-            current = task
-        if current is not None and current.get("status") in tasks.OPEN_STATUSES:
-            await _task_card(ctx, current)
-    finally:
-        ctx.application.bot_data["active_work"] -= 1
-
-
-async def _task_thought(ctx: ContextTypes.DEFAULT_TYPE, update: Update, task: dict, rev: int,
-                        reply: str, skill: str) -> None:
-    """Ответ обдумывания с маркером <<DO>>: проект решения под «▶️ Делай».
-    Без нажатия не выполняется ничего: самостоятельные скиллы убраны
-    (решение Ивана 19.10.2026)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    chat_key = f"{task['chat_id']}:{task['thread_id']}"
-    if _queued_count(ctx, chat_key) or _gather_pending(ctx, chat_key):
-        # Следом ждут сообщения Ивана (в очереди темы или ещё в склейке): этот
-        # ответ уже не про его последнее слово, проект даст следующий ход
-        # (ревью Codex 16.10 и 19.10).
-        return
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            current = data.get(task["id"])
-            if current is None or not tasks.propose(current, rev, reply, skill):
-                return
-            proposed = dict(current)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, proposal of %s lost: %s", task["id"], e)
-        return
-    with contextlib.suppress(Exception):
-        # Скилл идёт в выполнение отдельной строкой: Иван видит его до нажатия
-        # (ревью Codex 18.10).
-        how = _(" (по скиллу «{skill}»)").format(skill=skill) if skill else ""
-        await _send_retrying(lambda: update.message.reply_text(
-            _("Делать по проекту выше{how}? Кнопка или слово «делай»; другое сообщение "
-              "продолжит обдумывание.").format(how=how),
-            reply_markup=_markup(tasks.do_buttons(proposed["id"], proposed["plan_sha"])),
-            disable_notification=True))
-    await _task_card(ctx, proposed)
-
-
-async def _task_do(ctx: ContextTypes.DEFAULT_TYPE, tid: str, sha: str, press: str | None = None,
-                   query=None, reply_to: Any = None) -> None:
-    """«▶️ Делай» кнопкой или словом. Одобрение привязано к отпечатку
-    проекта: устаревшая кнопка не выполнит новый текст. Выполнение свободно:
-    сразу; занято другой задачей: ответ «занято», проект ждёт дальше и кнопка
-    остаётся рабочей (очередь убрана, разбор 19.10.2026)."""
-    bd = ctx.application.bot_data
-    cfg: Config = bd["cfg"]
-
-    async def say(text: str, alert: bool = False) -> None:
-        if query is not None:
-            await _answer_quietly(query, text, show_alert=alert)
-        elif reply_to is not None:
-            with contextlib.suppress(Exception):
-                await reply_to.reply_text(text, disable_notification=True)
-
-    if bd.get("draining") or bd.get("stopping"):
-        await say(_("♻️ бот готовится к перезапуску: скажи «делай» после рестарта"), alert=True)
-        return
-    # Проверка ожидания, переход и учёт работы без await между ними: рестарт
-    # не начнётся между одобрением и стартом выполнения.
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            kind, task = tasks.approve(data, tid, sha, _task_live(bd), press=press)
-            task = dict(task) if task else None
-            holder = tasks.running(data)
-            holder = dict(holder) if holder else None
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable: %s", e)
-        await say(_("Реестр задач не читается, см. журнал"), alert=True)
-        return
-    if kind == "running":
-        _task_exec_admit(ctx, task)
-    if kind == "dup":
-        await say(_("Это нажатие уже принято"))
-        return
-    if kind == "busy":
-        who = _("«{name}»").format(name=tasks.short_name(holder)) if holder else _("другая задача")
-        await say(_("⏳ Сейчас выполняется {who}. Когда закончится, нажми «Делай» ещё раз или напиши «делай».").format(who=who),
-                  alert=True)
-        return
-    if kind == "stale":
-        if task is not None and task.get("plan_sha") == sha and task.get("status") == "running":
-            await say(_("Этот проект уже одобрен"))
-            return
-        await say(_("Этот проект уже не действует: под последним проектом своя кнопка"), alert=True)
-        if query is not None:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
-        return
-    if query is not None:
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
-    await say(_("▶️ Выполняю"))
-    ctx.application.create_task(_task_exec(ctx, task))
-
-
-def _task_exec_finish(cfg: Config, ref: dict, result: ClaudeResult, stopping: bool) -> None:
-    """Ран выполнения кончился: done или failed с итогом, пока замок темы
-    ещё у выполнения. Итог доставит _task_exec по result_gen, даже если Иван
-    уже снова пишет в теме. Итог это сводка «✅/❌» из любого ответа рана;
-    без неё выполнение не считается удачным (разбор задач 19.10.2026)."""
-    # Сводка, написанная до сбоя рана (таймаут или отмена на ответе по
-    # уведомлению), тоже итог: работа к ней уже сделана (ревью Codex 19.10).
-    summary = tasks.exec_summary(result.texts or (() if result.is_error else (result.text,)))
-    ok = summary is not None and not tasks.exec_failed(summary)
-    text = summary or (result.text if result.is_error else _(tasks.EXEC_UNCONFIRMED))
-    # Итог хранится до доставки и может уйти отдельно: метка звука в нём лишняя.
-    text = extract_loud_marker(text)[1]
-    try:
-        with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-            current = data.get(ref["id"])
-            if not tasks.exec_current(current, ref) or not current.get("exec_started"):
-                return
-            current.update(status="done" if ok else "failed",
-                           interrupted=stopping and result.is_error and summary is None,
-                           # Снимается, когда ответ рана ушёл в тему; авария
-                           # раньше: итог пришлёт старт (ревью Codex 19.10).
-                           result_unsent=True,
-                           result_at=datetime.now().astimezone().isoformat(timespec="seconds"))
-            tasks.push_result(current, text, ok)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, exec end of %s not saved: %s", ref["id"], e)
-
-
-def _task_exec_admit(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
-    """Учёт выполнения от перехода в running до выхода процесса: работа для
-    перезапуска и занятое выполнение. Без await: зовут сразу после
-    перехода, снимает _task_exec_release."""
-    bd = ctx.application.bot_data
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    bd.setdefault("task_exec_live", set()).add(task["id"])
-
-
-def _task_exec_release(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
-    bd = ctx.application.bot_data
-    bd["active_work"] -= 1
-    bd.setdefault("task_exec_live", set()).discard(task["id"])
-
-
-def _task_live(bd: dict) -> set[str]:
-    """Выполнения по памяти бота, чей процесс ещё не вышел (tasks.approve)."""
-    return set(bd.get("task_exec_live") or ())
-
-
-def _task_release_after_exit(ctx: ContextTypes.DEFAULT_TYPE, procs: list,
-                             release: Callable[[], Awaitable[None]]) -> bool:
-    """Процесс рана не вышел и после SIGKILL (unexited, run_claude):
-    выполнение занято до подтверждённого выхода, release (снятие учёта)
-    зовётся фоном после него. False: живых нет, снимать сразу (ревью
-    Codex 14.10). Не через PTB create_task: остановка бота ждала бы выхода,
-    которого может и не быть."""
-    alive = [p for p in procs if p.returncode is None]
-    if not alive:
-        return False
-    pids = ", ".join(str(p.pid) for p in alive)
-    log.warning("task exec kept busy until pid %s exits", pids)
-
-    async def wait() -> None:
-        for p in alive:
-            await p.wait()
-        log.info("pid %s exited, task exec released", pids)
-        await release()
-
-    waits: set[asyncio.Task] = ctx.application.bot_data.setdefault("task_exit_waits", set())
-    task = asyncio.create_task(wait())
-    waits.add(task)
-    task.add_done_callback(waits.discard)
-    return True
-
-
-async def _task_exec(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
-    """Выполнение одобренного проекта: ран с отметкой старта и правами рана
-    выполнения (allow:task-exec), затем done или failed с итогом в теме. Ран
-    не стартовал: проект снова ждёт «Делай». Учёт взял вызывающий
-    (_task_exec_admit), здесь он снимается."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    tid = task["id"]
-    # Своё одобрение: проект могли поправить и одобрить заново, пока этот
-    # обработчик ждал Telegram (ревью Codex 14.10).
-    ref = tasks.exec_ref(task)
-    unexited: list = []
-    sink: list = []
-    sent: list = []
-    try:
-        try:
-            await _task_card(ctx, task)
-            upd = _synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
-
-            def started() -> None:
-                # Признак реального старта: диспетчер возвращается и без рана
-                # (ожидание перезапуска, восстановление входа). Зовёт run_claude,
-                # когда процесс создан, до подачи промпта (ревью Codex 14.10).
-                # Ошибка записи не глотается: без отметки процесс гасится до
-                # промпта (ревью 14.10).
-                if _task_update(cfg, tid, expect_exec=ref,
-                                exec_started=datetime.now().astimezone().isoformat(timespec="seconds")) is None:
-                    raise RuntimeError(f"task {tid} is not running")
-
-            # Сессия всегда новая, мостом служит одобренный проект: в
-            # обдумывании мог быть чужой текст (страница, чат, лог сервера), а
-            # распознать его по инструментам надёжно нельзя (переделка
-            # 18.10.2026, ревью Codex). Без запасного пути через GPT: там нет
-            # карточек, а песочница с записью (проект шага 3, 1.8).
-            await _dispatch_to_claude(upd, ctx, tasks.exec_prompt(task), send_voice_reply=False,
-                                      fresh=True, on_run_start=started,
-                                      allow_codex_fallback=False, exec_task=ref, unexited=unexited,
-                                      reply_sink=sink, reply_sent=sent)
-        except Exception:
-            log.exception("task exec failed %s", tid)
-        reply = sink[0][0] if sink else ""
-        bd = ctx.application.bot_data
-        restarting = bool(bd.get("stopping") or bd.get("draining"))
-        try:
-            with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-                current = data.get(tid)
-                done, not_started = None, False
-                if tasks.exec_current(current, ref):
-                    # Конец рана не записал диспетчер: ран не стартовал или
-                    # упал до итога (_task_exec_finish).
-                    status = tasks.after_exec(current, False)
-                    current["status"] = status
-                    not_started = status == "proposed"
-                    if not_started:
-                        # Тот же проект снова ждёт «Делай»: повтор после того же
-                        # нажатия (dup) не сработает. Кнопку ещё надо прислать:
-                        # отметка в том же переходе (ревью Codex 19.10).
-                        current.update(accepted_press=None, offer_due=True)
-                    else:
-                        tasks.push_result(current, reply, False)
-                    done = dict(current)
-                elif current is not None and current.get("result_gen") == ref["exec_gen"]:
-                    done = dict(current)
-        except (OSError, ValueError) as e:
-            log.error("tasks registry unreadable after exec %s: %s", tid, e)
-            done = None
-        if done is None:
-            return
-        if not_started:
-            await _task_offer_do(ctx, done, _("Выполнение не запустилось из-за рестарта: после него "
-                                              "скажи «делай» ещё раз.") if restarting else
-                                 _("Выполнение не запустилось: скажи «делай» ещё раз."))
-            return
-        if done.get("status") in ("done", "failed"):
-            # Иван уже снова пишет в теме: карточку ведёт его ход.
-            interrupted = bool(done.get("interrupted") or ctx.application.bot_data.get("stopping"))
-            await _task_card(ctx, done, tasks.EXEC_INTERRUPTED
-                             if interrupted and done.get("status") == "failed" else None)
-        if done.get("result_gen") == ref["exec_gen"] and done.get("result_unsent"):
-            if sent:
-                with contextlib.suppress(OSError, ValueError):
-                    _task_update(cfg, tid, result_unsent=None)
-            else:
-                # Ответ рана в тему не ушёл (сеть): итог живёт только в теме,
-                # его шлёт выполнение, не вышло, повторит уборка (ревью Codex 19.10).
-                await _task_post_result(ctx, done)
-    finally:
-        async def release() -> None:
-            _task_exec_release(ctx, task)
-
-        # Процесс выполнения не вышел и после SIGKILL: занято до выхода.
-        if not _task_release_after_exit(ctx, unexited, release):
-            await release()
-
-
-async def _task_note(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
-    """Строка итога в личку после «🗑 Закрыть» у задачи из лички, ответом на
-    исходное сообщение Ивана (решение Ивана 19.10.2026: итог живёт в теме).
-    Отправитель захватывает строку под замком реестра, второй (уборка,
-    повтор) её не шлёт (ревью Codex 19.10). Не ушла: повторит уборка, после
-    tasks.NOTE_TRIES неудач строка снимается. True, если строки больше не ждут."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    base = tasks.registry_dir(cfg.state_dir)
-    target = tasks.note_target(task, cfg.primary_chat_id)
-    try:
-        with tasks.locked(base) as data:
-            fresh = data.get(task["id"])
-            if fresh is None or not fresh.get("note_due"):
-                return True
-            if target is None:
-                fresh["note_due"] = None
-                return True
-            if not tasks.claim(fresh, "note_sending", datetime.now().astimezone()):
-                return False
-            fresh = dict(fresh)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, close note of %s not sent: %s", task["id"], e)
-        return False
-    chat_id, ask_id = target
-    reply = ReplyParameters(message_id=ask_id, allow_sending_without_reply=True) if ask_id else None
-    try:
-        await _send_retrying(lambda: ctx.bot.send_message(
-            chat_id, tasks.close_note(fresh), reply_parameters=reply,
-            link_preview_options=LinkPreviewOptions(is_disabled=True)))
-    except Exception:
-        log.warning("task close note failed %s", task["id"], exc_info=True)
-        with contextlib.suppress(OSError, ValueError):
-            with tasks.locked(base) as data:
-                current = data.get(task["id"])
-                if current is not None:
-                    tasks.release_note(current)
-        return False
-    with contextlib.suppress(OSError, ValueError):
-        _task_update(cfg, task["id"], note_due=None, note_sending=None,
-                     noted=datetime.now().astimezone().isoformat(timespec="seconds"))
-    return True
-
-
-async def _task_offer_do(ctx: ContextTypes.DEFAULT_TYPE, task: dict, line: str) -> None:
-    """Выполнение не началось: проект снова ждёт «Делай», строка на карточке
-    и новая кнопка в теме (прежнюю сняло нажатие). Кнопка не ушла: отметка
-    offer_due, кнопку пришлёт следующий старт (ревью Codex 19.10); слово
-    «делай» работает и без неё."""
-    await _task_card(ctx, task, line)
-    cfg: Config = ctx.application.bot_data["cfg"]
-    try:
-        await ctx.bot.send_message(
-            task["chat_id"], _("Выполнение не запустилось. Делать по проекту выше?"),
-            message_thread_id=task["thread_id"], disable_notification=True,
-            reply_markup=_markup(tasks.do_buttons(task["id"], task["plan_sha"])))
-        offer_due = None
-    except Exception:
-        log.warning("task do offer failed %s", task["id"], exc_info=True)
-        offer_due = True
-    with contextlib.suppress(OSError, ValueError):
-        _task_update(cfg, task["id"], expect=("proposed",), expect_sha=task.get("plan_sha"), offer_due=offer_due)
-
-
-async def _task_post_result(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
-    """Итог выполнения из реестра в тему, когда ответ рана туда не ушёл
-    (отметка result_unsent). Один отправитель за раз (захват result_posting);
-    не вышло, отметка остаётся, повторит уборка."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    base = tasks.registry_dir(cfg.state_dir)
-    try:
-        with tasks.locked(base) as data:
-            fresh = data.get(task["id"])
-            if fresh is None or not fresh.get("result_unsent") or not fresh.get("thread_id"):
-                return True
-            if not tasks.claim(fresh, "result_posting", datetime.now().astimezone()):
-                return False
-            fresh = dict(fresh)
-    except (OSError, ValueError) as e:
-        log.error("tasks registry unreadable, result of %s not posted: %s", task["id"], e)
-        return False
-    try:
-        await _send_retrying(lambda: ctx.bot.send_message(
-            fresh["chat_id"], tasks.unsent_result(fresh), message_thread_id=fresh["thread_id"],
-            link_preview_options=LinkPreviewOptions(is_disabled=True)))
-        done = True
-    except Exception:
-        log.warning("task result post failed %s", task["id"], exc_info=True)
-        done = False
-    with contextlib.suppress(OSError, ValueError):
-        if done:
-            _task_update(cfg, task["id"], result_unsent=None, result_posting=None)
-        else:
-            _task_update(cfg, task["id"], result_posting=None)
-    return done
-
-
-async def on_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопки задачи: «▶️ Делай» под проектом, «🗑 Закрыть» на карточке,
-    «Оставить» в напоминании. Переходы статуса под замком реестра."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
-        return
-    parsed = tasks.parse_callback(query.data or "")
-    try:
-        task = tasks.load(tasks.registry_dir(cfg.state_dir), strict=True).get(parsed[0]) if parsed else None
-    except (OSError, ValueError) as e:
-        # Нечитаемый реестр не значит «задача закрыта»: кнопки остаются
-        # (проект шага 3, 1.8).
-        log.error("tasks registry unreadable: %s", e)
-        await _answer_quietly(query, _("Реестр задач не читается, см. журнал"), show_alert=True)
-        return
-    if parsed is None or task is None or task.get("status") not in tasks.OPEN_STATUSES:
-        await _answer_quietly(query, _("Кнопка устарела или задача уже закрыта"))
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
-        return
-    tid, action, sha = parsed
-    pressed_in = getattr(getattr(query.message, "chat", None), "id", None) or getattr(query.message, "chat_id", None)
-    if pressed_in is not None and pressed_in != task.get("chat_id"):
-        # Кнопки задачи действуют только в её группе (ревью Codex 19.10).
-        await _answer_quietly(query, _("Кнопка не из темы этой задачи"), show_alert=True)
-        return
-    if action == "keep":
-        await _answer_quietly(query, _("Оставляю"))
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
-        return
-    if action == "do":
-        await _task_do(ctx, tid, sha, press=query.id, query=query)
-        return
-    # Закрытие: не посреди рана, иначе тема закроется, а агент продолжит
-    # (ревью Codex 13.10). Замок темы берётся без ожидания: запрос, вставший
-    # в очередь после, увидит закрытую задачу и не уйдёт в Claude.
-    lock = _chat_lock(ctx, f"{task['chat_id']}:{task['thread_id']}")
-    if lock.locked():
-        await _answer_quietly(query, _("Агент в теме работает: дождись конца или /cancel, потом закрой"),
-                              show_alert=True)
-        return
-    async with lock:
-        closed = _task_update(cfg, tid, expect=tasks.CLOSABLE, status="closed",
-                              closed=datetime.now().astimezone().isoformat(timespec="seconds"),
-                              note_due=tasks.note_target(task, cfg.primary_chat_id) is not None or None)
-    if closed is None:
-        await _answer_quietly(query, _("Сейчас закрыть нельзя: идёт выполнение"), show_alert=True)
-        return
-    await _answer_quietly(query, _("Закрываю задачу"))
-    with contextlib.suppress(Exception):
-        await ctx.bot.close_forum_topic(task["chat_id"], task["thread_id"])
-    await _task_card(ctx, closed, _("Задача закрыта. Тема удалится завтра утром."), buttons=False)
-    await _task_news_item(ctx, closed, _("задача закрыта"))
-    if closed.get("note_due"):
-        await _task_note(ctx, closed)
-    if query.message is not None and query.message.message_id != closed.get("card_id"):
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
-
-
-async def _tasks_housekeeping(ctx: ContextTypes.DEFAULT_TYPE, startup: bool = False) -> None:
-    """Раз в день и при старте: строку итога, не дошедшую до лички, ещё раз;
-    удалить темы, закрытые до сегодня; напомнить о задачах, где неделю тихо. Ошибка «темы нет» снимает задачу, другие ошибки (сеть, лимиты)
-    оставляют её до следующего раза (ревью Codex 13.10)."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    base = tasks.registry_dir(cfg.state_dir)
-    sessions: SessionStore | None = ctx.application.bot_data.get("sessions")
-    now = datetime.now().astimezone()
-    try:
-        registry = tasks.load(base, strict=True)
-    except (OSError, ValueError) as e:
-        # Пустым нечитаемый реестр не считается: уборка ждёт починки (проект шага 3, 1.8).
-        log.error("tasks registry unreadable, housekeeping skipped: %s", e)
-        return
-    for task in list(registry.values()):
-        tid, thread_id = task["id"], task.get("thread_id")
-        chat_key = f"{task['chat_id']}:{thread_id}"
-        if task.get("note_due"):
-            await _task_note(ctx, task)
-        if task.get("result_unsent") and thread_id and task.get("status") in tasks.OPEN_STATUSES and (
-                startup or not task.get("result_at")
-                or now - datetime.fromisoformat(task["result_at"]) > tasks.NOTE_CLAIM):
-            # На ходу только старый итог: свежий ещё может уходить ответом рана.
-            await _task_post_result(ctx, task)
-        if tasks.gone_expired(task, now) and not task.get("deleting"):
-            with tasks.locked(base) as data:
-                data.pop(tid, None)
-            continue
-        if task.get("status") == "gone" and task.get("deleting") and thread_id:
-            # Рестарт между записью gone и удалением темы: удаление повторяется
-            # (ревью Codex 16.10).
-            try:
-                await ctx.bot.delete_forum_topic(task["chat_id"], thread_id)
-                done = True
-            except BadRequest as e:
-                done = "not found" in str(e).lower() or "topic_id_invalid" in str(e).lower()
-            except TelegramError as e:
-                log.warning("news task topic delete retry failed %s: %s", tid, e)
-                done = False
-            if done:
-                _task_forget(ctx, chat_key)
-                _task_update(cfg, tid, expect=("gone",), deleting=None)
-            else:
-                # Тема осталась: задача снова прежняя, обычная уборка повторит
-                # удаление и не держит тему недоступной (ревью Codex 16.10).
-                _task_update(cfg, tid, expect=("gone",), status=task["deleting"], gone=None, deleting=None)
-            continue
-        stale_creating = task.get("status") == "creating" and (
-            now - datetime.fromisoformat(task["created"])).total_seconds() > 3600
-        gone = False
-        if stale_creating and not thread_id:
-            gone = True
-        elif thread_id and (stale_creating or tasks.delete_due(task, now)) \
-                and not _chat_lock(ctx, chat_key).locked():
-            # Тему, где идёт ран (/event, /at), не трогать: уборка повторит.
-            # Запись уходит в gone до запроса к Telegram и по свежему статусу:
-            # сообщение, пришедшее пока тема удаляется, уже не задача и не
-            # пропадает молча вместе с темой (ревью Codex 16.10).
-            was = task.get("status")
-            with tasks.locked(base) as data:
-                fresh = data.get(tid)
-                due = fresh is not None and fresh.get("status") == was and (
-                    stale_creating or tasks.delete_due(fresh, now))
-                if due:
-                    fresh.update(status="gone", gone=now.isoformat(timespec="seconds"), deleting=was)
-            if not due:
-                continue
-            try:
-                await ctx.bot.delete_forum_topic(task["chat_id"], thread_id)
-                gone = True
-            except BadRequest as e:
-                gone = "not found" in str(e).lower() or "topic_id_invalid" in str(e).lower()
-                if not gone:
-                    log.warning("news task topic delete failed %s: %s", tid, e)
-            except TelegramError as e:
-                log.warning("news task topic delete failed %s: %s", tid, e)
-            if not gone:
-                # Тема осталась: задача снова прежняя, уборка повторит.
-                _task_update(cfg, tid, expect=("gone",), status=was, gone=None, deleting=None)
-                continue
-        elif thread_id and sessions is not None and tasks.reminder_due(
-                task, sessions.last_used(chat_key), now) and not _chat_lock(ctx, chat_key).locked():
-            rows = tasks.card_buttons(tid, task.get("status", "")) + [
-                [{"text": _("▶ Оставить"), "data": f"{tasks.CALLBACK_PREFIX}:{tid}:keep"}]]
-            try:
-                await ctx.bot.send_message(
-                    task["chat_id"], tasks.reminder_text(task), message_thread_id=thread_id,
-                    reply_markup=_markup(rows))
-                _task_update(cfg, tid, reminded=now.isoformat(timespec="seconds"))
-            except BadRequest as e:
-                gone = "thread not found" in str(e).lower()
-                if not gone:
-                    log.warning("news task reminder failed %s: %s", tid, e)
-            except TelegramError as e:
-                log.warning("news task reminder failed %s: %s", tid, e)
-        if not gone:
-            continue
-        if thread_id:
-            _task_forget(ctx, chat_key)
-        # Запись остаётся отметкой «пункт уже был в работе»: старая кнопка
-        # в выпуске не заведёт задачу заново (ревью Codex 13.10).
-        _task_update(cfg, tid, status="gone", gone=now.isoformat(timespec="seconds"), deleting=None)
-        log.info("news task gone %s (was %s)", tid, task.get("status"))
-
-
-async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """При старте бота ранов нет. Выполнение, которое правда стартовало,
-    становится failed с пометкой «прервал рестарт»: что успело сделаться,
-    Иван проверит сам (ревью Codex 15.10: после аварии не повторять вслепую).
-    Не стартовавшее (и запись из очереди до 19.10.2026) снова ждёт «Делай»."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    base = tasks.registry_dir(cfg.state_dir)
-    moved: list[tuple[dict, str | None]] = []
-    # Строго: нечитаемый реестр это ошибка в журнал у вызывающего, а не пустой.
-    with tasks.locked(base) as data:
-        for task in data.values():
-            status = task.get("status")
-            if status == "running" and task.get("exec_started"):
-                task.update(status="failed", interrupted=True)
-                tasks.push_result(task, _(tasks.EXEC_INTERRUPTED), False)
-                moved.append((dict(task), tasks.EXEC_INTERRUPTED))
-            elif status in ("running", "queued"):
-                task.update(status="proposed", accepted_press=None, offer_due=True)
-                task.pop("queued_at", None)
-                moved.append((dict(task), None))
-            elif status == "proposed" and task.get("offer_due"):
-                # Кнопка после прошлого рестарта не ушла (_task_offer_do).
-                moved.append((dict(task), None))
-            else:
-                continue
-            log.warning("news task %s recovered: %s -> %s", task["id"], status, task["status"])
-    # Обдумывание, оборванное аварией бота (OOM, kill): ответа не будет, тема
-    # узнаёт об этом сама (разбор 19.10.2026).
-    # Отметка снимается после отправки: сбой сети оставит её до следующего
-    # старта (ревью Codex 19.10); темы нет, снимается тоже.
-    cut = [dict(t) for t in tasks.load(base, strict=True).values() if t.get("think_open")]
-    for task in cut:
-        said = not (task.get("status") in tasks.OPEN_STATUSES and task.get("thread_id"))
-        if not said:
-            log.warning("news task %s: thinking cut by bot restart", task["id"])
-            try:
-                await ctx.bot.send_message(task["chat_id"], _(tasks.THINK_INTERRUPTED),
-                                           message_thread_id=task["thread_id"])
-                said = True
-            except BadRequest:
-                said = True
-            except Exception:
-                log.warning("cut thinking notice failed %s", task["id"], exc_info=True)
-        if said:
-            with contextlib.suppress(OSError, ValueError):
-                _task_update(cfg, task["id"], think_open=None)
-    for task, line in moved:
-        if task["status"] == "proposed":
-            await _task_offer_do(ctx, task, _("Выполнение не запустилось из-за рестарта: скажи «делай» "
-                                              "ещё раз."))
-        else:
-            await _task_card(ctx, task, line)
-    # Карточка живой задачи, не ушедшая при заведении темы: заново (ревью Codex 14.10).
-    registry = tasks.load(base, strict=True)
-    for task in list(registry.values()):
-        status = task.get("status")
-        if (status in tasks.OPEN_STATUSES and status != "creating" and task.get("thread_id")
-                and not task.get("card_id")):
-            log.warning("news task %s without card, sending it", task["id"])
-            await _task_new_card(ctx, task, tasks.stage_line(task), status)
-
-
-async def _tasks_startup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Через полминуты после старта: права бота в группе новостей и уборка."""
-    chat_id = _tasks_chat_id()
-    if chat_id is not None:
-        try:
-            me = await ctx.bot.get_me()
-            member = await ctx.bot.get_chat_member(chat_id, me.id)
-            missing = [label for attr, label in (("can_manage_topics", "управление темами"),
-                                                 ("can_delete_messages", "удаление сообщений"))
-                       if not getattr(member, attr, False)]
-            if missing:
-                log.warning("news tasks: у бота нет прав: %s", ", ".join(missing))
-        except TelegramError as e:
-            log.warning("news tasks rights check failed: %s", e)
-    try:
-        await _tasks_housekeeping(ctx, startup=True)
-    except (OSError, ValueError) as e:
-        log.error("news tasks registry unreadable: %s", e)
-
-
-def _otklik_markup(rec: dict) -> InlineKeyboardMarkup | None:
-    rows = otklik.buttons(rec)
-    return InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row]
-                                 for row in rows]) if rows else None
-
-
-_OTKLIK_SHOW_LOCKS: dict[str, asyncio.Lock] = {}
-
-
-async def _otklik_edit(bot: Any, rec: dict) -> bool:
-    try:
-        await bot.edit_message_text(
-            otklik.render(rec), chat_id=rec["chat_id"], message_id=rec["message_id"],
-            reply_markup=_otklik_markup(rec), link_preview_options=LinkPreviewOptions(is_disabled=True))
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            log.warning("otklik edit failed aid=%s: %s", rec.get("id"), e)
-            return False
-    except Exception:
-        log.warning("otklik edit failed aid=%s", rec.get("id"), exc_info=True)
-        return False
-    return True
-
-
-async def _otklik_show(bot: Any, rec: dict, base: Path | None = None) -> None:
-    """Сообщение отклика по записи: текст со статусом и кнопки статуса.
-    С base показ идёт по свежему чтению записи, по одному на запись, и
-    отмечается в ней; запись сменилась во время правки: показать ещё раз.
-    Правка не прошла: синхронизация после рана перерисует (ревью Codex 22.10.2026)."""
-    if not rec.get("message_id") or rec.get("chat_id") is None:
-        return
-    if base is None:
-        await _otklik_edit(bot, rec)
-        return
-    lock = _OTKLIK_SHOW_LOCKS.setdefault(rec["id"], asyncio.Lock())
-    async with lock:
-        for _try in range(3):
-            cur = await asyncio.to_thread(otklik.load, base, rec["id"]) or rec
-            if not await _otklik_edit(bot, cur):
-                return
-            try:
-                if await asyncio.to_thread(otklik.mark_shown, base, cur["id"], cur["status"],
-                                           otklik.gen_of(cur)):
-                    return
-            except Exception:
-                log.warning("otklik mark shown failed aid=%s", cur.get("id"), exc_info=True)
-                return
-
-
-async def _otklik_sync(bot: Any, base: Path) -> None:
-    """Старт бота: сообщения откликов, отставшие от записи, перерисовать.
-    С паузой: при первом старте их может быть несколько десятков."""
-    try:
-        targets = await asyncio.to_thread(otklik.sync_targets, base)
-    except Exception:
-        log.exception("otklik: sync scan failed")
-        return
-    for rec in targets:
-        await _otklik_show(bot, rec, base)
-        await asyncio.sleep(0.5)
-
-
-async def _otklik_unknown_notice(bot: Any, rec: dict, base: Path) -> None:
-    """Неясный исход отправки: перерисовать сообщение и сказать отдельной
-    строкой со звуком, правка сообщения звука не даёт (ревью 22.10.2026)."""
-    await _otklik_show(bot, rec, base)
-    if not rec.get("message_id") or rec.get("chat_id") is None:
-        return
-    with contextlib.suppress(Exception):
-        await bot.send_message(
-            rec["chat_id"],
-            _("❓ Отклик «{title}»: ран кончился без итога отправки, результат неизвестен. "
-              "Проверь канал; если не ушло, ↩️ на сообщении вернёт кнопки.").format(title=rec.get("title")),
-            reply_parameters=ReplyParameters(message_id=rec["message_id"], allow_sending_without_reply=True))
-
-
-async def _otklik_close_attempts(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str) -> None:
-    """Конец рана чата, под его замком: взятые им отклики без итога получают
-    «результат неизвестен» (otklik.close_attempts). Сообщения правятся фоном,
-    заодно отставшие от записи (правка из команды агента не прошла)."""
-    try:
-        base = otklik.otklik_dir(cfg.state_dir)
-        if not base.is_dir():
-            return
-        changed = await asyncio.to_thread(otklik.close_attempts, base, chat_key)
-    except Exception:
-        log.exception("otklik: closing attempts failed chat=%s", chat_key)
-        return
-    for rec in changed:
-        log.warning("otklik %s: run ended without result, outcome unknown", rec["id"])
-        ctx.application.create_task(_otklik_unknown_notice(ctx.bot, rec, base))
-    ctx.application.create_task(_otklik_sync(ctx.bot, base))
-
-
-def _otklik_target(ctx: ContextTypes.DEFAULT_TYPE, rec: dict, update: Update) -> Update:
-    """Кого будит ✅: чат, где отклик готовили. Сообщение с кнопкой лежит в
-    личке; если источник она же, ран отвечает на само сообщение."""
-    source = otklik.source_of(rec)
-    msg = update.callback_query.message
-    if source == str(msg.chat_id):
-        return Update(update_id=update.update_id, message=msg)
-    chat, _sep, thread = source.partition(":")
-    return _synthetic_update(ctx.bot, int(chat), int(thread) if thread else None)
-
-
-async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопки отклика (otklik.py): ✅ будит агента отправить ровно этот текст,
-    ✏️ просит правку ответом, ⏭ только отмечает пропуск, ✋ отменяет одобрение
-    до захвата, ↩️ возвращает кнопки после проверки канала. Кнопка привязана к
-    хешу текста, поколению и своему сообщению: старая или чужая не действует.
-    Переходы под замком записей (otklik.pick), вне цикла событий: его держит
-    и команда агента."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
-        return
-    base = otklik.otklik_dir(cfg.state_dir)
-    parsed = otklik.parse_callback(query.data or "")
-    msg = query.message
-    try:
-        if parsed is None or msg is None:
-            raise otklik.Refused("bad callback")
-        oid, sha, gen, action = parsed
-        rec = await asyncio.to_thread(otklik.pick, base, oid, sha, gen, action,
-                                      msg.chat_id, msg.message_id)
-    except otklik.Refused:
-        await _answer_quietly(query, _("Кнопка устарела: этот отклик уже решён или заменён"),
-                              show_alert=True)
-        # Кнопки по нынешнему состоянию, а не снять все: на том же сообщении
-        # могут стоять кнопки нового поколения.
-        cur = otklik.load(base, parsed[0]) if parsed else None
-        if cur is not None and msg is not None and msg.message_id == cur.get("message_id"):
-            await _otklik_show(ctx.bot, cur, base)
-        else:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
-        return
-    except (OSError, ValueError) as e:
-        log.warning("otklik save failed: %s", e)
-        await _answer_quietly(query, _("Не записалось, см. журнал бота"), show_alert=True)
-        return
-    # Время нажатия для разбора недели: ожидание кнопки до старта рана, доли ✏️ и ⏭.
-    log.info("otklik pick aid=%s action=%s source=%s", rec["id"], action, otklik.source_of(rec))
-    if action != "o":
-        await _answer_quietly(query, {"e": _("Жду правку"), "s": _("Пропускаю"),
-                                      "c": _("Отменил, кнопки вернулись"),
-                                      "r": _("Кнопки вернулись")}[action])
-        # ⏭ только пишет статус: пропуск в воронку переносят утро, вечер и
-        # поиск по `otklik list --status skipped`, отдельный ран не нужен
-        # (разбор 22.10.2026).
-        await _otklik_show(ctx.bot, rec, base)
-        return
-    gen = otklik.gen_of(rec)
-
-    def still_approved() -> bool:
-        # Ран по ✅ по правилу промта Домового доотправляет все одобренные:
-        # нажатие, ждавшее замка за ним, иначе стало бы холостым раном «уже
-        # ушло». Запись не прочиталась: ран идёт, `otklik take` откажет сам,
-        # а молча потерять отправку хуже лишнего рана (ревью 22.10.2026).
-        cur = otklik.load(base, oid)
-        return cur is None or cur.get("status") == "approved"
-
-    reason = _("агент не взял текст")
-    # В мастерской ✅ идёт свежей сессией: задание по кнопке самодостаточно,
-    # а продолжение сессии поиска перечитывало бы 100-230 тысяч токенов
-    # чужого контекста (разбор 22.10.2026, решение Ивана: модель мастерской
-    # по умолчанию, Opus; выбор /model до конца сессии свежая сессия снимает).
-    # Исключение: отложенный после лимита повтор этой темы продолжает её
-    # сессию. Проверка идёт под замком темы: пока кнопка ждала, повтор мог
-    # появиться (ревью Codex 23.10.2026).
-    source = otklik.source_of(rec)
-
-    def fresh() -> bool:
-        return _is_workshop(cfg, source) and not _limit_retry_pending(ctx, source)
-    try:
-        await _answer_quietly(query, _("Отправляю"))
-        await _otklik_show(ctx.bot, rec, base)
-        if await _dispatch_to_claude(
-            _otklik_target(ctx, rec, update), ctx, otklik.approved_prompt(rec, base),
-            send_voice_reply=False, from_callback=True, still_wanted=still_approved, fresh=fresh,
-        ):
-            reason = _("бот перезапускается")
-    except Exception:
-        log.exception("otklik dispatch failed aid=%s", oid)
-        reason = _("не удалось запустить агента")
-    finally:
-        # Решение не должно пропасть молча: одобренное, которое ран не взял
-        # (отказ, лимит, рестарт, сбой), снова с кнопками. Взятое без итога
-        # бот уже пометил «неизвестно» в конце рана, отправленное не трогается.
-        # В finally: отмена задачи не оставит запись одобренной до рестарта.
-        try:
-            back = otklik.revert_untaken(base, oid, gen, reason)
-        except Exception:
-            log.exception("otklik revert failed aid=%s", oid)
-            back = None
-    if back is not None:
-        log.info("otklik %s: approved but not taken, buttons back (%s)", oid, reason)
-        await _otklik_show(ctx.bot, back, base)
 
 
 async def on_handoff_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3151,556 +1017,6 @@ def _news_context(cfg: Config, msg: Message, text: str) -> str:
         if found is not None:
             notes.append(news.reply_note(found[1]))
     return "\n".join(notes) + "\n\n" + text
-
-
-def _plan_generation(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
-    """Номер последнего plan-рана темы: растёт под замком темы при старте
-    каждого /plan. Одобрение относится к плану своего поколения: старая
-    карточка, нажатая во время нового /plan или в очереди за ним, иначе
-    выполняла бы новый план (ревью 11.10.2026)."""
-    gens: dict[str, int] = ctx.application.bot_data.setdefault("plan_generations", {})
-    return gens.get(chat_key, 0)
-
-
-def _bump_plan_generation(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> None:
-    gens: dict[str, int] = ctx.application.bot_data.setdefault("plan_generations", {})
-    gens[chat_key] = gens.get(chat_key, 0) + 1
-
-
-def _plan_snapshot(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> dict:
-    """Эпоха, session_id и поколение плана темы на сейчас: для карточки
-    плана снимаются под замком темы в конце plan-рана (ревью 11.10.2026)."""
-    store: SessionStore | None = ctx.application.bot_data.get("sessions")
-    return {
-        "epoch": _session_epoch(ctx, chat_key),
-        "sid": store.get(chat_key) if store is not None else None,
-        "plan": _plan_generation(ctx, chat_key),
-    }
-
-
-async def _send_plan_card(
-    ctx: ContextTypes.DEFAULT_TYPE, update: Update, chat_key: str,
-    snapshot: dict | None = None,
-) -> None:
-    """Кнопки решения по плану после /plan-рана (он read-only).
-
-    С токеном запоминаются эпоха и session_id: «Выполнять» старой карточки
-    после /reset, /resume или смены скоупа уходил в чужую сессию. Новая
-    карточка темы гасит прежние: одобрение относится к последнему плану
-    (ревью 12.10.2026).
-    snapshot: снимок _plan_snapshot под замком в конце рана. Карточка
-    отправляется уже после замка, и за задержку отправки ответа новый /plan
-    успевал пройти целиком: снятые здесь значения достались бы его плану.
-    Устаревший снимок карточку не публикует (ревью 11.10.2026).
-    """
-    if snapshot is None:
-        snapshot = _plan_snapshot(ctx, chat_key)
-    if snapshot["plan"] != _plan_generation(ctx, chat_key):
-        log.info("plan card skipped chat=%s: newer /plan started", chat_key)
-        try:
-            await update.message.reply_text(
-                _("⚠️ в теме уже начат новый /plan, кнопок у этого плана нет")
-            )
-        except Exception:
-            log.debug("stale plan note failed (ignored)", exc_info=True)
-        return
-    token = uuid.uuid4().hex[:8]
-    pending: dict[str, dict] = ctx.application.bot_data.setdefault("plan_options", {})
-    for t, v in list(pending.items()):
-        if v.get("chat_key") == chat_key:
-            pending.pop(t, None)
-    pending[token] = {"chat_key": chat_key, **snapshot}
-    rows = [
-        [InlineKeyboardButton(_("✅ Выполнять"), callback_data=f"plan:{token}:ok")],
-        [
-            InlineKeyboardButton(_("✏️ Доработать"), callback_data=f"plan:{token}:more"),
-            InlineKeyboardButton(_("❌ Отмена"), callback_data=f"plan:{token}:no"),
-        ],
-    ]
-    try:
-        sent = await update.message.reply_text(
-            _("План выше. Выполнять?"), reply_markup=InlineKeyboardMarkup(rows),
-        )
-    except Exception:
-        log.exception("plan card failed")
-        return
-    if isinstance(getattr(sent, "message_id", None), int) and token in pending:
-        pending[token]["msg"] = (sent.chat_id, sent.message_id)
-
-
-async def on_plan_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    if not _is_allowed(cfg, update):
-        return
-    parts = (query.data or "").split(":")
-    token, decision = (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
-    pending: dict[str, dict] = ctx.application.bot_data.setdefault("plan_options", {})
-    if token in pending and not _card_msg_matches(pending[token], query.message):
-        await _answer_quietly(query, _("Решение не принято: кнопка не от этого плана."), show_alert=True)
-        return
-    try:
-        await query.answer()
-    except Exception:
-        log.debug("callback answer failed (ignored)", exc_info=True)
-    picked = pending.pop(token, None)
-    if picked is None:
-        try:
-            await query.edit_message_text(_("⚠️ решение по плану устарело — повтори /plan"))
-        except Exception:
-            pass
-        return
-    store: SessionStore | None = ctx.application.bot_data.get("sessions")
-    if picked["epoch"] != _session_epoch(ctx, picked["chat_key"]) or (
-        store is not None and store.get(picked["chat_key"]) != picked["sid"]
-    ) or picked.get("plan") != _plan_generation(ctx, picked["chat_key"]):
-        try:
-            await query.edit_message_text(
-                _("⚠️ сессия темы сменилась после этого плана, решение не отправлено: повтори /plan")
-            )
-        except Exception:
-            pass
-        return
-    labels = {"ok": _("✅ выполняю план"), "more": _("✏️ дорабатываю план"), "no": _("❌ план отменён")}
-    card = query.message
-    try:
-        await query.edit_message_text(labels.get(decision, decision))
-    except Exception:
-        log.debug("plan card finalize failed (ignored)", exc_info=True)
-    if decision == "no":
-        return
-    upd = Update(update_id=update.update_id, message=card)
-    if decision == "more":
-        await _dispatch_to_claude(
-            upd, ctx,
-            _("Доработай план: уточни то, что осталось неясным, и предложи его снова. "
-              "Ничего пока не выполняй."),
-            send_voice_reply=False, permission_mode="plan", unattended=True,
-            expect_epoch=picked["epoch"], expect_plan=picked.get("plan"),
-        )
-        return
-    # Выполнение: обычный режим, мутации идут через approve-карточки.
-    await _dispatch_to_claude(
-        upd, ctx, _("План одобрен — выполняй его."), send_voice_reply=False,
-        expect_epoch=picked["epoch"], expect_plan=picked.get("plan"),
-        # Это нажатие, а не текст: лимит не переносит его в /at, где пропали
-        # бы сверки эпохи и поколения плана (ревью Codex 26.10.2026).
-        from_callback=True,
-    )
-
-
-@dataclass
-class ComposeBuffer:
-    """Накопитель кусков для /compose … /go.
-
-    generation отличает буфер от следующего такого же в этой теме: без него
-    обработчик, который проснулся после `/compose cancel` + нового `/compose`,
-    писал бы кусок по тому же индексу уже в ЧУЖОЙ буфер.
-    sealed ставит первый /go, дальше буфер только дозаполняется — второй /go
-    не отправит то же самое повторно.
-    cancelled ставит /compose cancel: /go, ждущий куски, ничего не отправляет.
-    voice: свой кусок просил голосовой ответ; /go берёт флаг отсюда, а не
-    ищет слова по всему промпту вместе с пересланным (ревью 12.10.2026).
-    """
-    generation: int
-    items: list[str | None] = field(default_factory=list)
-    sealed: bool = False
-    cancelled: bool = False
-    voice: bool = False
-    # Идущие большие загрузки (MTProto) в слотах буфера: /go ждёт их дольше 30 с.
-    slow: int = 0
-
-    @property
-    def ready(self) -> bool:
-        return all(x is not None for x in self.items)
-
-    @property
-    def filled(self) -> int:
-        return sum(1 for x in self.items if x is not None)
-
-
-# Резервация места: буфер идентифицируется поколением, слот — индексом.
-Reservation = tuple[int, int]
-
-
-def _compose_buffers(ctx: ContextTypes.DEFAULT_TYPE) -> dict[str, ComposeBuffer]:
-    return ctx.application.bot_data.setdefault("compose_buffers", {})
-
-
-def _compose_reserve(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> Reservation | None:
-    """Занять место в буфере ДО долгой обработки (STT, скачивание вложения).
-
-    Без резерва /go, нажатый пока идёт распознавание голоса, отправлял бы
-    неполный промпт, а опоздавший кусок уезжал бы отдельным раном.
-    None = буфер не активен (или уже запечатан) — обработчик работает обычным путём.
-    """
-    buf = _compose_buffers(ctx).get(chat_key)
-    if buf is None or buf.sealed:
-        return None
-    buf.items.append(None)  # placeholder, заполнится в _compose_fill
-    return (buf.generation, len(buf.items) - 1)
-
-
-def _compose_current(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reservation
-) -> ComposeBuffer | None:
-    """Буфер, если он тот же самый (не отменён и не заменён новым)."""
-    buf = _compose_buffers(ctx).get(chat_key)
-    if buf is None or buf.generation != res[0] or res[1] >= len(buf.items):
-        return None
-    return buf
-
-
-def _compose_fill(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reservation, piece: str,
-    *, voice: bool = False,
-) -> int | None:
-    """Заполнить зарезервированный слот. None — если буфер уехал по /go или был
-    отменён (тогда обработчик шлёт кусок обычным путём, не теряя его; кусок
-    отменённого буфера выбрасывает, см. _compose_cancelled)."""
-    buf = _compose_current(ctx, chat_key, res)
-    if buf is None:
-        return None
-    buf.items[res[1]] = piece
-    buf.voice = buf.voice or voice
-    return buf.filled
-
-
-def _compose_cancelled(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reservation | None) -> bool:
-    """Слот из буфера, отменённого /compose cancel. Опоздавший кусок такого
-    буфера выбрасывается, как в отменённой пачке склейки: иначе голосовое,
-    распознанное после отмены, уходило бы отдельным раном. Кусок буфера,
-    уехавшего по /go без него (таймаут), по-прежнему шлётся (ревью 12.10.2026)."""
-    if res is None:
-        return False
-    cancelled: dict[str, set[int]] = ctx.application.bot_data.get("compose_cancelled") or {}
-    return res[0] in cancelled.get(chat_key, ())
-
-
-def _compose_release(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reservation | None) -> None:
-    """Освободить слот, если кусок не доехал (сбой STT/скачивания).
-
-    Без этого /go ждал бы 30 секунд заведомо пустое место.
-    """
-    if res is None:
-        return
-    buf = _compose_current(ctx, chat_key, res)
-    if buf is not None and buf.items[res[1]] is None:
-        buf.items[res[1]] = ""  # пустое = «места нет», при сборке отфильтруется
-
-
-def _compose_add(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, piece: str, *, voice: bool = False,
-) -> int | None:
-    """Резерв+заполнение одним шагом: для текста, где долгой обработки нет."""
-    res = _compose_reserve(ctx, chat_key)
-    if res is None:
-        return None
-    return _compose_fill(ctx, chat_key, res, piece, voice=voice)
-
-
-# Склейка: пересылка с комментарием приходит от Telegram отдельными сообщениями
-# почти разом (сначала комментарий, потом пересланное), альбом приходит по
-# сообщению на фото. Без склейки комментарий уезжал отдельным раном без самого
-# пересланного, а пересланное получало «claude ещё работает над прошлым запросом».
-# Цена: каждый запрос стартует на GATHER_WINDOW_SEC позже. 0 = выключено.
-# 3 с с 20.10.2026: при 1,5 с вложение большой пересылки, которое телефон
-# догружает после текста, приходило отдельным запросом (жалоба Ивана).
-GATHER_WINDOW_SEC = 3.0
-# Новая пачка темы, открытая не позже стольких секунд после прошлого куска,
-# пишется в журнал с разрывом: по этим строкам окно подбирается по фактам.
-GATHER_LATE_LOG_SEC = 30.0
-# Дольше пачку не держим: ни ради скачиваемого или распознаваемого куска, ни
-# при непрерывном потоке сообщений.
-GATHER_MAX_WAIT_SEC = 30.0
-
-
-@dataclass(eq=False)  # сравнение и хеш по объекту: пачки лежат в множествах ожидания
-class GatherBatch:
-    """Сообщения одной темы, пришедшие почти разом; уходят одним промптом.
-
-    update первого сообщения: на него ответ и 👀, остальным 👀 ставит флаш.
-    sealed: пачку забрали (флаш перед отправкой или «!»-поправка); кусок, не
-    успевший к этому, обработчик шлёт сам, а новые сообщения открывают
-    следующую пачку. cancelled: пачку отменил /cancel, опоздавший кусок
-    выбрасывается, иначе отменённый запрос воскрес бы после скачивания.
-    slow: идущие большие загрузки (MTProto). Пачка с ними ждёт их до конца,
-    а не GATHER_MAX_WAIT_SEC; после тишины её состав закрывается (closed),
-    и новые сообщения темы открывают следующую пачку, которая уйдёт после
-    этой (prev, done). work: сколько единиц active_work пачка держит за
-    докачанные файлы (перезапуск их ждёт); admitted: такой файл принят до
-    ожидания перезапуска и доводится до Claude.
-    """
-    update: Update
-    ctx: Any
-    items: list[str | None] = field(default_factory=list)
-    messages: list[Any] = field(default_factory=list)
-    voice: bool = False
-    last_arrival: float = 0.0
-    sealed: bool = False
-    cancelled: bool = False
-    slow: int = 0
-    closed: bool = False
-    work: int = 0
-    admitted: bool = False
-    prev: "GatherBatch | None" = None
-    done: asyncio.Event = field(default_factory=asyncio.Event)
-
-    @property
-    def ready(self) -> bool:
-        return all(x is not None for x in self.items)
-
-    @property
-    def pieces(self) -> list[str]:
-        return [x for x in self.items if x]
-
-
-GatherSlot = tuple[GatherBatch, int]
-
-
-def _gather_reserve(update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> GatherSlot | None:
-    """Занять место в пачке ДО скачивания и распознавания (как _compose_reserve).
-
-    Первое сообщение открывает пачку и запускает её отправку по тишине.
-    None = склейка выключена, обработчик работает обычным путём.
-    """
-    # Во время stop() новая пачка не нужна: задачу, созданную после начала
-    # остановки, PTB уже не ждёт. Обработчик шлёт кусок сам, как до склейки.
-    if GATHER_WINDOW_SEC <= 0 or not ctx.application.running:
-        return None
-    batches: dict[str, GatherBatch] = ctx.application.bot_data.setdefault("gather_batches", {})
-    batch = batches.get(chat_key)
-    if batch is None or batch.sealed:
-        tails: dict[str, GatherBatch] = ctx.application.bot_data.setdefault("gather_tails", {})
-        prev = tails.get(chat_key)
-        if prev is not None and prev.last_arrival:
-            gap = time.monotonic() - prev.last_arrival
-            if gap <= GATHER_LATE_LOG_SEC:
-                log.info("gather: new batch %.1fs after previous piece (window %.1fs) chat=%s",
-                         gap, GATHER_WINDOW_SEC, chat_key)
-        batch = GatherBatch(update=update, ctx=ctx,
-                            prev=prev if prev is not None and not prev.done.is_set() else None)
-        batches[chat_key] = batch
-        tails[chat_key] = batch
-        # create_task приложения, а не asyncio: исключение флаша дойдёт до
-        # _on_error с этим update (пользователь увидит ошибку), а stop() при
-        # рестарте дождётся задачи вместо того, чтобы бросить её на полпути.
-        ctx.application.create_task(
-            _gather_flush(chat_key, batch), update=update, name=f"gather:{chat_key}",
-        )
-    else:
-        batch.messages.append(update.message)
-    batch.items.append(None)
-    batch.last_arrival = time.monotonic()
-    return (batch, len(batch.items) - 1)
-
-
-def _gather_fill(slot: GatherSlot, piece: str, *, voice: bool = False, work: bool = False) -> bool:
-    """Положить кусок в занятое место. False: пачку уже забрали без него,
-    обработчик шлёт кусок обычным путём, не теряя его. work: кусок держит
-    единицу active_work (докачанный большой файл), она переходит к пачке."""
-    batch, idx = slot
-    if batch.cancelled:
-        return True  # /cancel: кусок выбрасывается вместе с пачкой
-    if batch.sealed:
-        return False
-    batch.items[idx] = piece
-    batch.voice = batch.voice or voice
-    if work:
-        batch.work += 1
-        batch.admitted = True
-    return True
-
-
-def _gather_release(slot: GatherSlot | None) -> None:
-    """Освободить место, если кусок не доехал (сбой скачивания, STT, лимит)."""
-    if slot is None:
-        return
-    batch, idx = slot
-    if not batch.sealed and batch.items[idx] is None:
-        batch.items[idx] = ""  # пустое = «места нет», при сборке отфильтруется
-
-
-def _gather_pending(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
-    """В теме собирается пачка сообщений Ивана (склейка или /compose), ещё не
-    ушедшая в Claude."""
-    bd = ctx.application.bot_data
-    batch = bd.get("gather_batches", {}).get(chat_key)
-    buf = bd.get("compose_buffers", {}).get(chat_key)
-    return (batch is not None and not batch.sealed and not batch.cancelled) or (
-        buf is not None and not buf.sealed and bool(buf.items))
-
-
-def _gather_take(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> GatherBatch | None:
-    """Забрать ожидающую пачку темы сейчас; её флаш после этого ничего не шлёт."""
-    batches: dict[str, GatherBatch] = ctx.application.bot_data.setdefault("gather_batches", {})
-    batch = batches.pop(chat_key, None)
-    if batch is not None:
-        batch.sealed = True
-    return batch
-
-
-def _gather_cancel(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> int:
-    """/cancel до отправки: выбросить ожидающую пачку и пачки, закрытые в
-    ожидании большой загрузки. Сколько сообщений в них было."""
-    n = 0
-    batch = _gather_take(ctx, chat_key)
-    if batch is not None:
-        batch.cancelled = True
-        n += len(batch.items)
-    waiting: dict[str, set[GatherBatch]] = ctx.application.bot_data.get("gather_waiting") or {}
-    for b in waiting.pop(chat_key, set()):
-        b.cancelled = True
-        b.sealed = True
-        n += len(b.items)
-    return n
-
-
-def _gather_close(app: Any, chat_key: str, batch: GatherBatch) -> None:
-    """Закрыть состав пачки, ждущей большую загрузку: новые сообщения темы
-    идут следующей пачкой, /cancel находит эту в gather_waiting."""
-    batch.closed = True
-    batches: dict[str, GatherBatch] = app.bot_data.setdefault("gather_batches", {})
-    if batches.get(chat_key) is batch:
-        batches.pop(chat_key, None)
-    app.bot_data.setdefault("gather_waiting", {}).setdefault(chat_key, set()).add(batch)
-
-
-async def _gather_react(messages: list[Any]) -> None:
-    for m in messages:
-        try:
-            await m.set_reaction("👀")
-        except Exception:
-            log.debug("set_reaction failed (ignored)", exc_info=True)
-
-
-async def _busy_notice(msg: Any) -> Any:
-    try:
-        return await msg.reply_text(
-            _("⏳ claude ещё работает над прошлым запросом, этот встанет в очередь. "
-              "/cancel прервёт текущий, «!текст» прервёт его и сразу отправит поправку")
-        )
-    except Exception:
-        log.exception("busy notice failed")
-        return None
-
-
-async def _drop_busy_notice(sent: Any) -> None:
-    """Очередь дошла до запроса: уведомление «встанет в очередь» больше не нужно."""
-    if sent is None:
-        return
-    try:
-        await sent.delete()
-    except Exception:
-        log.debug("busy notice delete failed (ignored)", exc_info=True)
-
-
-async def _gather_flush(chat_key: str, batch: GatherBatch) -> None:
-    """Ждёт GATHER_WINDOW_SEC тишины и готовности всех кусков, шлёт пачку одним
-    ходом. Не дольше GATHER_MAX_WAIT_SEC, даже если сообщения всё идут; пачку
-    с большой загрузкой ждёт до её конца (срок у самой загрузки)."""
-    app = batch.ctx.application
-    try:
-        await _gather_flush_impl(chat_key, batch)
-    finally:
-        batch.done.set()
-        waiting: dict[str, set[GatherBatch]] = app.bot_data.get("gather_waiting") or {}
-        waiting.get(chat_key, set()).discard(batch)
-        if not waiting.get(chat_key, True):
-            waiting.pop(chat_key, None)
-        tails: dict[str, GatherBatch] = app.bot_data.get("gather_tails") or {}
-        if tails.get(chat_key) is batch:
-            tails.pop(chat_key, None)
-        if batch.work:
-            app.bot_data["active_work"] = app.bot_data.get("active_work", 0) - batch.work
-            batch.work = 0
-
-
-async def _gather_flush_impl(chat_key: str, batch: GatherBatch) -> None:
-    ctx = batch.ctx
-    app = ctx.application
-    deadline = time.monotonic() + GATHER_MAX_WAIT_SEC
-    while not batch.sealed and app.running:
-        now = time.monotonic()
-        wait = batch.last_arrival + GATHER_WINDOW_SEC - now
-        if wait <= 0 and batch.ready:
-            break
-        if now >= deadline and not batch.slow:
-            break
-        if batch.slow and not batch.closed and (wait <= 0 or now >= deadline):
-            _gather_close(app, chat_key, batch)
-        if batch.closed:
-            await asyncio.sleep(0.5)
-        else:
-            await asyncio.sleep(max(min(max(wait, 0.2), deadline - now), 0.05))
-    if batch.sealed:
-        return  # пачку забрала «!»-поправка или выбросил /cancel
-    batch.sealed = True
-    batches: dict[str, GatherBatch] = app.bot_data.setdefault("gather_batches", {})
-    if batches.get(chat_key) is batch:
-        batches.pop(chat_key, None)
-    if not app.running:
-        # Бот останавливается: новый ран всё равно оборвал бы рестарт.
-        # cancelled, чтобы и докачавшийся позже кусок не ушёл в Claude сам;
-        # уведомление нужно, даже если ни один кусок ещё не готов.
-        batch.cancelled = True
-        log.warning("gathered request dropped on shutdown chat=%s", chat_key)
-        try:
-            await batch.update.message.reply_text(
-                _("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта")
-            )
-        except Exception:
-            log.debug("shutdown notice failed (ignored)", exc_info=True)
-        return
-    # Пачка, закрытая раньше в ожидании большой загрузки, уходит первой:
-    # порядок сообщений темы сохраняется.
-    prev = batch.prev
-    batch.prev = None
-    if prev is not None and not prev.done.is_set():
-        await prev.done.wait()
-    if batch.cancelled:
-        return
-    pieces = batch.pieces
-    if not pieces:
-        return
-    if batch.messages:
-        # Реакции фоном: пока они ждут сеть, опоздавший кусок успел бы
-        # отправиться сам и обогнать пачку.
-        app.create_task(_gather_react(batch.messages))
-    if len(pieces) > 1:
-        log.info("gathered %d messages into one request chat=%s", len(pieces), chat_key)
-    # Следующая пачка темы ждёт эту только до очереди замка, а не до конца её
-    # рана: до входа в замок в _dispatch_to_claude нет ни одного await, порядок
-    # дальше держит FIFO замка. Иначе сообщение, написанное во время долгого
-    # рана, вставало за кнопками и событиями, пришедшими позже (разбор 22.10.2026).
-    # Из gather_waiting пачка уходит тогда же: /cancel её уже не снимет.
-    batch.done.set()
-    waiting: dict[str, set[GatherBatch]] = app.bot_data.get("gather_waiting") or {}
-    waiting.get(chat_key, set()).discard(batch)
-    await _dispatch_to_claude(
-        batch.update, ctx, "\n\n---\n\n".join(pieces), send_voice_reply=batch.voice,
-        **({"admitted": True} if batch.admitted else {}),
-    )
-
-
-def _gather_send_now(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> None:
-    """Отправить ожидающую пачку сразу, не дожидаясь тишины. Перед /compose:
-    иначе текст, пришедший до /compose, ушёл бы позже содержимого буфера."""
-    batch = _gather_take(ctx, chat_key)
-    if batch is None or not batch.pieces:
-        return
-    app = ctx.application
-    if batch.messages:
-        app.create_task(_gather_react(batch.messages))
-    app.create_task(
-        _dispatch_to_claude(
-            batch.update, batch.ctx, "\n\n---\n\n".join(batch.pieces),
-            send_voice_reply=batch.voice,
-        ),
-        update=batch.update,
-    )
 
 
 async def on_compose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3836,7 +1152,7 @@ async def on_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await note.edit_text(_("⚠️ ccusage вернул неожиданный формат"))
         return
     if not blocks:
-        await note.edit_text(_("Активного 5-часового окна нет — расход сейчас не идёт."))
+        await note.edit_text(_("Активного 5-часового окна нет — расход сейчас не идёт.") + _usage_limit_line())
         return
     b = blocks[0]
     lines = [_("🪟 Текущее 5-часовое окно:")]
@@ -3859,8 +1175,24 @@ async def on_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     proj_total = _num(proj.get("totalTokens"))
     if proj_total is not None:
         lines.append(_("• прогноз к концу окна: ~{k}k токенов").format(k=proj_total // 1000))
-    lines.append(_("\nЛимит окна Anthropic не публикует — сравнивай с обычными своими значениями."))
+    lines.append(_usage_limit_line() or
+                 _("\nЛимит окна Anthropic не публикует — сравнивай с обычными своими значениями."))
     await note.edit_text("\n".join(lines))
+
+
+def _usage_limit_line() -> str:
+    """Доля окон подписки из последнего rate_limit_event (limits.py): её бот
+    знает с 20.10.2026, а /usage говорил, что лимит не публикуется (аудит
+    удобства 31.10.2026). Пусто: снимка нет или окна уже сбросились."""
+    try:
+        got = limits.summary()
+    except Exception:
+        log.debug("limits summary failed (ignored)", exc_info=True)
+        return ""
+    if not got:
+        return ""
+    return "\n" + _("Лимит подписки по последнему рану: {summary} (общий с маком, снимок может отставать).").format(
+        summary=got)
 
 
 async def on_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3903,165 +1235,6 @@ def _synthetic_update(bot: Any, chat_id: int, thread_id: int | None) -> Update:
     )
     msg.set_bot(bot)
     return Update(update_id=0, message=msg)
-
-
-def _parse_at_when(spec: str) -> float | None:
-    """Секунды до срабатывания: '45m'/'2h'/'90s' или 'HH:MM' (ближайшее)."""
-    dur = parse_duration(spec)
-    if dur is not None:
-        return float(dur)
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", spec.strip())
-    if not m:
-        return None
-    hh, mm = int(m.group(1)), int(m.group(2))
-    if hh > 23 or mm > 59:
-        return None
-    now = datetime.now()
-    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
-
-
-async def _at_fire(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    data: dict = ctx.job.data
-    # at_running с первой строки: пока задание выполняется, отмена заявки на
-    # перезапуск не ставит его в очередь второй раз (ревью Codex 13.10.2026).
-    running: set[str] = ctx.application.bot_data.setdefault("at_running", set())
-    running.add(data["jid"])
-    try:
-        await _at_fire_running(ctx, data)
-    finally:
-        running.discard(data["jid"])
-
-
-async def _at_fire_running(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
-    store: SessionStore = ctx.application.bot_data["at_jobs"]
-    prompt = data["prompt"]
-    expires_at = data.get("expires_at")
-    if expires_at is not None and float(expires_at) <= time.time():
-        # Перенесённое лимитом событие со сроком: окно прошло, не запускать.
-        log.warning("at job %s expired (event %s), dropped", data["jid"], data.get("event_id"))
-        store.remove(data["jid"])
-        return
-    token = _SILENT_RUN.set(bool(data.get("silent")))
-    deal_token = _DEAL_ASKS.set(data.get("deal_asks") is True)
-    try:
-        await _at_fire_dispatch(ctx, data, store, prompt)
-    finally:
-        _DEAL_ASKS.reset(deal_token)
-        _SILENT_RUN.reset(token)
-
-
-async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: SessionStore,
-                            prompt: str) -> None:
-    try:
-        await ctx.bot.send_message(
-            chat_id=data["chat_id"],
-            text=_("⏰ отложенный промпт: {prompt}").format(prompt=prompt[:200]),
-            message_thread_id=data["thread_id"],
-        )
-    except Exception:
-        log.exception("at-notice failed jid=%s", data["jid"])
-    update = _synthetic_update(ctx.bot, data["chat_id"], data["thread_id"])
-    # Запись снимается, когда ран получил тему, а не до очереди замка: задание,
-    # ждавшее занятую тему, переживает рестарт (восстановление в post_init).
-    # Начатый ран после аварии не повторяется, чтобы не задвоить действия
-    # (ревью 12.10.2026). Отклонённое на время ожидания перезапуска тоже
-    # остаётся на диске и уйдёт после рестарта (ревью Codex 13.10.2026).
-    rejected = False
-    try:
-        expires_at = data.get("expires_at")
-        ref = {k: data[k] for k in ("event_id", "expires_at", "silent", "deal_asks")
-               if data.get(k) is not None} or None
-        rejected = bool(await _dispatch_to_claude(
-            update, ctx, prompt, send_voice_reply=False, unattended=True,
-            on_run_start=lambda: store.remove(data["jid"]), deferred=True,
-            limit_retry=int(data.get("limit_retry") or 0),
-            # Срок события и под замком темы: задание могло ждать чужой ран.
-            still_wanted=(lambda: float(expires_at) > time.time()) if expires_at is not None else None,
-            event_ref=ref,
-        ))
-    finally:
-        bd = ctx.application.bot_data
-        if not rejected and not bd.get("stopping"):
-            # Ран не понадобился (идёт вход, ошибка до старта): задание отработано.
-            store.remove(data["jid"])
-        elif rejected and not bd.get("stopping") and not bd.get("draining") \
-                and data["jid"] in store.data:
-            # Заявку отменили, пока шёл отказ: отмена пропустила это задание
-            # как выполняющееся, вернуть его в очередь здесь.
-            _schedule_at_job(ctx.application, data["jid"],
-                             {k: v for k, v in data.items() if k != "jid"})
-
-
-def _schedule_at_job(application: Application, jid: str, payload: dict) -> None:
-    delay = max(1.0, float(payload["fire_at"]) - time.time())
-    application.job_queue.run_once(
-        _at_fire, when=delay, data={"jid": jid, **payload}, name=f"at:{jid}",
-    )
-
-
-async def on_at(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/at 45m <текст> | /at 14:30 <текст> | /at (список) | /at cancel <id>."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    if not _is_allowed(cfg, update):
-        return
-    msg = update.message
-    chat_key, chat_id, thread_id = _chat_key(update)
-    store: SessionStore = ctx.application.bot_data["at_jobs"]
-
-    if not ctx.args:
-        rows = []
-        for jid, entry in store.data.items():
-            try:
-                payload = json.loads(entry["v"])
-            except (json.JSONDecodeError, KeyError):
-                continue
-            if payload.get("chat_key") != chat_key:
-                continue
-            when = datetime.fromtimestamp(payload["fire_at"]).strftime("%d.%m %H:%M")
-            rows.append(f"• {jid} · {when} · {payload['prompt'][:60]}")
-        if not rows:
-            await msg.reply_text(
-                _("Отложенных промптов нет.\n"
-                  "Формат: /at 45m <текст> | /at 14:30 <текст> | /at cancel <id>")
-            )
-            return
-        # Длинный список режем тем же сплиттером, что и ответы claude.
-        for chunk in split_for_telegram(
-            _("Отложенные промпты этой темы:\n{rows}").format(rows="\n".join(rows)), cfg.telegram_text_limit
-        ):
-            await msg.reply_text(chunk)
-        return
-
-    if ctx.args[0].lower() == "cancel":
-        if len(ctx.args) < 2:
-            await msg.reply_text(_("Формат: /at cancel <id>"))
-            return
-        jid = ctx.args[1].strip()
-        for j in ctx.application.job_queue.get_jobs_by_name(f"at:{jid}"):
-            j.schedule_removal()
-        removed = store.remove(jid)
-        await msg.reply_text(_("🗑 отменено.") if removed else _("⚠️ id {jid} не найден.").format(jid=jid))
-        return
-
-    delay = _parse_at_when(ctx.args[0])
-    parts = (msg.text or "").split(maxsplit=2)
-    prompt = parts[2].strip() if len(parts) >= 3 else ""
-    if delay is None or not prompt:
-        await msg.reply_text(_("Формат: /at 45m <текст> | /at 2h <текст> | /at 14:30 <текст>"))
-        return
-    jid = uuid.uuid4().hex[:6]
-    fire_at = time.time() + delay
-    payload = {
-        "chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
-        "fire_at": fire_at, "prompt": prompt,
-    }
-    store.set(jid, json.dumps(payload, ensure_ascii=False))
-    _schedule_at_job(ctx.application, jid, payload)
-    when = datetime.fromtimestamp(fire_at).strftime("%d.%m %H:%M:%S")
-    await msg.reply_text(_("⏰ ок, {when}: «{prompt}» (отмена: /at cancel {jid})").format(when=when, prompt=prompt[:80], jid=jid))
 
 
 def _current_sid(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> str | None:
@@ -4519,133 +1692,6 @@ async def on_model_pin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
-def _login_keyboard(ctx, engines=("claude", "codex"), *, private: bool = True):
-    rows = []
-    for engine in engines:
-        label = _("Восстановить вход {engine}").format(engine='Claude' if engine == 'claude' else 'Codex')
-        action = {"callback_data": f"login:{engine}"} if private else {
-            "url": f"https://t.me/{ctx.bot.username}?start=login_{engine}"
-        }
-        rows.append([InlineKeyboardButton(label, **action)])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _offer_login(update, ctx, engine):
-    cfg = ctx.application.bot_data.get("cfg")
-    if cfg is not None and _is_workshop(cfg, _chat_key(update)[0]):
-        # Мастерская заглушена: кнопка входа в личку, туда же ведёт и вход.
-        with contextlib.suppress(Exception):
-            await ctx.bot.send_message(
-                cfg.primary_chat_id,
-                _("🛠 Мастерская: нужно восстановить вход {engine}.").format(
-                    engine='Claude' if engine == 'claude' else 'Codex'),
-                reply_markup=_login_keyboard(ctx, (engine,), private=True))
-        return
-    try:
-        await update.effective_message.reply_text(
-            _("Нужно восстановить вход {engine}. "
-              "Кнопка открывает вход в личном чате с ботом.").format(engine='Claude' if engine == 'claude' else 'Codex'),
-            reply_markup=_login_keyboard(ctx, (engine,), private=update.effective_chat.type == "private"),
-        )
-    except Exception:
-        log.warning("login button delivery failed for %s", engine)
-
-
-async def _start_login(update, ctx, engine: str):
-    cfg = ctx.application.bot_data["cfg"]
-    if not _is_allowed(cfg, update):
-        return
-    msg = update.effective_message
-    if update.effective_chat.type != "private":
-        await msg.reply_text(_("Восстановление входа доступно в личном чате с ботом."),
-                             reply_markup=_login_keyboard(ctx, private=False))
-        return
-    manager = ctx.application.bot_data["login_manager"]
-    if engine == "cancel":
-        cancelled = await manager.cancel(update.effective_user.id, update.effective_chat.id)
-        await msg.reply_text(_("Вход отменён.") if cancelled else _("Нет активного входа."))
-        return
-    if engine not in ("claude", "codex"):
-        await msg.reply_text(_("Выбери, какой вход восстановить. Отмена: /login cancel"),
-                             reply_markup=_login_keyboard(ctx))
-        return
-    if not manager.binaries[engine]:
-        await msg.reply_text(_("Codex не настроен: отсутствует CODEX_BIN."))
-        return
-    if any(lock.locked() for lock in ctx.application.bot_data.get("chat_locks", {}).values()):
-        await msg.reply_text(_("Сначала дождись завершения запросов бота или отмени их через /cancel в соответствующем чате."))
-        return
-    if not manager.start(engine, update.effective_user.id, update.effective_chat.id):
-        await msg.reply_text(_("Уже идёт восстановление входа. Дождись результата или используй /login cancel."))
-
-
-async def on_login_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(ctx.application.bot_data["cfg"], update):
-        await update.callback_query.answer()
-        return
-    await update.callback_query.answer()
-    await _start_login(update, ctx, update.callback_query.data.split(":", 1)[1])
-
-
-async def on_auth_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg is None or update.callback_query is not None:
-        return
-    text = msg.text or msg.caption or ""
-    parts = text.split()
-    command = parts[0].split("@", 1)[0].lower() if parts and text.startswith("/") else ""
-    manager = ctx.application.bot_data["login_manager"]
-    session = manager.session
-    user = update.effective_user
-    chat = update.effective_chat
-    owner = session is not None and user is not None and chat is not None and (
-        session.user_id, session.chat_id
-    ) == (user.id, chat.id)
-    reply = getattr(msg, "reply_to_message", None)
-    quoted = (reply.text or reply.caption or "") if reply is not None else ""
-    login_active = session is not None
-    secret = command == "/authcode" or looks_like_auth_code(text, login_active=login_active)
-    quoted_secret = quoted.lower().startswith("/authcode") or looks_like_auth_code(
-        quoted, login_active=login_active
-    )
-    # Пересланное это чужой текст, а не команда: пересланное «/login claude»
-    # запускало вход и на 10 минут отклоняло все запросы к моделям. Сообщения,
-    # похожие на код входа, удаляются по-прежнему (ревью 12.10.2026).
-    forwarded = getattr(msg, "forward_origin", None) is not None
-    login_command = not forwarded and (command == "/login" or (
-        command == "/start" and len(parts) == 2 and parts[1] in ("login_claude", "login_codex")
-    ))
-    if not (secret or quoted_secret or owner or login_command):
-        return
-    if not _is_allowed(ctx.application.bot_data["cfg"], update):
-        raise ApplicationHandlerStop
-    if secret:
-        with contextlib.suppress(Exception):
-            await msg.delete()
-    if update.edited_message is not None or update.edited_channel_post is not None:
-        raise ApplicationHandlerStop
-    if secret:
-        if chat.type != "private":
-            answer = _("Код входа принимается только в личном чате с ботом.")
-        else:
-            code = text[len(parts[0]):].strip() if command == "/authcode" else text.strip()
-            answer = await manager.submit(user.id, chat.id, code)
-        # Do not quote the deleted message containing the code.
-        await ctx.bot.send_message(chat_id=chat.id, text=answer, message_thread_id=msg.message_thread_id)
-    elif login_command:
-        engine = parts[1] if len(parts) == 2 else ""
-        if command == "/start":
-            engine = engine.removeprefix("login_")
-        await _start_login(update, ctx, engine)
-    elif owner and command == "/cancel" and not forwarded:
-        await _start_login(update, ctx, "cancel")
-    elif quoted_secret:
-        await ctx.bot.send_message(chat_id=chat.id, text=_("Сообщения с цитатой кода входа не передаются модели."))
-    else:
-        await msg.reply_text(_("Идёт восстановление входа. Дождись результата или используй /login cancel. Код Claude: /authcode КОД."))
-    raise ApplicationHandlerStop
-
-
 async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     user = update.effective_user
@@ -4654,27 +1700,31 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         _("Привет. user_id={user_id}, ты в whitelist.\n"
-        "В Claude destructive-команды (Bash/Write/Edit/…) приходят на approve через кнопки.\n"
-        "Codex (`gpt:`/fallback) работает по своей sandbox без этих кнопок.\n"
-        "Readonly (Read/Grep/Glob/…) — без подтверждения.\n\n"
+        "Чтение идёт без карточек. Перед изменениями агент присылает одну карточку «📋 План», "
+        "после ✅ шаги этого запуска идут без карточек. Отдельной карточкой всегда: удаление "
+        "данных, push, отправка от твоего имени, секреты. Codex (`gpt:` и запасной путь) "
+        "работает в своей песочнице без карточек.\n\n"
+        "Пока идёт ответ:\n"
+        "«стоп» или /cancel: остановить; «ничего не отправляй»: остановить и ждать\n"
+        "«!текст»: прервать и сразу отправить поправку\n"
+        "остальное, что напишешь, уйдёт одним следующим сообщением\n"
+        "На голосовое ответ голосом; в тексте попроси «голосом» или «озвучь».\n\n"
         "Команды:\n"
-        "/reset [force] — сбросить claude-сессию в этом чате (force = прибить активный claude и сбросить разом)\n"
-        "/cancel — прервать текущий claude-процесс\n"
-        "/status — что сейчас происходит\n"
-        "/keys [off] — кнопки «Новый диалог», «Стоп», «Статус» под полем ввода\n"
-        "/login — восстановить вход Claude или Codex в личном чате\n"
-        "/plan <задача> — сначала план с кнопками, выполнение после ✅\n"
-        "/task <что сделать>: отдельная тема задачи в группе «Новостей», там обсуждение, итоговый план и выполнение после ✅\n"
-        "/auto [15m|1h|off] — окно auto-approve (default 15m, max 1h)\n"
-        "/compose … /go — накопить сообщения и отправить одним промптом\n"
-        "/at 45m|14:30 <текст> — отложенный промпт (/at — список, /at cancel <id>)\n"
-        "/resume — подцепить одну из последних сессий, /export — сессию в Markdown,\n"
-        "/handback — команда для продолжения сессии в терминале\n"
-        "/usage — расход текущего 5-часового окна подписки\n"
-        "/effort [low|medium|high|xhigh|max|default] — глубина рассуждений в этой ветке\n"
-        "/model — модель claude для этой ветки до конца сессии, выбор кнопками (или /model <имя>|pin [имя]|default)\n"
-        "/scope [текст|clear] — ручная пометка темы (что это за тема/где контекст), переживает сброс сессии\n\n"
-        "«! поправка» при занятой теме — прервать текущий ран и сразу отправить поправку.").format(user_id=user.id)
+        "/status: что сейчас происходит\n"
+        "/reset [force]: новый разговор в этой теме (force = сначала остановить ответ)\n"
+        "/keys [off]: кнопки «Новый диалог», «Стоп», «Статус» под полем ввода\n"
+        "/plan <задача>: сначала план с кнопками, выполнение после ✅\n"
+        "/task <что сделать>: отдельная тема задачи в группе «Новостей» (обсуждение, "
+        "проект под «▶️ Делай», выполнение, итог)\n"
+        "/auto [15m|1h|off]: окно без карточек в этой теме (по умолчанию 15m, максимум 1h)\n"
+        "/compose … /go: накопить сообщения и отправить одним\n"
+        "/at 45m|14:30 <текст>: отложенный запрос (/at: список, /at cancel <id>)\n"
+        "/resume: подцепить одну из последних сессий, /export: сессию в Markdown, "
+        "/handback: команда для терминала\n"
+        "/model, /effort: модель и глубина рассуждений этой темы\n"
+        "/scope [текст|clear]: пометка темы, переживает сброс сессии\n"
+        "/usage: расход 5-часового окна подписки\n"
+        "/login: восстановить вход Claude или Codex в личном чате").format(user_id=user.id)
     )
 
 
@@ -4690,8 +1740,7 @@ async def on_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     answer = await _reset_session(ctx, cfg, chat_key, force=force)
     if answer is None:
         await update.message.reply_text(
-            _("⚠️ Claude сейчас работает в этом чате/теме. Сначала /cancel, потом /reset "
-              "(или `/reset force` — прибить и сбросить разом).")
+            _("⚠️ Сейчас идёт ответ. Остановить его и начать заново: /reset force.")
         )
         return
     await update.message.reply_text(answer)
@@ -4720,6 +1769,7 @@ async def _reset_session(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: 
         procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
         proc = procs.get(chat_key)
         if proc is not None and proc.returncode is None:
+            _mark_user_stop(ctx, chat_key)
             await _terminate_and_wait(chat_key, proc)
             killed = True
             # Pending approvals убитой сессии гасит сам обработчик сообщения
@@ -4844,10 +1894,12 @@ async def on_keys_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.debug("keys pick edit failed (ignored)", exc_info=True)
 
 
-async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, nosend: bool = False) -> bool:
+    """True: что-то снято или прервано. nosend: Иван сказал «ничего не
+    отправляй», и подтверждение это называет одним сообщением."""
     cfg: Config = ctx.application.bot_data["cfg"]
     if not _is_allowed(cfg, update):
-        return
+        return False
     chat_key, _unused, _unused = _chat_key(update)
     if (getattr(ctx, "args", None) and ctx.args[0].lower() in ("мастерская", "workshop")
             and getattr(cfg, "workshop_chat_key", "")):
@@ -4858,17 +1910,26 @@ async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if proc is None or proc.returncode is not None:
         # Сообщение, ещё ждущее склейки, и есть то, что отменяют: иначе бот
         # ответил бы «нет процесса», а запрос ушёл бы следом.
-        dropped = _gather_cancel(ctx, chat_key)
+        dropped = (_gather_cancel(ctx, chat_key) + _pack_cancel(ctx, chat_key)
+                   + _prestart_cancel(ctx, chat_key) + _drained_cancel(ctx.application, chat_key))
         downloads = _downloads_cancel(ctx.application, chat_key)
+        tail = _nosend_tail() if nosend else ""
         if dropped:
-            await update.message.reply_text(_("🗑 отменено до отправки в Claude: {count} сообщ.").format(count=dropped))
-            return
+            await update.message.reply_text(
+                _("🗑 отменено до отправки в Claude: {count} сообщ.").format(count=dropped) + tail)
+            return True
         if downloads:
-            await update.message.reply_text(_("🗑 загрузка файла отменена"))
-            return
-        await update.message.reply_text(_("Нет активного процесса (claude/codex) в этом чате/теме."))
-        return
-    await update.message.reply_text(await _cancel_running(ctx, chat_key, proc))
+            await update.message.reply_text(_("🗑 загрузка файла отменена") + tail)
+            return True
+        await update.message.reply_text(_("Сейчас ничего не идёт, останавливать нечего."))
+        return False
+    text = await _cancel_running(ctx, chat_key, proc)
+    await update.message.reply_text(text + (_nosend_tail() if nosend else ""))
+    return True
+
+
+def _nosend_tail() -> str:
+    return "\n" + _("Ничего не отправляю, жду твоего слова.")
 
 
 async def _cancel_running(
@@ -4879,6 +1940,8 @@ async def _cancel_running(
     store: SessionStore = ctx.application.bot_data["sessions"]
     active_sessions: dict[str, str] = ctx.application.bot_data["active_sessions"]
     pid = proc.pid
+    # До первого await: ран может закончиться, пока гасятся карточки.
+    _mark_user_stop(ctx, chat_key)
     # Эскалация SIGTERM → grace_sec → SIGKILL запускается в фоне, чтобы юзер
     # сразу увидел подтверждение, не блокируясь на grace_sec секундах ожидания.
     # _terminate_and_wait уже даёт правильную модель (как в shutdown), плюс
@@ -4888,7 +1951,8 @@ async def _cancel_running(
     # Ждущее склейки отменяется и при занятой теме, до первого await: иначе
     # через GATHER_WINDOW_SEC оно ушло бы в Claude новым раном сразу после отмены
     # (ревью 12.10.2026).
-    dropped = _gather_cancel(ctx, chat_key)
+    dropped = (_gather_cancel(ctx, chat_key) + _pack_cancel(ctx, chat_key)
+               + _drained_cancel(ctx.application, chat_key))
     _downloads_cancel(ctx.application, chat_key)
 
     # Гасим все pending approvals, принадлежащие убитой сессии: их кнопки
@@ -4901,13 +1965,41 @@ async def _cancel_running(
     count = 0
     if sid:
         count = await _cleanup_abandoned_approvals(
-            ctx, sid, "deny:cancelled-by-user", _("🚫 approval отменён (/cancel)")
+            ctx, sid, "deny:cancelled-by-user", _("🚫 карточка снята: ран остановлен")
         )
 
-    note = _(" · сброшено pending approvals: {count}").format(count=count) if count else ""
+    log.info("cancel by user chat=%s pid=%s cards=%d dropped=%d", chat_key, pid, count, dropped)
+    note = _(" · снято карточек: {count}").format(count=count) if count else ""
     if dropped:
-        note += _(" · отменено до отправки в Claude: {count} сообщ.").format(count=dropped)
-    return _("SIGTERM отправлен (pid={pid}){note}. SIGKILL через 5с если не выйдет.").format(pid=pid, note=note)
+        note += _(" · не ушло в Claude: {count} сообщ.").format(count=dropped)
+    return _("⛔ Остановлено{note}").format(note=note)
+
+
+@dataclass
+class RunStop:
+    """Отметка «этот ран снял сам Иван», своя у каждого рана (_run_stops)."""
+    stopped: bool = False
+
+
+def _run_stops(ctx: Any) -> dict[str, RunStop]:
+    """Отметка рана темы, держащего замок, от старта до отпуска замка."""
+    return ctx.application.bot_data.setdefault("run_stops", {})
+
+
+def _mark_user_stop(ctx: Any, chat_key: str) -> None:
+    """Ран темы снимает сам Иван: его подтверждение уже сказало «остановлено»,
+    ответ убитого рана «⛔ отменено (signal -15)» второй раз не нужен (аудит
+    удобства 31.10.2026). Отметка ставится рану, идущему сейчас, а не теме:
+    общая на тему, она снималась стартом следующего рана раньше, чем конец
+    снятого успевал её прочесть, и тот всё же писал «отменено» (queue2)."""
+    mark = _run_stops(ctx).get(chat_key)
+    if mark is not None:
+        mark.stopped = True
+
+
+def _quiet_after_user_stop(result: ClaudeResult, user_stop: bool) -> bool:
+    """Ответ рана не отправлять: его снял сигналом сам Иван."""
+    return user_stop and result.is_error and result.signalled
 
 
 async def _memory_status_line() -> str:
@@ -4942,6 +2034,24 @@ async def _memory_status_line() -> str:
     return stdout.decode("utf-8", errors="replace").strip() or _("ок, разбирать нечего")
 
 
+def _status_headline(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, proc_running: bool) -> str:
+    """Первая строка /status: что идёт в этой теме, сколько и как остановить.
+    Живой статус рана мог уехать вверх, а технические поля ниже за рулём не
+    читаются (ux.md 13)."""
+    watch: dict[str, _RunStatus] = ctx.application.bot_data.get("run_watch") or {}
+    status = next((s for s in list(watch.values()) if s.chat_key == chat_key), None)
+    if status is not None:
+        line = status.headline()
+    elif proc_running:
+        line = _("▶️ отвечаю")
+    else:
+        return _("💤 сейчас ничего не идёт")
+    queued = ctx.application.bot_data.get("lock_waiting", {}).get(chat_key, 0)
+    if queued > 0:
+        line += ", " + _("в очереди {n}").format(n=queued)
+    return line + _(". Остановить: «стоп»")
+
+
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     if not _is_allowed(cfg, update):
@@ -4966,7 +2076,8 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         elif side:
             proc_line += _(" · ран по чужому тексту в своей сессии {sid}").format(
                 sid=(active_sessions.get(chat_key) or "")[:8])
-    uptime = int(time.time() - started)
+    up_min = int(time.time() - started) // 60
+    uptime = _("{h} ч {m} мин").format(h=up_min // 60, m=up_min % 60)
     pending_count = registry.pending_count
     openai_ok = ctx.application.bot_data.get("openai") is not None
     burst_until = burst_until_ts(ctx, chat_key)
@@ -4993,9 +2104,13 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     model_cur = _model_label(ctx, cfg, chat_key)
     memory_line = await _memory_status_line()
     workshop_line = _workshop_status(ctx, cfg) + _cost_day_line(ctx)
+    head = _status_headline(ctx, chat_key, proc is not None and proc.returncode is None) + "\n"
+    limit = limits.summary()
+    if limit:
+        head += _("лимит подписки: {limit}").format(limit=limit) + "\n"
     await update.message.reply_text(
-        workshop_line +
-        _("uptime: {uptime}s\n"
+        head + workshop_line +
+        _("uptime: {uptime}\n"
           "chat_key: {chat_key}\n"
           "session (here): {sid}\n"
           "claude process: {proc_line}\n"
@@ -5015,693 +2130,6 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def _limit_movable(task: dict | None, exec_task: dict | None, from_callback: bool,
-                   permission_mode: str) -> bool:
-    """Можно ли перенести запрос отложенным промптом (/at) на после сброса.
-    Нельзя: выполнение задачи и тема задачи (свой порядок одобрения), /plan,
-    ответ кнопкой. Там Иван повторяет сам."""
-    return task is None and exec_task is None and not from_callback and permission_mode != "plan"
-
-
-def _limit_retry_pending(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
-    """Ждёт ли тема отложенного после лимита повтора (задание /at с limit_retry)."""
-    store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
-    for entry in list((store.data if store is not None else {}).values()):
-        with contextlib.suppress(Exception):
-            job = json.loads(entry["v"])
-            if job.get("chat_key") == chat_key and int(job.get("limit_retry") or 0) > 0:
-                return True
-    return False
-
-
-def _limit_defer(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, chat_id: int, thread_id: int | None,
-                 prompt: str, fire_at: float, retry: int, event_ref: dict | None = None) -> bool:
-    """Отложенный промпт, как /at: переживает рестарт, уходит фоновым раном."""
-    store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
-    if store is None or getattr(ctx.application, "job_queue", None) is None:
-        return False
-    expires_at = (event_ref or {}).get("expires_at")
-    if expires_at is not None and float(expires_at) <= fire_at:
-        # Событие со сроком (поиск в своём окне) после сброса уже не нужно.
-        return False
-    jid = uuid.uuid4().hex[:6]
-    payload = {"chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
-               "fire_at": fire_at, "prompt": prompt, "limit_retry": retry}
-    # Событие с диска передаёт заданию id, срок и тишину: после рестарта оно не
-    # будится второй раз, а задание само проверит срок (ревью Codex 22.10.2026).
-    payload.update({k: v for k, v in (event_ref or {}).items() if v is not None})
-    try:
-        store.set(jid, json.dumps(payload, ensure_ascii=False))
-        _schedule_at_job(ctx.application, jid, payload)
-    except Exception:
-        # Готовый ответ важнее отложенного задания: он уходит с пометкой.
-        log.exception("limit: deferral failed chat=%s", chat_key)
-        with contextlib.suppress(Exception):
-            store.remove(jid)
-        return False
-    log.info("limit: deferred chat=%s jid=%s until=%s retry=%d", chat_key, jid, limits.clock(fire_at), retry)
-    return True
-
-
-def _limit_note_once(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, until: float) -> bool:
-    """Уведомление о пропуске фонового рана: одно на тему за время резерва."""
-    seen: set = ctx.application.bot_data.setdefault("limit_noticed", set())
-    key = (chat_key, int(until))
-    if key in seen:
-        return False
-    seen.add(key)
-    return True
-
-
-async def _limit_hold(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, msg: Any, chat_key: str,
-                      chat_id: int, thread_id: int | None, prompt: str, *,
-                      unattended: bool, untrusted: bool, movable: bool, limit_retry: int,
-                      event_ref: dict | None = None) -> bool:
-    """Резерв лимита Claude (limits.py): с 97% пятичасового или 99% недельного
-    окна идёт только разговор Ивана в чате Домового. Остальное откладывается до
-    сброса, а что ждать не может, пропускается с уведомлением. True: ран не
-    начинать."""
-    until = limits.reserve()
-    if until is None:
-        return False
-    if chat_key in getattr(cfg, "limit_reserve_chats", frozenset()) and not unattended:
-        return False
-    fire_at = limits.fire_at(until)
-    head = _("⏸ лимит Claude на исходе ({where}), остаток оставлен разговору с Домовым").format(
-        where=limits.summary() or "?")
-    if untrusted or (unattended and fire_at - time.time() > limits.BACKGROUND_MAX_WAIT_SEC):
-        # Ран по чужому тексту отложенным промптом не повторить: /at идёт с
-        # полными правами. Фоновое дело после долгого ожидания несвоевременно.
-        log.info("limit: skipped chat=%s untrusted=%s until=%s", chat_key, untrusted, limits.clock(until))
-        text = head + _(": фоновый запуск пропущен, сброс в {when}.").format(when=limits.clock(until)) \
-            if _limit_note_once(ctx, chat_key, until) else ""
-    elif movable and limit_retry < limits.MAX_RETRIES \
-            and _limit_defer(ctx, chat_key, chat_id, thread_id, prompt, fire_at, limit_retry + 1,
-                             event_ref):
-        text = head + _(": запрос отложен до {when} и уйдёт сам фоновым раном.").format(
-            when=limits.clock(fire_at))
-    else:
-        text = head + _(": запрос не ушёл в Claude, повтори после {when}.").format(when=limits.clock(fire_at))
-    if text:
-        with contextlib.suppress(Exception):
-            await msg.reply_text(text)
-    return True
-
-
-def _limit_after_error(ctx: ContextTypes.DEFAULT_TYPE, result: ClaudeResult, chat_key: str,
-                       chat_id: int, thread_id: int | None, prompt: str, *,
-                       unattended: bool, untrusted: bool, movable: bool,
-                       limit_retry: int, event_ref: dict | None = None) -> ClaudeResult:
-    """Ран упал на исчерпании подписки: повторить после сброса, если можно.
-    Повторяется оставшаяся работа: агент сначала смотрит, что уже сделано
-    (ревью Codex 20.10.2026)."""
-    reset = result.limit_reset
-    note = ""
-    when = limits.fire_at(reset) if reset is not None else None
-    if when is None:
-        note = _("время сброса неизвестно, повтори сам позже")
-    elif untrusted or not movable:
-        note = _("повтори после {when}").format(when=limits.clock(when))
-    elif limit_retry >= limits.MAX_RETRIES:
-        note = _("повторы исчерпаны, продолжи сам после {when}").format(when=limits.clock(when))
-    elif unattended and when - time.time() > limits.BACKGROUND_MAX_WAIT_SEC:
-        note = _("фоновый запуск не повторяю, сброс в {when}").format(when=limits.clock(when))
-    else:
-        # Обёртка «проверь сделанное» и после откладывания до первого запуска:
-        # тот мог частично выполниться (ревью Codex 20.10.2026). Не вкладывается.
-        again = prompt if prompt.startswith(LIMIT_RETRY_HEAD) else _(
-            "{head} Лимит Claude сбросился. Прошлый запуск по этому запросу оборвался на исчерпании "
-            "лимита: сначала проверь, что уже сделано, и продолжи, не повторяя сделанного.\n\n"
-            "Запрос:\n{prompt}").format(head=LIMIT_RETRY_HEAD, prompt=prompt)
-        if _limit_defer(ctx, chat_key, chat_id, thread_id, again, when, limit_retry + 1, event_ref):
-            note = _("продолжу сам в {when}").format(when=limits.clock(when))
-        else:
-            note = _("повтор не поставлен, повтори сам после {when}").format(when=limits.clock(when))
-    return dataclasses.replace(result, text=f"{result.text}\n\n⏸ {note}" if note else result.text)
-
-
-# Начало отложенного повтора после исчерпания: по нему повтор не оборачивается дважды.
-LIMIT_RETRY_HEAD = "⏸ limit-retry:"
-
-
-# Метка в ответе Codex: в сообщении было поручение, Claude выполнит его после
-# сброса. Без метки продолжения нет, лишнего ответа тоже (ревью Codex 20.10.2026).
-LIMIT_TODO_MARK = "[[поручения]]"
-
-
-def _limit_talk_prompt(prompt: str, reset: float | None) -> str:
-    when = limits.clock(limits.fire_at(reset)) if reset is not None else _("неизвестного времени")
-    return _(
-        "Claude сейчас недоступен: лимит подписки исчерпан до {when}. Ты отвечаешь Ивану вместо "
-        "Домового только разговором: памяти и инструментов Домового у тебя нет, ничего не меняй и "
-        "не записывай. Если в сообщении есть поручение (записать, отправить, изменить, напомнить), "
-        "не выполняй его, а скажи, что Claude выполнит его после сброса лимита, и последней строкой "
-        "ответа напиши ровно {mark}. Без поручения эту строку не пиши.\n\n"
-        "Сообщение Ивана:\n{prompt}").format(when=when, prompt=prompt, mark=LIMIT_TODO_MARK)
-
-
-def _limit_follow_up(ctx: ContextTypes.DEFAULT_TYPE, answer: ClaudeResult, failed: ClaudeResult,
-                     chat_key: str, chat_id: int, thread_id: int | None, prompt: str, *,
-                     limit_retry: int) -> ClaudeResult:
-    """После ответа Codex поставить Claude на после сброса: выполнить поручения
-    из сообщения, не отвечая заново (ревью Codex 20.10.2026). Только если Codex
-    отметил поручение."""
-    lines = answer.text.rstrip().splitlines()
-    if not lines or lines[-1].strip() != LIMIT_TODO_MARK:
-        # Метка только отдельной последней строкой: упоминание в тексте не в счёт.
-        return answer
-    answer = dataclasses.replace(answer, text="\n".join(lines[:-1]).rstrip())
-    reset = failed.limit_reset
-    if reset is None:
-        return dataclasses.replace(answer, text=answer.text + "\n\n" + _(
-            "⏸ время сброса неизвестно: поручения из сообщения повтори сам позже"))
-    if limit_retry >= limits.MAX_RETRIES:
-        return dataclasses.replace(answer, text=answer.text + "\n\n" + _(
-            "⏸ повторы исчерпаны: поручения из сообщения повтори сам после {when}").format(
-                when=limits.clock(limits.fire_at(reset))))
-    done = "\n\n".join(failed.texts)[-2000:]
-    task = _(
-        "Лимит Claude сбросился. Пока его не было, на сообщение Ивана ответил Codex только "
-        "разговором, без действий. Заново на сообщение не отвечай. До исчерпания Claude мог "
-        "успеть часть поручений: сначала проверь журнал, дневник и прочие следы, что уже "
-        "сделано, и не повторяй сделанного. Оставшиеся поручения выполни и коротко отчитайся.\n\n"
-        "Сообщение Ивана:\n{prompt}\n\nЧто Claude успел ответить до исчерпания:\n{done}"
-        "\n\nОтвет Codex:\n{body}"
-    ).format(prompt=prompt, done=done or "—", body=answer.text[-3000:])
-    fire_at = limits.fire_at(reset)
-    if _limit_defer(ctx, chat_key, chat_id, thread_id, task, fire_at, limit_retry + 1):
-        return dataclasses.replace(answer, text=answer.text + "\n\n" + _(
-            "⏸ поручения из сообщения Claude выполнит сам в {when}").format(when=limits.clock(fire_at)))
-    return dataclasses.replace(answer, text=answer.text + "\n\n" + _(
-        "⏸ задание не поставлено: поручения из сообщения повтори сам после {when}").format(
-            when=limits.clock(fire_at)))
-
-
-async def _limit_handle(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, result: ClaudeResult,
-                        chat_key: str, chat_id: int, thread_id: int | None, prompt: str, *,
-                        unattended: bool, untrusted: bool, limit_retry: int, movable: bool,
-                        agent_context: str, procs: dict, unexited: list,
-                        event_ref: dict | None = None,
-                        ) -> tuple[ClaudeResult, bool, tuple[str, ...]]:
-    """Ран упал на исчерпании подписки. Сообщение Ивана (не фон, не чужой
-    текст, не задача, не /plan, не кнопка): ответ Codex только разговором,
-    всегда read-only. Остальное: повтор Claude после сброса. Возвращает
-    результат, был ли Codex и ответы Claude до сбоя."""
-    if movable and not unattended and not untrusted and cfg.codex_bin and cfg.codex_fallback:
-        log.warning("claude subscription limit — conversation via codex chat=%s", chat_key)
-        if result.session_id:
-            await _cleanup_abandoned_approvals(
-                ctx, result.session_id, "deny:claude-exited", _("🚫 approval заброшен (claude exited)"))
-        if not ctx.application.bot_data.get("stopping"):
-            reset = result.limit_reset
-            answer = await _codex_as_claude_result(
-                cfg, _limit_talk_prompt(prompt, reset),
-                header=_("⚠️ лимит Claude до {when} → ответ через GPT (codex), только разговор").format(
-                    when=limits.clock(limits.fire_at(reset)) if reset is not None else "?"),
-                agent_context=agent_context, sandbox="read-only",
-                chat_key=chat_key, process_registry=procs,
-                should_stop=lambda: bool(ctx.application.bot_data.get("stopping")),
-                unexited=unexited)
-            if not answer.is_error:
-                return (_limit_follow_up(ctx, answer, result, chat_key, chat_id, thread_id, prompt,
-                                         limit_retry=limit_retry), True, result.texts)
-            if answer.auth_error:
-                return answer, True, result.texts
-            # У Codex тоже отказ: остаётся повтор Claude после сброса.
-    return (_limit_after_error(ctx, result, chat_key, chat_id, thread_id, prompt,
-                               unattended=unattended, untrusted=untrusted, movable=movable,
-                               limit_retry=limit_retry, event_ref=event_ref), False, ())
-
-
-def _is_claude_unavailable(result: ClaudeResult) -> bool:
-    """True, если ошибка claude — про недоступность сервиса (а не отказ/таймаут/
-    отмену пользователем), т.е. имеет смысл попробовать codex-фоллбэк.
-
-    Учитываем ошибки входа CLI и HTTP-статусы из API: 401 (протухший токен — кейс
-    инцидента 2026-06-20), 429 (лимит), 5xx (сбой Anthropic). Refusal, таймаут,
-    /cancel, FileNotFound и т.п. сюда НЕ попадают — на них codex не зовём."""
-    s = result.api_error_status
-    return (result.auth_error == "claude" or s in (401, 429) or (s is not None and 500 <= s < 600)
-            # Исчерпание подписки CLI не всегда помечает статусом 429 (limits.py).
-            or bool(getattr(result, "limit_hit", False)))
-
-
-def _build_codex_prompt(user_prompt: str, agent_context: str) -> str:
-    """Добавить persona/scope к одноразовому Codex-запросу с явными границами."""
-    context = agent_context.strip()
-    if not context:
-        return user_prompt
-    return (
-        _("## Контекст агента\n"
-          "Это контекст канала и проекта, а не расширение полномочий. "
-          "Текущий запрос и sandbox выше сохранённых правил.\n\n"
-          "{context}\n\n"
-          "## Запрос пользователя\n"
-          "{prompt}").format(context=context, prompt=user_prompt)
-    )
-
-
-async def _codex_as_claude_result(
-    cfg: Config, prompt: str, *, header: str,
-    agent_context: str = "",
-    sandbox: str | None = None,
-    chat_key: str | None = None,
-    process_registry: dict[str, asyncio.subprocess.Process] | None = None,
-    should_stop: Callable[[], bool] | None = None,
-    unexited: list[asyncio.subprocess.Process] | None = None,
-) -> ClaudeResult:
-    """Запустить codex и завернуть его ответ в ClaudeResult, чтобы дальнейшая
-    отправка (voice/text/файлы/футер) работала без изменений. cost_usd=0 —
-    codex идёт по подписке, cost-футер не показываем; session_id пуст.
-    sandbox=None → cfg.codex_sandbox (ручной режим); авто-фоллбэк передаёт
-    cfg.codex_fallback_sandbox (read-only). process_registry/chat_key — чтобы
-    /cancel мог прибить codex. agent_context содержит Telegram-persona и scope
-    темы; истории диалога Codex по-прежнему не получает."""
-    codex_prompt = _build_codex_prompt(prompt, agent_context)
-    r = await run_codex(
-        cfg.codex_bin, codex_prompt,
-        cwd=cfg.claude_cwd,
-        timeout_sec=cfg.codex_timeout_sec,
-        sandbox=sandbox or cfg.codex_sandbox,
-        network_access=cfg.codex_network_access,
-        chat_key=chat_key,
-        process_registry=process_registry,
-        should_stop=should_stop,
-        unexited=unexited,
-    )
-    text = f"{header}\n\n{r.text}" if header else r.text
-    return ClaudeResult(text=text, is_error=r.is_error, auth_error="codex" if r.auth_error else "")
-
-
-class _RunStatus:
-    """Одно статусное сообщение «что сейчас делает claude» на весь ран.
-
-    Обновляется по событиям tool_use из stream-json (см. claude_runner),
-    редактированием того же сообщения — без спама новыми. Троттлинг 3 с,
-    по завершении рана сообщение удаляется. Любой сбой Telegram глотается:
-    статус — косметика, ломать ран он не должен.
-
-    Фоновый тик (start) раз в _TICK_SEC перерисовывает статус и без событий,
-    чтобы росла «тишина», и сторожит ран: нет ни одного события stream-json
-    silence_alert_sec, и в чат уходит тревога со звуком и кнопками «Ждать» и
-    «Прервать» (on_run_watch_pick), одна на эпизод тишины; после
-    progress_note_sec работы один раз приходит весточка «Работаю N минут».
-    Codex-раны идут мимо: событий по ходу у run_codex нет, сторож давал бы
-    ложные тревоги.
-    """
-
-    _THROTTLE_SEC = 3.0
-    # Перерисовка без событий: тишина растёт на глазах, а правок в разы меньше
-    # лимита Telegram на редактирование.
-    _TICK_SEC = 25.0
-    # Тишину в статусе показываем только заметную: паузы по 5-10 с между
-    # событиями обычное дело.
-    _SILENCE_SHOW_SEC = 30.0
-    # Попыток громкой отправки на эпизод: тревогу или весточку, которая не
-    # уходит, не повторяем со звуком до конца рана.
-    _LOUD_TRIES = 4
-    # finish() убирает статус и тревоги не дольше этого, даже после 429.
-    _FINISH_BUDGET_SEC = 30.0
-    _DELETE_TRIES = 3
-    # BadRequest правки, после которых это сообщение уже не поправить.
-    _EDIT_GONE = ("message to edit not found", "message can't be edited", "message_id_invalid")
-
-    def __init__(
-        self, bot: Any, chat_id: int, thread_id: int | None, *,
-        chat_key: str = "",
-        silence_alert_sec: int = 0,
-        progress_note_sec: int = 0,
-        registry: dict[str, _RunStatus] | None = None,
-        waiting: Callable[[], bool] | None = None,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self._bot = bot
-        self._chat_id = chat_id
-        self._thread_id = thread_id
-        self.chat_key = chat_key
-        self._silence_alert_sec = silence_alert_sec
-        self._progress_note_sec = progress_note_sec
-        # run_id -> статус живых ранов: по нему кнопки тревоги находят свой ран.
-        self._registry = registry
-        # True, пока ран ждёт решения по карточке approve: эта тишина за
-        # человеком, а не за раном.
-        self._waiting = waiting
-        self._clock = clock
-        self.run_id = uuid.uuid4().hex[:12]
-        self._message_id: int | None = None
-        self._started = clock()
-        self._last_edit = 0.0
-        # Начало тишины для статуса и текста тревоги: последнее событие, а
-        # ожидание карточки approve сдвигает его, как и _quiet_since.
-        self._last_event = self._started
-        # Отсчёт до тревоги: от последнего события или от нажатия «Ждать».
-        self._quiet_since = self._started
-        self._alerted = False
-        # Сколько ещё попыток у тревоги этого эпизода и у весточки.
-        self._alert_left = self._LOUD_TRIES
-        self._progress_left = self._LOUD_TRIES
-        self._alert_ids: list[int] = []
-        self._progress_sent = False
-        self._steps = 0
-        self._desc = ""
-        self._closed = False
-        # До этого момента Telegram не трогаем: 429 на retry_after.
-        self._pause_until = 0.0
-        # Пауза одного статуса после его сбоя: громкие отправки она не держит.
-        self._status_pause_until = 0.0
-        self._ticker: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
-
-    @staticmethod
-    def _dur(sec: float) -> str:
-        m, s = divmod(int(sec), 60)
-        return _("{m}м{s:02d}с").format(m=m, s=s) if m else _("{s}с").format(s=s)
-
-    @staticmethod
-    def _plural(n: int, forms: tuple[str, str, str]) -> str:
-        if n % 10 == 1 and n % 100 != 11:
-            return forms[0]
-        if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-            return forms[1]
-        return forms[2]
-
-    def _fmt(self, now: float) -> str:
-        parts = [f"🔧 {self._desc}", _("шаг {steps}").format(steps=self._steps), _("всего {dur}").format(dur=self._dur(now - self._started))]
-        silence = now - self._last_event
-        if silence >= self._SILENCE_SHOW_SEC:
-            parts.append(_("тишина {dur}").format(dur=self._dur(silence)))
-        return " · ".join(parts)
-
-    def start(self) -> None:
-        """Регистрация для кнопок и фоновый тик. Задача копирует контекст рана,
-        поэтому в ране без звука (_SILENT_RUN) тревога тоже уходит без звука."""
-        if self._registry is not None:
-            self._registry[self.run_id] = self
-        self._ticker = asyncio.create_task(self._tick_loop(), name=f"run-status:{self.run_id}")
-
-    def on_event(self) -> None:
-        """Любое событие stream-json (activity_cb): тишина и эпизод тревоги сначала."""
-        now = self._clock()
-        self._last_event = now
-        self._quiet_since = now
-        self._alerted = False
-        self._alert_left = self._LOUD_TRIES
-
-    async def on_tool(self, desc: str) -> None:
-        self._steps += 1
-        self._desc = desc
-        self.on_event()
-        async with self._lock:
-            if self._closed:
-                return
-            now = self._clock()
-            if self._message_id is not None and now - self._last_edit < self._THROTTLE_SEC:
-                return
-            await self._show(now)
-
-    def _back_off(self, exc: RetryAfter) -> None:
-        """Общая пауза всех запросов рана на retry_after из 429."""
-        ra = exc.retry_after
-        sec = ra.total_seconds() if isinstance(ra, timedelta) else float(ra or 0)
-        self._pause_until = max(self._pause_until, self._clock() + sec)
-
-    async def _show(self, now: float) -> None:
-        """Отправить или перерисовать статус. Звать под self._lock."""
-        if now < max(self._pause_until, self._status_pause_until):
-            return
-        try:
-            if self._message_id is None:
-                m = await self._bot.send_message(
-                    chat_id=self._chat_id,
-                    text=self._fmt(now),
-                    message_thread_id=self._thread_id,
-                    disable_notification=True,
-                )
-                self._message_id = m.message_id
-            else:
-                await self._bot.edit_message_text(
-                    chat_id=self._chat_id,
-                    message_id=self._message_id,
-                    text=self._fmt(now),
-                )
-            self._last_edit = now
-        except Exception as e:
-            if isinstance(e, RetryAfter):
-                self._back_off(e)
-            elif (
-                self._message_id is not None
-                and isinstance(e, BadRequest)
-                and any(s in str(e).lower() for s in self._EDIT_GONE)
-            ):
-                # Статус удалили руками: править нечего, следующий показ
-                # пришлёт новый. Тревоги и весточку это не задерживает.
-                self._message_id = None
-                log.info("run status message gone, will send a new one: %s", e)
-                return
-            # Сбой тоже тратит окно троттлинга статуса: иначе следующее
-            # событие повторило бы запрос сразу.
-            self._status_pause_until = max(self._status_pause_until, now + self._THROTTLE_SEC)
-            log.debug("run status update failed (ignored)", exc_info=True)
-
-    # Куда тревога тишины, если тема рана заглушена (мастерская): (чат, тема).
-    alarm_target: tuple[int, int | None] | None = None
-
-    async def _send_loud(
-        self, text: str, left: int, markup: InlineKeyboardMarkup | None = None,
-        alarm: bool = False,
-    ) -> tuple[int | None, int]:
-        """Отдельное сообщение со звуком: статус беззвучный и разбудить не может.
-        Возвращает id (None, если не доставлено: тик повторит позже) и остаток
-        попыток эпизода из left. Явный отказ Telegram (429, BadRequest) тратит
-        одну попытку. Таймаут и сбой сети неопределённы: Telegram мог доставить,
-        поэтому после них не больше одного повтора, иначе дубли со звуком."""
-        if self._clock() < self._pause_until:
-            return None, left
-        chat_id, thread_id = (self.alarm_target if alarm and self.alarm_target else (self._chat_id, self._thread_id))
-        if alarm and self.alarm_target:
-            text = _("🛠 Мастерская: ") + text
-        try:
-            m = await self._bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                message_thread_id=thread_id,
-                disable_notification=False,
-                reply_markup=markup,
-            )
-            return m.message_id, left
-        except Exception as e:
-            if isinstance(e, RetryAfter):
-                self._back_off(e)
-            unsure = not isinstance(e, TelegramError) or (
-                isinstance(e, NetworkError) and not isinstance(e, BadRequest)
-            )
-            left = min(left - 1, 1) if unsure else left - 1
-            log.warning(
-                "run watch message failed (%s, tries left %d)",
-                "maybe delivered" if unsure else "not delivered", left, exc_info=True,
-            )
-            return None, left
-
-    async def _tick_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self._TICK_SEC)
-            try:
-                await self._tick()
-            except Exception:
-                log.debug("run status tick failed (ignored)", exc_info=True)
-
-    async def _tick(self) -> None:
-        async with self._lock:
-            if self._closed:
-                return
-            now = self._clock()
-            if self._waiting is not None and self._waiting():
-                self._quiet_since = now
-                self._last_event = now
-            if self._desc and (self._message_id is None or now - self._last_edit >= self._THROTTLE_SEC):
-                await self._show(now)
-            # Пока шёл запрос, finish() мог закрыть ран: тогда ни звука.
-            if self._closed:
-                return
-            last = self._desc or _("ещё не было")
-            if (
-                self._silence_alert_sec > 0
-                and not self._alerted
-                and now - self._quiet_since >= self._silence_alert_sec
-            ):
-                quiet = self._quiet_since
-                mins = int(now - self._last_event) // 60
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(_("Ждать"), callback_data=f"runwatch:wait:{self.run_id}"),
-                    InlineKeyboardButton(_("Прервать"), callback_data=f"runwatch:stop:{self.run_id}"),
-                ]])
-                mid, left = await self._send_loud(
-                    _("⏳ {mins} {unit} тишины: "
-                      "последнее действие {last}. Похоже, завис или долгая команда.").format(
-                        mins=mins, unit=plural(mins, ('минута', 'минуты', 'минут'), ('minute', 'minutes')), last=last),
-                    self._alert_left,
-                    markup,
-                    alarm=True,
-                )
-                if mid is not None:
-                    self._alert_ids.append(mid)
-                # Эпизод закрывает доставленная тревога или кончившиеся
-                # попытки. Событие, пришедшее во время отправки, уже начало
-                # новый эпизод со своими попытками.
-                if self._quiet_since == quiet:
-                    self._alert_left = left
-                    if mid is not None or left <= 0:
-                        self._alerted = True
-                if self._closed:
-                    return
-            if (
-                self._progress_note_sec > 0
-                and not self._progress_sent
-                and now - self._started >= self._progress_note_sec
-            ):
-                mins = int(now - self._started) // 60
-                mid, self._progress_left = await self._send_loud(
-                    _("Работаю {mins} {unit}, "
-                      "шагов {steps}, сейчас: {last}").format(
-                        mins=mins, unit=plural(mins, ('минуту', 'минуты', 'минут'), ('minute', 'minutes')),
-                        steps=self._steps, last=last),
-                    self._progress_left,
-                )
-                if mid is not None or self._progress_left <= 0:
-                    self._progress_sent = True
-
-    def snooze(self, alert_id: int | None) -> None:
-        """«Ждать»: следующая тревога не раньше ещё одного полного срока тишины."""
-        self._quiet_since = self._clock()
-        self._alerted = False
-        self._alert_left = self._LOUD_TRIES
-        self.forget_alert(alert_id)
-
-    def forget_alert(self, alert_id: int | None) -> None:
-        """На тревогу ответили: по завершении рана её не удалять."""
-        if alert_id in self._alert_ids:
-            self._alert_ids.remove(alert_id)
-
-    async def finish(self) -> None:
-        self._closed = True
-        if self._registry is not None:
-            self._registry.pop(self.run_id, None)
-        # Под замком: дождаться отправки, начатой тиком, иначе созданное ею
-        # сообщение осталось бы в чате навсегда.
-        async with self._lock:
-            mid, self._message_id = self._message_id, None
-            alerts, self._alert_ids = self._alert_ids, []
-        if self._ticker is not None:
-            self._ticker.cancel()
-            await asyncio.gather(self._ticker, return_exceptions=True)
-            self._ticker = None
-        # Тревогу без ответа убираем вместе со статусом: ответ рана уже идёт
-        # следом, кнопки при нём только сбивали бы с толку.
-        # После 429 ждём retry_after, но не дольше _FINISH_BUDGET_SEC на всё:
-        # ответ рана ждёт finish().
-        deadline = self._clock() + self._FINISH_BUDGET_SEC
-        alarm_chat = self.alarm_target[0] if self.alarm_target else self._chat_id
-        for m, chat in ([(mid, self._chat_id)] if mid is not None else []) + [(a, alarm_chat) for a in alerts]:
-            done = False
-            for _unused in range(self._DELETE_TRIES):
-                wait = self._pause_until - self._clock()
-                if wait > 0:
-                    if self._clock() + wait > deadline:
-                        break
-                    await asyncio.sleep(wait)
-                try:
-                    # Тревога мастерской лежит в личке (alarm_target), статус в теме.
-                    await self._bot.delete_message(chat_id=chat, message_id=m)
-                    done = True
-                except RetryAfter as e:
-                    self._back_off(e)
-                except Exception:
-                    # Не 429 (уже удалено, нет прав): повтор не поможет.
-                    done = True
-                    log.debug("run status delete failed (ignored)", exc_info=True)
-                if done:
-                    break
-            if not done:
-                log.warning("run status message %s left in chat: delete kept hitting 429", m)
-
-
-def _run_waits_approval(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
-    """Ран темы ждёт решения по карточке approve. Публичного «есть ли карточка
-    у сессии» у ApprovalRegistry нет, поэтому реестр читается напрямую."""
-    sid = ctx.application.bot_data.get("active_sessions", {}).get(chat_key)
-    registry = ctx.application.bot_data.get("registry")
-    items = getattr(registry, "_items", None) or {}
-    return bool(sid) and any(getattr(p, "session_id", None) == sid for p in items.values())
-
-
-async def on_run_watch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопки тревоги тишины рана (_RunStatus): «Ждать» и «Прервать»."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
-        return
-    parts = (query.data or "").split(":")
-    action, run_id = (parts[1], parts[2]) if len(parts) == 3 else ("", "")
-    status: _RunStatus | None = ctx.application.bot_data.get("run_watch", {}).get(run_id)
-    card = query.message
-    if status is None:
-        await _answer_quietly(query, _("Ран уже закончился"))
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            log.debug("run watch markup clear failed (ignored)", exc_info=True)
-        return
-    alert_id = getattr(card, "message_id", None)
-    if action == "wait":
-        status.snooze(alert_id)
-        await _answer_quietly(query, _("Жду дальше"))
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            log.debug("run watch markup clear failed (ignored)", exc_info=True)
-        return
-    if action != "stop":
-        await _answer_quietly(query, _("Неизвестная кнопка"))
-        return
-    status.forget_alert(alert_id)
-    procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
-    proc = procs.get(status.chat_key)
-    if proc is None or proc.returncode is not None:
-        note = _("процесса уже нет")
-    else:
-        note = await _cancel_running(ctx, status.chat_key, proc)
-    await _answer_quietly(query, _("Прерываю"))
-    try:
-        await query.edit_message_text(f"{getattr(card, 'text', '') or ''}\n\n🛑 {note}".lstrip())
-    except Exception:
-        log.debug("run watch card edit failed (ignored)", exc_info=True)
-
-
-async def _typing_loop(bot: Any, chat_id: int) -> None:
-    """Держит индикатор «печатает…» живым: Telegram гасит его через ~5 с,
-    а claude работает минуты. Сбой индикатора не должен ломать основной путь."""
-    while True:
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.debug("chat action failed (ignored)", exc_info=True)
-        await asyncio.sleep(5.0)
-
-
-@contextlib.asynccontextmanager
-async def _typing_indicator(bot: Any, chat_id: int):
-    task = asyncio.create_task(_typing_loop(bot, chat_id))
-    try:
-        yield
-    finally:
-        task.cancel()
-
-
 def _autocompact_for(cfg: Config, chat_key: str) -> str:
     """Окно автосжатия для темы: CLAUDE_AUTOCOMPACT там, где его включили
     (CLAUDE_AUTOCOMPACT_CHATS, пусто = везде). getattr: тесты собирают cfg
@@ -5710,6 +2138,220 @@ def _autocompact_for(cfg: Config, chat_key: str) -> str:
     chats = getattr(cfg, "autocompact_chats", frozenset())
     return value if value and (not chats or chat_key in chats) else ""
 
+
+# Сообщение Ивана во время ожидания перезапуска (аудит очереди 8, ранов 5,
+# удобства 9): кладётся отложенным запросом в at_jobs, одна запись на тему,
+# куски по времени прихода. Запись переживает рестарт и уходит после него;
+# новое сообщение темы до её срабатывания везёт её первой, порядок не ломается.
+_DRAIN_JOINER = "\n\n---\n\n"
+# Весть об аварии при сбое сети на старте: повторы, дальше до следующего старта.
+_INFLIGHT_RETRY_SEC = 60.0
+_INFLIGHT_TRIES = 5
+
+
+def _plain_ask(kwargs: dict) -> bool:
+    """Обычное сообщение Ивана: без кнопок, задач, событий и своих сверок."""
+    return set(kwargs) <= {"send_voice_reply"}
+
+
+def _drained_find(store: SessionStore, chat_key: str, skip: Any = ()) -> tuple[str, dict] | None:
+    for jid, entry in store.data.items():
+        try:
+            payload = json.loads(entry["v"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if payload.get("drained") and payload.get("chat_key") == chat_key and jid not in skip:
+            return jid, payload
+    return None
+
+
+def _drain_defer(ctx: ContextTypes.DEFAULT_TYPE, update: Update, prompt: str, *,
+                 voice: bool, arrived: float, rids: Collection[str | None] = (),
+                 replaces: Collection[str] = ()) -> str:
+    """Отложить сообщение до рестарта. Возвращает строку ответа Ивану.
+    rids: записи inflight сообщения, ждавшего замка. Два файла разом не
+    пишутся: отложенное называет их, и авария между записями не даёт вести
+    «повтори» при том, что сообщение уйдёт само (_inflight_recover).
+    replaces: записи, чей текст уже внутри prompt: снимаются той же записью файла."""
+    store: SessionStore = ctx.application.bot_data["at_jobs"]
+    chat_key, chat_id, thread_id = _chat_key(update)
+    # Задание, уже ждущее тему, держит свой снимок текста: дописка в его запись
+    # пропала бы. Новое сообщение идёт своей записью следом.
+    found = _drained_find(store, chat_key, ctx.application.bot_data.get("at_running") or ())
+    if found is None:
+        jid = uuid.uuid4().hex[:6]
+        payload = {"chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
+                   "fire_at": arrived, "drained": True, "voice": False, "pieces": []}
+    else:
+        jid, payload = found
+    pieces = sorted([*payload.get("pieces", []), [arrived, prompt]], key=lambda x: x[0])
+    own_rids = [r for r in rids if r is not None]
+    payload.update(pieces=pieces, prompt=_DRAIN_JOINER.join(t for _ts, t in pieces),
+                   voice=bool(payload.get("voice")) or voice,
+                   rids=[*payload.get("rids", []), *own_rids])
+    for old in replaces:
+        store.data.pop(old, None)
+    store.set(jid, json.dumps(payload, ensure_ascii=False))
+    state_dir = _inflight_dir(ctx.application)
+    for rid in own_rids:
+        inflight.remove(state_dir, rid)
+    log.info("drain: deferred chat=%s jid=%s pieces=%d", chat_key, jid, len(pieces))
+    if found is None:
+        return _("♻️ бот ждёт конца работы для перезапуска: "
+                 "сообщение уйдёт в Claude сразу после него (отмена: /cancel)")
+    return _("♻️ и это уйдёт после перезапуска, всего {count} сообщ.").format(count=len(pieces))
+
+
+def _drained_unschedule(app: Any, jid: str) -> None:
+    jq = getattr(app, "job_queue", None)
+    if jq is not None:
+        for j in jq.get_jobs_by_name(f"at:{jid}"):
+            j.schedule_removal()
+
+
+def _drained_claim(app: Any, chat_key: str) -> tuple[str, dict] | None:
+    """Новое сообщение везёт отложенное перед собой. Запись остаётся на диске
+    до старта рана (отказ и авария до него текста не теряют) и держится в
+    at_running: это снимок, в него не дописывают, и задание по нему не идёт.
+    Задание, уже ждущее тему, не забирается: сообщение и так встанет за ним."""
+    store: SessionStore | None = app.bot_data.get("at_jobs")
+    running: set[str] = app.bot_data.setdefault("at_running", set())
+    found = _drained_find(store, chat_key, running) if store is not None else None
+    if found is not None:
+        running.add(found[0])
+        _drained_unschedule(app, found[0])
+    return found
+
+
+def _drained_release(app: Any, jid: str, payload: dict) -> None:
+    """Обработка кончилась. Запись на месте, значит ран не стартовал: она
+    уходит сама; при остановке и ожидании перезапуска после рестарта."""
+    app.bot_data["at_running"].discard(jid)
+    store: SessionStore = app.bot_data["at_jobs"]
+    if jid in store.data and not app.bot_data.get("stopping") and not app.bot_data.get("draining"):
+        _schedule_at_job(app, jid, payload)
+
+
+def _drained_started(app: Any, update: Update, jids: Collection[str], rids: list[str | None] | None) -> None:
+    """Старт рана снимает увезённые записи: начатое после аварии не повторяется
+    (как у /at). Весть об аварии назовёт его своей записью inflight, она
+    заводится до снятия: авария между ними даст весть и повтор, а не потерю."""
+    store: SessionStore = app.bot_data["at_jobs"]
+    state_dir = _inflight_dir(app)
+    _ck, chat_id, thread_id = _chat_key(update)
+    for jid in jids:
+        entry = store.data.get(jid)
+        if entry is None:
+            continue
+        if state_dir is not None and rids is not None and not app.bot_data.get("stopping"):
+            rids.append(inflight.add(state_dir, chat_id=chat_id, thread_id=thread_id, message_id=None,
+                                     prompt=json.loads(entry["v"]).get("prompt") or "", kind="at"))
+        store.remove(jid)
+
+
+def _drained_cancel(app: Any, chat_key: str) -> int:
+    """/cancel выбрасывает отложенное темы, и ждущее тему, и увезённое."""
+    store: SessionStore | None = app.bot_data.get("at_jobs")
+    count = 0
+    while store is not None and (found := _drained_find(store, chat_key)) is not None:
+        jid, payload = found
+        store.remove(jid)
+        _drained_unschedule(app, jid)
+        count += len(payload.get("pieces") or [None])
+    return count
+
+
+def _inflight_dir(app: Any) -> Path | None:
+    return getattr(app.bot_data.get("cfg"), "state_dir", None)
+
+
+def _inflight_open(app: Any, update: Update, prompt: str, kwargs: dict) -> list[str | None]:
+    """Запись в state/inflight.json на время обработки (inflight.py). Начатое
+    /at пишется с момента старта процесса: до того его запись в at_jobs сама
+    переживает рестарт. Пробуждения, задачи и чужой текст не пишутся: у них
+    своя весть после рестарта. Возвращает список id записей, его снимает
+    конец обработки; запись /at дописывает туда обёртка on_run_start."""
+    rids: list[str | None] = []
+    state_dir = _inflight_dir(app)
+    if state_dir is None or app.bot_data.get("stopping"):
+        return rids
+    _ck, chat_id, thread_id = _chat_key(update)
+    if _plain_ask(kwargs) or (kwargs.get("from_callback") and kwargs.get("ask_ref") is not None):
+        rids.append(inflight.add(state_dir, chat_id=chat_id, thread_id=thread_id,
+                                 message_id=getattr(update.message, "message_id", None), prompt=prompt,
+                                 kind="ask" if _plain_ask(kwargs) else "button"))
+        return rids
+    start = kwargs.get("on_run_start")
+    if kwargs.get("deferred") and start is not None and kwargs.get("event_ref") is None:
+        def started() -> None:
+            # Запись до снятия задания: авария между ними даст весть, а не потерю.
+            if not app.bot_data.get("stopping"):
+                rids.append(inflight.add(state_dir, chat_id=chat_id, thread_id=thread_id,
+                                         message_id=None, prompt=prompt, kind="at"))
+            start()
+
+        kwargs["on_run_start"] = started
+    return rids
+
+
+async def _inflight_announce(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """После старта: каждой работе, оборванной аварией, одно сообщение ответом
+    на исходное (inflight.py). Запись снимается доставкой: сбой сети оставляет
+    её до повтора здесь или до следующего старта, авария повторит весть, а не
+    потеряет. Отказ самого Telegram (чата или темы нет) не лечится повтором."""
+    app = ctx.application
+    lost: dict[str, dict] = app.bot_data.get("inflight_lost") or {}
+    state_dir = app.bot_data["cfg"].state_dir
+    for rid, rec in list(lost.items()):
+        mid = rec.get("message_id")
+        trail = format_run_notes(inflight.footer_trail(state_dir / AUDIT_LOG_NAME, rec.get("sid"), rec.get("ts")))
+        try:
+            await app.bot.send_message(
+                chat_id=rec["chat_id"], message_thread_id=rec.get("thread_id"),
+                text="\n".join([_("⚠️ бот упал посреди работы и поднялся сам: ответ не дошёл "
+                                  "(«{head}»). Повтори, если ещё нужно.").format(head=rec.get("head") or "…"),
+                                *trail]),
+                reply_parameters=ReplyParameters(message_id=mid, allow_sending_without_reply=True)
+                if mid else None,
+            )
+        except (BadRequest, Forbidden, KeyError):
+            log.warning("inflight: notice %s refused, dropped", rid, exc_info=True)
+        except Exception:
+            log.warning("inflight: notice %s not delivered", rid, exc_info=True)
+            continue
+        lost.pop(rid, None)
+        inflight.remove(state_dir, rid)
+    tries = app.bot_data.get("inflight_tries", 0) + 1
+    app.bot_data["inflight_tries"] = tries
+    jq = getattr(app, "job_queue", None)
+    if lost and tries < _INFLIGHT_TRIES and jq is not None and not app.bot_data.get("stopping"):
+        jq.run_once(_inflight_announce, when=_INFLIGHT_RETRY_SEC, name="inflight-announce")
+
+
+def _inflight_recover(app: Any) -> None:
+    """При старте, до приёма обновлений: найти записи прошлого процесса."""
+    state_dir = app.bot_data["cfg"].state_dir
+    lost = inflight.load(state_dir)
+    # Сообщение, успевшее лечь в отложенное, уйдёт само: «повтори» ему не нужно.
+    store: SessionStore | None = app.bot_data.get("at_jobs")
+    for entry in (store.data.values() if store is not None and lost else ()):
+        with contextlib.suppress(ValueError, KeyError, TypeError, AttributeError):
+            for rid in json.loads(entry["v"]).get("rids") or ():
+                if lost.pop(rid, None) is not None:
+                    inflight.remove(state_dir, rid)
+    if lost:
+        log.warning("inflight: %d request(s) cut by a crash", len(lost))
+    app.bot_data["inflight_lost"] = lost
+
+
+def _inflight_stopped(app: Any) -> None:
+    """Конец штатной остановки: всё, что успело, сказало о себе само. Остаётся
+    только весть о прошлой аварии, не доставленная до остановки. Без
+    _inflight_recover (сбой старта) файл не трогается: он чужой."""
+    state_dir = _inflight_dir(app)
+    lost = app.bot_data.get("inflight_lost")
+    if state_dir is not None and lost is not None:
+        inflight.clear(state_dir, keep=lost)
 
 
 async def _dispatch_to_claude(
@@ -5729,10 +2371,19 @@ async def _dispatch_to_claude(
     # admitted: работа принята до начала ожидания (событие /event ответило 200),
     # её доводят до конца, а не отклоняют (ревью Codex 13.10.2026).
     admitted = bool(kwargs.pop("admitted", False))
+    own_text = prompt_text
+    claim: tuple[str, dict] | None = None
     keys = app.bot_data.get("draining_keys") or ()
     draining_here = bool(keys) and _chat_key(update)[0] in keys
     if (app.bot_data.get("draining") or draining_here) and not admitted and not app.bot_data.get("stopping"):
         msg = update.message
+        if _plain_ask(kwargs) and app.bot_data.get("at_jobs") is not None:
+            _pending_text_taken(ctx, _chat_key(update)[0], prompt_text)
+            text = _drain_defer(ctx, update, prompt_text, voice=bool(kwargs.get("send_voice_reply")),
+                                arrived=time.time())
+            with contextlib.suppress(Exception):
+                await msg.reply_text(text)
+            return True
         try:
             # Явный флаг, а не наличие on_run_start: выполнение задачи тоже
             # его передаёт, а после рестарта само не уходит (проект шага 3, 1.5).
@@ -5745,13 +2396,70 @@ async def _dispatch_to_claude(
         except Exception:
             log.debug("draining notice failed (ignored)", exc_info=True)
         return True
+    if _plain_ask(kwargs) and app.bot_data.get("at_jobs") is not None and not app.bot_data.get("stopping"):
+        # Отложенное во время перезапуска уходит раньше нового (порядок темы).
+        claim = _drained_claim(app, _chat_key(update)[0])
+        if claim is not None:
+            prompt_text = claim[1]["prompt"] + _DRAIN_JOINER + prompt_text
+            if claim[1].get("voice"):
+                kwargs["send_voice_reply"] = True
     app.bot_data["active_work"] = app.bot_data.get("active_work", 0) + 1
+    # Текст самого сообщения: увезённое после аварии уйдёт из своей записи.
+    rids = _inflight_open(app, update, own_text, kwargs)
     think_marks: list[tuple[str, int]] = []
     warm_after: list[str] = []
+    pack_out: list[TurnPack] = []
+    # Служебные строки хода для футера (ux2, 01.11.2026): что не ушло футером
+    # (ответа нет, ран остановлен, сбой), уходит одним тихим сообщением ниже.
+    turn_notes: list[str] = []
+    failed = False
+    preview_token = _NO_PREVIEW_RUN.set(True) if kwargs.get("untrusted") else None
     try:
         return await _dispatch_to_claude_impl(update, ctx, prompt_text, admitted=admitted,
-                                              think_marks=think_marks, warm_after=warm_after, **kwargs)
+                                              think_marks=think_marks, warm_after=warm_after,
+                                              pack_out=pack_out, turn_notes=turn_notes, rids=rids,
+                                              carried=claim[0] if claim is not None else None, **kwargs)
+    except BaseException:
+        failed = True
+        raise
     finally:
+        for rid in rids:
+            inflight.remove(app.bot_data["cfg"].state_dir, rid)  # rids есть только при state_dir
+        if claim is not None:
+            _drained_release(app, *claim)
+        if preview_token is not None:
+            _NO_PREVIEW_RUN.reset(preview_token)
+        if turn_notes and update.message is not None:
+            with contextlib.suppress(Exception):
+                await update.message.reply_text("\n".join(turn_notes), disable_notification=True)
+        for pack in pack_out:
+            chat_key = _chat_key(update)[0]
+            # Везущий запрос кончился: присоединённые к пачке выходят.
+            for key in ("turn_packs", "turn_packs_taken"):
+                held = app.bot_data.get(key) or {}
+                if held.get(chat_key) is pack:
+                    held.pop(chat_key, None)
+            try:
+                if not pack.started and not pack.cancelled:
+                    # Ход не начался: ранние отказы под замком ответили везущему,
+                    # снятый нажатием проект называется каждому ответу кнопкой, а
+                    # присоединённым говорится, что они не ушли: иначе они
+                    # пропали бы молча (ревью Codex 29.10, /code-review 31.10).
+                    for ref in pack.picks:
+                        with contextlib.suppress(Exception):
+                            await _dropped_plan_note(update.message, ref)
+                    if failed:
+                        log.warning("turn pack failed before run chat=%s items=%d", chat_key, len(pack.items))
+                    if failed or not pack.deferred:
+                        note = (_("⚠️ сбой бота, сообщение не ушло в Claude: повтори") if failed
+                                else _("⚠️ сообщение не ушло в Claude, причина в ответе на первое: повтори"))
+                        for item in pack.items[1:]:
+                            if not any(item is r for r in pack.refused):
+                                with contextlib.suppress(Exception):
+                                    await item.msg.reply_text(note)
+            finally:
+                # И при отмене задачи: иначе присоединённые ждали бы вечно.
+                pack.done.set()
         for warm_key in warm_after:
             # После рана по чужому тексту этого вызова, замок темы уже отпущен:
             # пинг не упрётся в него (ревью Codex 26.10.2026).
@@ -5790,7 +2498,7 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
         total += len(s)
         n_voice += 1
     last_voice = max(i for i in range(n_voice) if spoken[i].strip())
-    markup = None
+    markup = token = None
     if len(chunks) > 1 or fences:
         try:
             token = save_full_text(cfg.state_dir, reply, chat_id)
@@ -5803,6 +2511,7 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
     jobs = [asyncio.create_task(synthesize(openai_client, cfg, s)) if s.strip() else None
             for s in spoken[:n_voice]]
     sent = 0
+    unconfirmed: list[str] = []
     try:
         for i in range(n_voice):
             caption = with_counter(chunks[i], i + 1, n_voice)
@@ -5812,7 +2521,8 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
                 sent = i + 1
                 continue
             with contextlib.suppress(Exception):
-                await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+                await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE,
+                                               read_timeout=5)
             try:
                 audio = await jobs[i]
             except Exception:
@@ -5825,13 +2535,19 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
             try:
                 await send_voice_caption(msg, audio, caption,
                                          reply_markup=markup if i == last_voice else None)
-            except Exception:
-                # Сбой отправки голоса (таймаут загрузки, запрет голосовых) не
-                # теряет ответ: недоставленное уходит текстом (ревью 12.10.2026).
-                log.exception("voice reply send failed")
-                if not sent:
-                    return False
-                break
+            except Exception as e:
+                if is_unconfirmed(e):
+                    # Голосовое обычно приходит позже: текст стал бы дублем,
+                    # весь ответ остаётся под кнопкой в записке после серии.
+                    log.warning("voice reply unconfirmed part=%d/%d", i + 1, n_voice)
+                    unconfirmed.append(f"{i + 1}/{n_voice}")
+                else:
+                    # Сбой отправки голоса (таймаут загрузки, запрет голосовых) не
+                    # теряет ответ: недоставленное уходит текстом (ревью 12.10.2026).
+                    log.exception("voice reply send failed")
+                    if not sent:
+                        return False
+                    break
             sent = i + 1
     finally:
         live = [job for job in jobs if job is not None]
@@ -5840,6 +2556,22 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
         # Забрать исход каждой задачи: иначе asyncio пишет «Task exception was
         # never retrieved» (ревью Codex 21.10.2026).
         await asyncio.gather(*live, return_exceptions=True)
+    if unconfirmed:
+        # До остатка: его сбой не должен отнять кнопку у неподтверждённого голоса.
+        note = (_("⚠️ Telegram не подтвердил голосовое {parts}: могло прийти позже или потеряться. "
+                  "Весь ответ по кнопке.").format(parts=", ".join(unconfirmed)) if n_voice > 1 else
+                _("⚠️ Telegram не подтвердил голосовое: могло прийти позже или потеряться. "
+                  "Весь ответ по кнопке."))
+        try:
+            token = token or save_full_text(cfg.state_dir, reply, chat_id)
+            await msg.reply_text(note, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                _("📄 Полный текст"), callback_data=f"vtext:{token}")]]))
+        except Exception as e:
+            if not is_unconfirmed(e):
+                # Нет ни записки, ни кнопки: ответ важнее дубля.
+                log.exception("unconfirmed voice note failed")
+                await send_reply_text(cfg, update, reply)
+                return True
     rest = "\n\n".join(chunks[sent:] + fences)
     if rest:
         await send_reply_text(cfg, update, rest)
@@ -5867,6 +2599,10 @@ async def _dispatch_to_claude_impl(
     event_ref: dict | None = None,
     ask_ref: dict | None = None,
     deal: dict | None = None,
+    pack_out: list | None = None,
+    turn_notes: list[str] | None = None,
+    rids: list[str | None] | None = None,
+    carried: str | None = None,
 ) -> bool | None:
     """unattended=True — запуск без человека за клавиатурой (/at, /event, /plan-режим):
     ручной триггер «gpt:» игнорируется (Codex не проходит через approve-hook и
@@ -5906,7 +2642,12 @@ async def _dispatch_to_claude_impl(
     deal: ход дела (опыт В1, _deal_turn): id, sid дела или точка вопроса
     fork_at, ярлык head. Ран идёт в сессии дела (deal_sessions), как ран по
     чужому тексту в своей: сессию темы не трогает; без GPT и переноса в /at;
-    ответ текстом с ярлыком на каждом куске. Сюда же fork_failed."""
+    ответ текстом с ярлыком на каждом куске. Сюда же fork_failed.
+    pack_out: сюда пачка хода, которую везёт этот запрос (TurnPack);
+    _dispatch_to_claude отпускает её присоединённых в конце.
+    rids: записи state/inflight.json этого запроса (_drain_defer).
+    carried: запись отложенного, чей текст уже в начале prompt_text
+    (_drained_claim); снимается стартом рана."""
     cfg: Config = ctx.application.bot_data["cfg"]
     store: SessionStore = ctx.application.bot_data["sessions"]
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
@@ -5915,6 +2656,16 @@ async def _dispatch_to_claude_impl(
     openai_client = ctx.application.bot_data.get("openai")
     msg = update.message
     chat_key, chat_id, thread_id = _chat_key(update)
+    arrived_at = time.time()
+    stop_mark: RunStop | None = None  # отметка «снял Иван» этого рана
+    # Обычное сообщение Ивана (как _plain_ask у _dispatch_to_claude).
+    plain_here = (
+        not unattended and not untrusted and deal is None and exec_task is None
+        and on_run_start is None and reply_sink is None and reply_sent is None and not deferred
+        and fresh is False and expect_epoch is None and expect_plan is None and event_ref is None
+        and not limit_retry and still_wanted is None and ask_ref is None
+        and permission_mode == "bypassPermissions" and allow_codex_fallback
+    )
 
     # Мгновенный ack: реакция переживает долгий ран (typing гаснет через ~5 с),
     # видно «сообщение принято» даже если ран займёт минуты. Фоном, как и
@@ -5940,6 +2691,37 @@ async def _dispatch_to_claude_impl(
     )
 
     lock = _chat_lock(ctx, chat_key)
+    # В пачку хода идут только текст Ивана и ответ кнопкой в обычном режиме:
+    # у остальных свои сверки и права под замком (план, задача, дело, событие,
+    # чужой текст, «gpt:»), они ждут замка каждый сам.
+    joinable = (
+        not unattended and not untrusted and not forced_codex and deal is None
+        and exec_task is None and still_wanted is None and on_run_start is None
+        and reply_sink is None and reply_sent is None and not deferred and fresh is False
+        and expect_plan is None and event_ref is None and not limit_retry
+        and permission_mode == "bypassPermissions" and allow_codex_fallback
+        and (not from_callback or ask_ref is not None)
+    )
+    pack: TurnPack | None = None
+    carried_jids = [carried] if carried else []
+    at_store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
+    if joinable and pack_out is not None:
+        packs = _turn_packs(ctx)
+        item = PackItem(prompt_text, msg, voice=send_voice_reply, ask_ref=ask_ref,
+                        expect_epoch=expect_epoch if ask_ref is not None else None, admitted=admitted,
+                        carried=carried, rids=rids or [])
+        open_pack = packs.get(chat_key)
+        if open_pack is not None and not open_pack.taken:
+            # Тема занята, пачку уже везут: дописаться и ждать её хода. Без
+            # await между проверкой и записью: везущий не заберёт пачку посреди.
+            open_pack.items.append(item)
+            log.info("turn pack join chat=%s items=%d", chat_key, len(open_pack.items))
+            await open_pack.done.wait()
+            return None
+        if lock.locked():
+            pack = TurnPack(items=[item])
+            packs[chat_key] = pack
+            pack_out.append(pack)
     notice = None
     # Только на текст Ивана: кнопки и фоновые пробуждения ждут молча (проект
     # Домового 22.10.2026, 1.7: 14 сообщений бота на одно своё).
@@ -5953,11 +2735,63 @@ async def _dispatch_to_claude_impl(
     # Фоновый ран (/at, /event с wake) отличается от /plan: тот тоже идёт с
     # unattended, но его зовёт Иван и режим plan задан сразу (ревью Codex 16.10).
     background = unattended and permission_mode != "plan"
-    async with _typing_indicator(ctx.bot, chat_id), _counted_lock(ctx, cfg, chat_key, lock, prompt_text):
+    long_wait = (_wait_note(ctx, chat_key, msg, pack)
+                 if notice is not None and chat_key == str(getattr(cfg, "primary_chat_id", "")) else None)
+    async with _typing_indicator(ctx.bot, chat_id), _counted_lock(ctx, cfg, chat_key, lock, prompt_text, long_wait):
         if notice is not None:
             # Уже в очереди: дождаться уведомления, чтобы «встанет в очередь»
             # не пришло после ответа на этот же запрос; дождавшись, убрать.
             await _drop_busy_notice(await notice)
+        if pack is not None:
+            # Забрать пачку без await: опоздавшее сообщение откроет следующую.
+            # Взятая до старта процесса видна /cancel (ревью Codex 29.10).
+            pack.taken = True
+            packs = _turn_packs(ctx)
+            if packs.get(chat_key) is pack:
+                packs.pop(chat_key, None)
+            if pack.cancelled:
+                return None
+            ctx.application.bot_data.setdefault("turn_packs_taken", {})[chat_key] = pack
+            pack_epoch = _session_epoch(ctx, chat_key)
+            carried_jids = [i.carried for i in pack.items if i.carried]
+            taken = await _pack_prompt(ctx, cfg, chat_key, pack)
+            if taken is None or pack.cancelled:
+                return None
+            prompt_text, send_voice_reply, picks = taken
+            # С ответом кнопкой пачка идёт только в сессию, под которую он
+            # сочинён: поздняя сверка эпохи остаётся включённой (ревью Codex
+            # 29.10). Отказ тогда общий: в пачке и текст. Пометку о снятом
+            # проекте даёт _dispatch_to_claude по pack.picks.
+            expect_epoch = pack_epoch if picks else None
+            ask_ref = None
+            # Ответ кнопкой это данные: с ним пачка не уходит в /at и в GPT
+            # только на чтение, как сам ответ (проект шага 1, 2.1).
+            from_callback = from_callback or bool(picks)
+            admitted = admitted or any(i.admitted for i in pack.items)
+            # Метки всех ответов пачки, и отвергнутых: они ждут её конца
+            # (ревью 29.10.2026).
+            own_picks = {i.ask_ref["queued"] for i in pack.items
+                         if i.ask_ref is not None and i.ask_ref.get("queued")}
+        else:
+            own_picks = {ask_ref["queued"]} if ask_ref and ask_ref.get("queued") else set()
+        for piece_text in ([i.text for i in pack.items] if pack is not None else [prompt_text]):
+            _pending_text_taken(ctx, chat_key, piece_text)
+        if (ctx.application.bot_data.get("draining") and not admitted
+                and not ctx.application.bot_data.get("stopping") and plain_here
+                and not from_callback and ctx.application.bot_data.get("at_jobs") is not None):
+            # Ждало замка до начала ожидания перезапуска: в отложенные с
+            # временем прихода, перед написанным позже.
+            text = _drain_defer(ctx, update, prompt_text, voice=send_voice_reply, arrived=arrived_at,
+                                rids=[r for i in pack.items for r in i.rids] if pack is not None else rids or (),
+                                replaces=carried_jids)
+            if pack is not None:
+                pack.deferred = True
+                for item in pack.items[1:]:
+                    with contextlib.suppress(Exception):
+                        await item.msg.reply_text(text)
+            with contextlib.suppress(Exception):
+                await msg.reply_text(text)
+            return True
         if ctx.application.bot_data.get("stopping") or (
                 ctx.application.bot_data.get("draining") and not admitted):
             # Бот останавливается или ждёт перезапуска по заявке (restart.py):
@@ -5986,17 +2820,27 @@ async def _dispatch_to_claude_impl(
             await msg.reply_text(_ask_pick_refusal(ask_ref) if ask_ref is not None else
                                  _("⚠️ сессия темы сменилась, ответ в новую сессию не отправлен"))
             return
+        moved: list[bool] = []
+
+        def limit_moved() -> None:
+            # До ответа Ивану: авария в ожидании сети не запустит текст дважды.
+            moved.append(True)
+            for jid in carried_jids:
+                at_store.remove(jid)
+
         try:
             held = not forced_codex and await _limit_hold(
                 ctx, cfg, msg, chat_key, chat_id, thread_id, prompt_text,
                 unattended=unattended, untrusted=untrusted,
                 movable=_limit_movable(task, exec_task, from_callback, permission_mode) and deal is None,
-                limit_retry=limit_retry, event_ref=event_ref)
+                limit_retry=limit_retry, event_ref=event_ref, on_moved=limit_moved)
         except Exception:
             # Учёт лимита вспомогательный: его сбой не останавливает сообщение.
             log.exception("limit: reserve check failed chat=%s", chat_key)
             held = False
         if held:
+            if pack is not None:
+                pack.deferred = bool(moved)
             await _dropped_plan_note(msg, ask_ref)
             return
         if task is not None and task.get("status") not in tasks.OPEN_STATUSES:
@@ -6052,11 +2896,17 @@ async def _dispatch_to_claude_impl(
         claude_texts: tuple[str, ...] = ()
         plan_snapshot: dict | None = None
         task_cost = None
+        if any(jid not in at_store.data for jid in carried_jids):
+            # /cancel снял увезённое, пока ран шёл к старту, и уже ответил.
+            return None
         if forced_codex:
             codex_prompt = prompt_text.lstrip()[len(prefix):].lstrip()
             if not codex_prompt:
                 await msg.reply_text(_("После «{prefix}» нужен текст запроса для GPT.").format(prefix=prefix))
                 return
+            _drained_started(ctx.application, update, carried_jids, rids)
+            if on_run_start is not None:
+                on_run_start()  # отложенное `gpt:` после аварии не повторяется
             result: ClaudeResult = await _codex_as_claude_result(
                 cfg, codex_prompt, header="🧠 GPT (codex)",
                 agent_context=agent_context,
@@ -6112,12 +2962,15 @@ async def _dispatch_to_claude_impl(
                     _bump_session_epoch(ctx, chat_key)
                     log.info("idle-reset session chat=%s (idle %.0fs > ttl %ds)",
                              chat_key, time.time() - last, cfg.session_idle_ttl_sec)
-                    try:
-                        await msg.reply_text(
-                            _("🆕 новая сессия (в теме давно не было активности).")
+                    # Строкой футера, а не отдельным сообщением со звуком перед
+                    # ответом (ux.md 12); ход без ответа отдаст её в конце.
+                    note = (_("🆕 новая сессия (в теме давно не было активности).")
                             + _model_reverted_note(ctx, cfg, chat_key, ended_model))
-                    except Exception:
-                        log.exception("idle-reset note failed")
+                    if turn_notes is not None:
+                        turn_notes.append(note)
+                    else:
+                        with contextlib.suppress(Exception):
+                            await msg.reply_text(note)
             # resume_target сбросит сессию, если скоуп сменился мимо /scope и
             # переименования (занятый чат, рестарт): эпоха поднимается здесь,
             # чтобы кнопки старой сессии не ответили в новую (ревью 12.10.2026).
@@ -6147,7 +3000,13 @@ async def _dispatch_to_claude_impl(
             # субагенты разрешены. Фоновый ран в теме задачи остаётся строгим.
             task_think = task is not None and exec_task is None and permission_mode == "plan" and not unattended
 
+            run_sid: list[str] = []
+
             def _session_started(sid: str) -> None:
+                run_sid[:] = [sid]
+                if rids and side is None:
+                    # Весть об аварии найдёт следы рана в журнале по сессии.
+                    inflight.note_sid(cfg.state_dir, rids, sid)
                 # До запуска процесса: метка чужого текста переживает отмену,
                 # таймаут и аварийный рестарт посреди рана; скоуп сессии нужен
                 # /resume (ревью 12.10.2026).
@@ -6207,7 +3066,41 @@ async def _dispatch_to_claude_impl(
                 # сторожа или дела, и его sid в сессию темы не кладёт (проект
                 # шага 1, 2.5). Значение для /status: чей это ран.
                 foreign_running[chat_key] = f"deal:{deal['id']}" if deal_store is not None else True
+            if pack is not None:
+                if pack.cancelled:
+                    return None
+                base_start = on_run_start
+                run_pack = pack
+
+                def on_run_start() -> None:
+                    run_pack.started = True
+                    taken_packs = ctx.application.bot_data.get("turn_packs_taken") or {}
+                    if taken_packs.get(chat_key) is run_pack:
+                        taken_packs.pop(chat_key, None)
+                    if base_start is not None:
+                        base_start()
+                    proc = procs.get(chat_key)
+                    if run_pack.cancelled and proc is not None:
+                        # /cancel пришёл между проверкой выше и созданием процесса.
+                        _track_cancel_task(ctx.application, asyncio.create_task(
+                            _terminate_and_wait(chat_key, proc)))
+            if carried_jids:
+                carried_base = on_run_start
+
+                def on_run_start() -> None:
+                    _drained_started(ctx.application, update, carried_jids, rids)
+                    if carried_base is not None:
+                        carried_base()
             run_start_cb = on_run_start
+            # Ран без пачки до создания процесса (освежение входа в run_claude
+            # до 45 с): /cancel и «стоп» видят его здесь, а не отвечают «нет
+            # процесса», пропуская ран (аудит очереди 31.10.2026).
+            prestart = RunPrestart() if pack is None else None
+            prestarts: dict[str, RunPrestart] = ctx.application.bot_data.setdefault("run_prestart", {})
+            if prestart is not None:
+                prestarts[chat_key] = prestart
+            stop_mark = RunStop()
+            _run_stops(ctx)[chat_key] = stop_mark
             notes_taken: list[tuple[str, float, str]] = []
             if (side is None and not unattended and permission_mode != "plan" and task is None
                     and getattr(cfg, "state_dir", None) is not None and deals.deals_dir(cfg.state_dir).is_dir()):
@@ -6224,9 +3117,41 @@ async def _dispatch_to_claude_impl(
                     def run_start_cb() -> None:
                         if on_run_start is not None:
                             on_run_start()
+                        # Отменённый до старта ран итогов не увидит: они ждут следующего.
+                        if (prestart is not None and prestart.cancelled) or (pack is not None and pack.cancelled):
+                            return
                         with contextlib.suppress(OSError, ValueError):
                             with deals.locked(deals.deals_dir(cfg.state_dir)) as data:
                                 deals.drop_notes(data, notes_taken)
+            if prestart is not None:
+                prestart_base = run_start_cb
+
+                def run_start_cb() -> None:
+                    if prestarts.get(chat_key) is prestart:
+                        prestarts.pop(chat_key, None)
+                    if prestart_base is not None:
+                        prestart_base()
+                    proc = procs.get(chat_key)
+                    if prestart.cancelled and proc is not None:
+                        # Отмена пришла до процесса: гасится до промпта, как у пачки.
+                        _track_cancel_task(ctx.application, asyncio.create_task(
+                            _terminate_and_wait(chat_key, proc)))
+            if rids is not None and side is None:
+                note_base = run_start_cb
+
+                def run_start_cb() -> None:
+                    if note_base is not None:
+                        note_base()
+                    # Записи /at и увезённого заводятся стартом, уже после сессии.
+                    if rids and run_sid:
+                        inflight.note_sid(cfg.state_dir, rids, run_sid[0])
+            # Отметки «после факта» этого рана копятся для футера
+            # (approval.add_run_note). Мастерская заглушена: там прежние сообщения.
+            run_notes: dict[str, list] = ctx.application.bot_data.setdefault(RUN_NOTES, {})
+            notes_key = burst_target_key(chat_id, thread_id)
+            notes_bucket: list | None = None
+            if not _is_workshop(cfg, chat_key):
+                notes_bucket = run_notes[notes_key] = []
             try:
                 result = await run_claude(
                     cfg.claude_bin,
@@ -6282,6 +3207,16 @@ async def _dispatch_to_claude_impl(
                 await msg.reply_text(_("⚠️ внутренняя ошибка — смотри логи бота"))
                 return
             finally:
+                if notes_bucket is not None:
+                    if run_notes.get(notes_key) is notes_bucket:
+                        run_notes.pop(notes_key, None)
+                    if turn_notes is not None:
+                        turn_notes.extend(format_run_notes(notes_bucket))
+                if prestart is not None and prestarts.get(chat_key) is prestart:
+                    prestarts.pop(chat_key, None)
+                if stop_mark is not None and _run_stops(ctx).get(chat_key) is stop_mark:
+                    # Отметку читает конец этого рана ниже, уже без замка.
+                    _run_stops(ctx).pop(chat_key, None)
                 if side is not None:
                     # Первым делом: отмена на await ниже не оставит метку навсегда.
                     foreign_running.pop(chat_key, None)
@@ -6306,6 +3241,8 @@ async def _dispatch_to_claude_impl(
                 if untrusted:
                     # Чужой текст теперь в истории этой сессии.
                     _mark_untrusted_session(ctx, chat_key, run_store.get(chat_key))
+            _keep_failed_session(ctx, chat_key, result, store,
+                                 own=side is None and not untrusted, epoch=run_epoch)
             if deal is not None:
                 # Сессия дела в его запись ещё под замком темы: следующий ран
                 # этого чата deal_sessions уже перепишет (проект В1, 2.5).
@@ -6360,7 +3297,7 @@ async def _dispatch_to_claude_impl(
                 if result.session_id:
                     await _cleanup_abandoned_approvals(
                         ctx, result.session_id, "deny:claude-exited",
-                        _("🚫 approval заброшен (claude exited)"))
+                        _("🚫 карточка больше не действует: ран закончился"))
                 api_status = result.api_error_status
                 reason = _("нужен вход") if result.auth_error else f"HTTP {api_status}"
                 # Остановка могла прийти, пока гасились подтверждения: тогда
@@ -6403,12 +3340,21 @@ async def _dispatch_to_claude_impl(
     # бы до timeout=900s и клик писал бы misleading allow/deny в audit.
     if result.session_id:
         await _cleanup_abandoned_approvals(
-            ctx, result.session_id, "deny:claude-exited", _("🚫 approval заброшен (claude exited)")
+            ctx, result.session_id, "deny:claude-exited", _("🚫 карточка больше не действует: ран закончился")
         )
 
     if result.auth_error == "codex":
         await _offer_login(update, ctx, "codex")
     reply = result.text
+    # Ран снял сам Иван (/cancel, «стоп», «!»-поправка, /reset force): его
+    # подтверждение уже сказало «остановлено». Только в обычной теме: в теме
+    # задачи, деле и мастерской ответ рана несёт и итог (аудит удобства 31.10.2026).
+    # Пачку, снятую /cancel до старта процесса, тоже снял Иван.
+    user_stop = (stop_mark is not None and stop_mark.stopped) or (pack is not None and pack.cancelled)
+    quiet_stop = (_quiet_after_user_stop(result, user_stop)
+                  and task is None and deal is None and reply_sink is None and reply_sent is None
+                  and not _is_workshop(cfg, chat_key) and not result.texts
+                  and not ctx.application.bot_data.get("stopping"))
     if result.is_error and ctx.application.bot_data.get("stopping"):
         # Ран оборвала остановка бота (SIGTERM от stop() или systemd), а не
         # /cancel: «отменено (signal -15)» сбивало с толку (ревью 12.10.2026).
@@ -6423,7 +3369,12 @@ async def _dispatch_to_claude_impl(
                       "повторить: напиши здесь, что дальше, и «делай» под новым проектом")
     if result.session_lost and not untrusted and deal is None:
         # Ран по чужому тексту и так каждый раз свежий: сессию темы он не терял.
-        await msg.reply_text(_("⚠️ не удалось закрепить session_id — следующее сообщение начнёт новый разговор."))
+        # Строкой футера (ux.md 15): ответ этого хода идёт следом.
+        note = _("⚠️ не удалось закрепить session_id: следующее сообщение начнёт новый разговор.")
+        if turn_notes is not None:
+            turn_notes.append(note)
+        else:
+            await msg.reply_text(note)
 
     # Маркер проекта решения в теме задачи (tasks.extract_do): Иван его не
     # видит, кнопку «Делай» бот ставит сам. Из ответа GPT и с ошибкой маркер
@@ -6438,7 +3389,8 @@ async def _dispatch_to_claude_impl(
         earlier = list(texts)
         if not codex_fallback and earlier[-1] == result.text:
             earlier.pop()
-        earlier = [extract_loud_marker(extract_ask_marker(tasks.extract_do(t)[1])[1])[1] for t in earlier]
+        earlier = [extract_quiet_marker(extract_loud_marker(extract_ask_marker(tasks.extract_do(t)[1])[1])[1])[1]
+                   for t in earlier]
         reply = tasks.run_reply(earlier + [reply], reply)
     if think_rev is not None:
         do_skill, reply = tasks.extract_do(reply)
@@ -6458,6 +3410,7 @@ async def _dispatch_to_claude_impl(
     # ASK-маркер: вопрос с вариантами уедет кнопками после основного ответа.
     ask, reply = extract_ask_marker(reply)
     loud, reply = extract_loud_marker(reply)
+    quiet, reply = extract_quiet_marker(reply)
     # Тире на дефис здесь, а не хуком: строка «Исправлено» хука подменяла
     # ответ, ведь в чат уходит только последний текст рана (решение 22.10.2026).
     reply = soften_dashes(reply)
@@ -6465,6 +3418,15 @@ async def _dispatch_to_claude_impl(
         ask = (soften_dashes(ask[0]), [soften_dashes(o) for o in ask[1]])
     workshop = _is_workshop(cfg, chat_key)
     ws_question = ""
+    if quiet_stop:
+        log.info("reply of user-stopped run not sent chat=%s", chat_key)
+        return
+    if (quiet and not reply.strip() and not loud and not result.is_error and ask is None
+            and not files_to_send and (untrusted or _SILENT_RUN.get())):
+        # Только весь ответ целиком и только в ране без звука: метка рядом с
+        # текстом или в разговоре ответ не глотает.
+        log.info("quiet run: no message chat=%s", chat_key)
+        return
     if (workshop or untrusted) and ask is not None:
         # Тема мастерской заглушена, кнопки там никто не увидит: вопрос текстом
         # в ответ, ответ пересылается в личку (проект Домового 22.10.2026).
@@ -6534,8 +3496,10 @@ async def _dispatch_to_claude_impl(
     if task_cost is not None:
         # В теме задачи футер называет и расход задачи (проект шага 3, 1.6).
         model_note = " · ".join(n for n in (model_note, tasks.cost_note(task_cost[2])) if n)
-    await send_cost_footer(cfg, update, result, model_note,
-                           warn_reset=not _autocompact_for(cfg, chat_key))
+    if await send_cost_footer(cfg, update, result, model_note,
+                              warn_reset=not _autocompact_for(cfg, chat_key),
+                              notes=turn_notes or ()) and turn_notes:
+        turn_notes.clear()
     if task_cost is not None:
         await _task_cost_seen(ctx, *task_cost)
     if do_skill is not None and reply.strip():
@@ -6553,7 +3517,7 @@ async def _dispatch_to_claude_impl(
         await _send_ask_card(
             ctx, update, chat_key, ask,
             permission_mode=permission_mode, untrusted=untrusted, epoch=run_epoch,
-            own_queued=(ask_ref or {}).get("queued"),
+            own_queued=own_picks,
         )
     elif permission_mode == "plan" and not result.is_error and reply.strip() and not ask_held:
         if _task_for(cfg, chat_id, thread_id, ctx) is not None:
@@ -6567,177 +3531,6 @@ async def _dispatch_to_claude_impl(
             )
         else:
             await _send_plan_card(ctx, update, chat_key, plan_snapshot)
-
-
-# Прогрев кэша разговора (warm.py). Потолок пинга: обычно он идёт 5-15 с.
-WARM_RUNTIME_SEC = 180
-# Насколько раньше срока задание job_queue может сработать без отказа.
-WARM_EARLY_SEC = 30
-
-
-def _warm_prompt() -> str:
-    return _("Служебный ход бота для прогрева кэша, не сообщение человека. "
-             "Ответь одним словом «ок», не вызывая инструментов.")
-
-
-def _warm_signature(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str) -> tuple:
-    """Всё, что входит в начало запроса рана темы: модель, effort, окно
-    сжатия, персона и подсказка памяти. Другое значение у следующего рана
-    значит другой кэш, и пинг старого был бы впустую (ревью Codex 19.10:
-    /model default и /model pin меняют модель без ожидающего выбора)."""
-    persona = _persona_for(ctx, cfg, chat_key)
-    return (_model_for(ctx, cfg, chat_key), _effort_for(ctx, cfg, chat_key),
-            _autocompact_for(cfg, chat_key), hashlib.sha256(persona.encode()).hexdigest(),
-            _memory_scope_hint(ctx, cfg, chat_key))
-
-
-def _warm_after_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
-                    result: ClaudeResult, sig: tuple) -> None:
-    """Отметка прогрева после рана темы: сессия, начало последнего запроса
-    к модели, размер разговора и параметры рана; пинг через IDLE минут.
-    Ран без обращения к Claude (отказ до API, не та сессия) отметку не
-    двигает: кэш он не обновил (ревью Codex 19.10)."""
-    if chat_key not in getattr(cfg, "warm_chats", frozenset()):
-        return
-    store: SessionStore = ctx.application.bot_data["sessions"]
-    sid = store.get(chat_key)
-    if not result.last_request_at or not sid or result.session_id != sid:
-        return
-    marks: dict = ctx.application.bot_data.setdefault("warm", {})
-    if not result.context_tokens:
-        # Разговор сжат в последнем запросе, ожидаемый размер неизвестен.
-        marks.pop(chat_key, None)
-        return
-    marks[chat_key] = {"sid": sid, "at": result.last_request_at,
-                       "expected": result.context_tokens, "sig": sig}
-    _warm_schedule(ctx.application, chat_key)
-
-
-def _warm_forget(app: Application, chat_key: str) -> None:
-    if app.bot_data.get("warm", {}).pop(chat_key, None) is not None:
-        _warm_cancel(app, chat_key)
-
-
-def _warm_cancel(app: Application, chat_key: str) -> None:
-    jq = app.job_queue
-    if jq is not None:
-        for job in jq.get_jobs_by_name(f"warm:{chat_key}"):
-            job.schedule_removal()
-
-
-def _warm_schedule(app: Application, chat_key: str) -> None:
-    """Пинг через IDLE минут от начала последнего запроса. Поколение отметки
-    едет в задании: уже запущенное задание schedule_removal не снимает, и без
-    сверки оно пинговало бы по отметке нового рана сразу (ревью Codex 19.10)."""
-    jq = app.job_queue
-    if jq is None:
-        return
-    _warm_cancel(app, chat_key)
-    bd = app.bot_data
-    mark = bd["warm"][chat_key]
-    bd["warm_gen"] = gen = bd.get("warm_gen", 0) + 1
-    mark["gen"] = gen
-    cfg: Config = bd["cfg"]
-    delay = max(1.0, mark["at"] + cfg.warm_idle_min * 60 - time.time())
-    jq.run_once(_warm_tick, when=delay, name=f"warm:{chat_key}", data=(chat_key, gen))
-
-
-def _warm_skip_reason(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
-                      mark: dict | None, gen: int) -> str:
-    """Почему пинга сейчас не будет; пусто: можно. Цепочка на этом кончается,
-    следующую назначит настоящий ран."""
-    bd = ctx.application.bot_data
-    if mark is None:
-        return "no mark"
-    if mark.get("gen") != gen:
-        return "mark replaced"
-    if time.time() - mark["at"] < cfg.warm_idle_min * 60 - WARM_EARLY_SEC:
-        return "not idle yet"
-    if bd.get("stopping") or bd.get("draining"):
-        return "bot stopping or restart pending"
-    if limits.reserve() is not None:
-        # Остаток лимита Claude оставлен разговору с Домовым (limits.py); прогрев
-        # это фон и уступает даже в его теме (ревью Codex 20.10.2026).
-        return "subscription reserve"
-    if not warm.in_window(datetime.now(local_zone()), cfg.warm_hours):
-        return "outside window"
-    if time.time() - mark["at"] > warm.LATE_SEC:
-        # Таймер опоздал (сон машины): кэш, скорее всего, уже истёк, и пинг
-        # переписал бы весь разговор.
-        return "late"
-    store: SessionStore = bd["sessions"]
-    if store.get(chat_key) != mark["sid"]:
-        return "session changed"
-    if _warm_signature(ctx, cfg, chat_key) != mark["sig"]:
-        return "run settings changed"
-    if warm.near_compaction(mark["expected"], _autocompact_for(cfg, chat_key)):
-        return "near autocompact window"
-    return ""
-
-
-async def _warm_tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пинг прогрева: ход в ответвление сессии темы (run_claude,
-    warm_fork_sid) под замком темы, с замками рана по чужому тексту (у темы
-    может быть автоодобрение, а человека рядом нет). В чат ничего не идёт,
-    итог в журнале бота. Прочитал разговор: следующий пинг через IDLE минут."""
-    app = ctx.application
-    bd = app.bot_data
-    chat_key, gen = ctx.job.data
-    cfg: Config = bd["cfg"]
-    reason = _warm_skip_reason(ctx, cfg, chat_key, bd.get("warm", {}).get(chat_key), gen)
-    if reason:
-        log.info("warm skip chat=%s: %s", chat_key, reason)
-        return
-    lock = _chat_lock(ctx, chat_key)
-    if lock.locked():
-        # Идёт ран: он сам назначит пинг после себя.
-        log.info("warm skip chat=%s: run in progress", chat_key)
-        return
-    chat_id_s, _sep, thread_s = chat_key.partition(":")
-    # Учёт работы: перезапуск по заявке ждёт и пинг (ревью Codex 19.10).
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    try:
-        async with lock:
-            mark = bd.get("warm", {}).get(chat_key)
-            reason = _warm_skip_reason(ctx, cfg, chat_key, mark, gen)
-            if reason:
-                log.info("warm skip chat=%s: %s", chat_key, reason)
-                return
-            result = await run_claude(
-                cfg.claude_bin, chat_key, int(chat_id_s), int(thread_s) if thread_s else None,
-                _warm_prompt(), bd["sessions"],
-                cwd=cfg.claude_cwd,
-                hook_settings=cfg.hook_settings_path,
-                persona=_persona_for(ctx, cfg, chat_key),
-                memory_scope_hint=_memory_scope_hint(ctx, cfg, chat_key),
-                effort=_effort_for(ctx, cfg, chat_key),
-                model=_model_for(ctx, cfg, chat_key),
-                autocompact=_autocompact_for(cfg, chat_key),
-                max_runtime_sec=WARM_RUNTIME_SEC,
-                # Реестр процессов: остановка бота и поправка «!» гасят пинг.
-                # Реестр сессий нет: поправка восстановила бы в тему id
-                # ответвления, которого нет на диске.
-                process_registry=bd["procs"],
-                session_targets=bd["session_targets"],
-                cost_totals=bd.get("cost_totals"),
-                unattended_sids=bd.setdefault("unattended_sids", set()),
-                untrusted_sids=bd.setdefault("untrusted_sids", set()),
-                should_stop=lambda: bool(bd.get("stopping") or bd.get("draining")),
-                warm_fork_sid=warm.fork_sid(chat_key),
-            )
-            ok = (not result.is_error and result.requests == 1 and not result.compacted
-                  and warm.healthy(result.first_cache_read, result.first_cache_write, mark["expected"]))
-            if not ok:
-                log.warning("warm chain stopped chat=%s: error=%s requests=%d compacted=%d "
-                            "read=%d write=%d expected=%d text=%r",
-                            chat_key, result.is_error, result.requests, result.compacted,
-                            result.first_cache_read, result.first_cache_write, mark["expected"],
-                            result.text[:200])
-                return
-            mark["at"] = result.last_request_at
-            _warm_schedule(app, chat_key)
-    finally:
-        bd["active_work"] -= 1
 
 
 # Триггеры, при которых бот озвучивает ответ на ТЕКСТОВЫЙ запрос. Сценарий:
@@ -6774,6 +3567,124 @@ def _forward_note(msg: Any) -> str:
     return _("[Переслано от: {who}]\n").format(who=who)
 
 
+# Срочные слова: целым сообщением, без пересылки и цитаты. Слово внутри
+# фразы («стоп, сначала проверь X») идёт обычным текстом.
+_URGENT_STOP = frozenset({"стоп", "stop", "хватит", "остановись"})
+_URGENT_NOSEND = frozenset({"ничего не отправляй", "не отправляй", "не отправляй ничего"})
+
+
+def _real_reply(msg: Any) -> Any:
+    """Сообщение, на которое Иван ответил свайпом. Служебное сообщение
+    создания темы ответом не считается: в теме форума Telegram может ставить
+    его в reply_to_message любому сообщению (аудит очереди 31.10.2026)."""
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is None or getattr(reply, "forum_topic_created", None) is not None:
+        return None
+    thread = getattr(msg, "message_thread_id", None)
+    if thread is not None and getattr(reply, "message_id", None) == thread:
+        return None
+    return reply
+
+
+def _urgent_word(msg: Any, text: str | None = None) -> str | None:
+    """text: расшифровка голосового; без него слово берётся из msg.text."""
+    if _forward_note(msg) or _real_reply(msg) is not None:
+        return None
+    if text is None:
+        text = msg.text or ""
+    # Только хвостовые знаки: «!стоп» это поправка со словом, а не стоп (ревью Codex 29.10).
+    word = " ".join(text.lower().replace("ё", "е").split()).rstrip(" .!")
+    if word in _URGENT_STOP:
+        return "stop"
+    if word in _URGENT_NOSEND:
+        return "nosend"
+    return None
+
+
+def _something_to_stop(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
+    """Срочное слово действует, только когда есть что остановить: иначе
+    «не отправляй» это ответ на вопрос Claude и идёт ему (ревью 29.10.2026)."""
+    proc = ctx.application.bot_data["procs"].get(chat_key)
+    at_jobs = ctx.application.bot_data.get("at_jobs")
+    return bool((proc is not None and proc.returncode is None) or _chat_lock(ctx, chat_key).locked()
+                or _gather_pending(ctx, chat_key) or _turn_packs(ctx).get(chat_key)
+                or (at_jobs is not None and _drained_find(at_jobs, chat_key) is not None))
+
+
+def _text_in_context(cfg: Config, msg: Any, text: str) -> str:
+    """Текст сообщения с цитатой свайпа и пометкой темы новостей."""
+    # Свайп-ответ: цитируемый кусок — это referent («вот это поправь»). Без
+    # него после idle-TTL/reset Claude вообще не знает, о чём речь.
+    quoted = msg.reply_to_message
+    if quoted is not None and (quoted.text or quoted.caption):
+        src = (quoted.text or quoted.caption or "")[:1000]
+        # Цитата в ограждении: имя заказчика в ней (ответ бота, план) иначе
+        # закрепило бы его память за новой сессией при нейтральных словах
+        # Ивана (ревью Codex 14.10).
+        text = _("[Пользователь отвечает на сообщение ниже]\n{quote}\n\n{text}").format(quote=tasks.fence(src), text=text)
+    return _news_context(cfg, msg, text)
+
+
+# Текст последних сообщений: по нему правка находит свой кусок в склейке и
+# пачке, где куски уже склеены и своё сообщение помнит только первый.
+_PENDING_TEXTS_MAX = 64
+
+
+def _pending_text_remember(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, msg: Any, text: str) -> None:
+    seen: dict[tuple[str, int], str] = ctx.application.bot_data.setdefault("pending_texts", {})
+    seen[(chat_key, msg.message_id)] = text
+    while len(seen) > _PENDING_TEXTS_MAX:
+        seen.pop(next(iter(seen)))
+
+
+def _pending_text_taken(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, text: str) -> None:
+    """Ход взял текст: правка его кусков больше не подменяет. Иначе правка
+    ушедшего «да» нашла бы такое же «да», ещё ждущее в пачке."""
+    seen: dict[tuple[str, int], str] = ctx.application.bot_data.get("pending_texts") or {}
+    for piece in text.split(_DRAIN_JOINER):
+        key = next((k for k, v in seen.items() if k[0] == chat_key and v == piece), None)
+        if key is not None:
+            seen.pop(key)
+
+
+def _swap_piece(text: str, old: str, new: str) -> str | None:
+    """Текст, где кусок old заменён на new; None: такого куска нет. Целым
+    куском, а не подстрокой: «да» иначе нашлось бы внутри соседнего."""
+    pieces = text.split(_DRAIN_JOINER)
+    if text == old:
+        return new
+    if old not in pieces:
+        return None
+    pieces[pieces.index(old)] = new
+    return _DRAIN_JOINER.join(pieces)
+
+
+def _pending_text_swap(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, message_id: int, new: str) -> bool:
+    """Заменить текст сообщения, ещё не взятого в ход. False: уже ушло,
+    снято или это не обычный текст (compose, отложенное)."""
+    bd = ctx.application.bot_data
+    seen: dict[tuple[str, int], str] = bd.get("pending_texts") or {}
+    old = seen.get((chat_key, message_id))
+    if old is None:
+        return False
+    for batch in (bd.get("gather_batches", {}).get(chat_key), *bd.get("gather_waiting", {}).get(chat_key, ())):
+        if batch is None or batch.cancelled:
+            continue
+        for i, m in enumerate([batch.update.message, *batch.messages]):
+            if m.message_id == message_id and i < len(batch.items) and batch.items[i]:
+                batch.items[i] = new
+                seen[(chat_key, message_id)] = new
+                return True
+    pack = _turn_packs(ctx).get(chat_key)
+    for item in (pack.items if pack is not None and not pack.taken else ()):
+        swapped = _swap_piece(item.text, old, new)
+        if swapped is not None:
+            item.text = swapped
+            seen[(chat_key, message_id)] = new
+            return True
+    return False
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     user = update.effective_user
@@ -6788,6 +3699,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if await _handoff_reply(ctx, msg):
         # Буквы капчи для ждущего агента: в Claude не идут.
+        return
+    urgent = _urgent_word(msg)
+    if urgent is not None and _something_to_stop(ctx, _chat_key(update)[0]):
+        # «стоп» и «ничего не отправляй» действуют сразу, как /cancel, а не
+        # встают в пачку хода (решение Ивана 29.10.2026).
+        # «Ничего не отправляй» одним сообщением с подтверждением остановки.
+        await on_cancel(update, ctx, nosend=urgent == "nosend")
         return
     if _is_task_ask_reply(ctx, msg):
         # Ответ на подсказку пустой /task: слова новой задачи, а не ход
@@ -6826,6 +3744,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lock = _chat_lock(ctx, chat_key)
         procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
         proc = procs.get(chat_key)
+        into_pack = _turn_packs(ctx).get(chat_key)
+        if into_pack is not None and not into_pack.taken:
+            # Пачку уже везут: поправка дописывается в неё до прерывания, иначе
+            # везущий взял бы замок раньше и ушёл без неё (ревью Codex 29.10).
+            into_pack.items.append(PackItem(_news_context(cfg, msg, text), msg, voice=voice_trigger))
+        else:
+            into_pack = None
         if lock.locked() and proc is not None and proc.returncode is None:
             # Сохраняем sid убиваемого рана: run_claude в signal-ветке store.set
             # не делает, и поправка стартовала бы ЧИСТУЮ сессию без контекста
@@ -6839,6 +3764,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             # конец рана (проект шага 1, 2.5).
             foreign_kill = bool(ctx.application.bot_data.get("foreign_running", {}).get(chat_key))
             queued = _queued_count(ctx, chat_key)
+            _mark_user_stop(ctx, chat_key)
             note = _("⏹ прерываю текущий ран, поправка уйдёт следом…")
             if queued:
                 note += _("\n⚠️ перед ней в очереди ещё {count} сообщ. — /cancel их не трогает").format(count=queued)
@@ -6856,20 +3782,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 store_.set(chat_key, sid)
         # Буферизация поправки бессмысленна — она срочная, шлём сразу.
         log.info("interrupt correction user=%s chat=%s len=%d", user.id, chat.id, len(text))
+        if into_pack is not None:
+            await into_pack.done.wait()
+            return
         text = _news_context(cfg, msg, text)
         await _dispatch_to_claude(update, ctx, text, send_voice_reply=voice_trigger)
         return
 
-    # Свайп-ответ: цитируемый кусок — это referent («вот это поправь»). Без
-    # него после idle-TTL/reset Claude вообще не знает, о чём речь.
-    quoted = msg.reply_to_message
-    if quoted is not None and (quoted.text or quoted.caption):
-        src = (quoted.text or quoted.caption or "")[:1000]
-        # Цитата в ограждении: имя заказчика в ней (ответ бота, план) иначе
-        # закрепило бы его память за новой сессией при нейтральных словах
-        # Ивана (ревью Codex 14.10).
-        text = _("[Пользователь отвечает на сообщение ниже]\n{quote}\n\n{text}").format(quote=tasks.fence(src), text=text)
-    text = _news_context(cfg, msg, text)
+    text = _text_in_context(cfg, msg, text)
 
     # Compose-буфер: копим вместо отправки.
     n = _compose_add(ctx, chat_key, text, voice=voice_trigger)
@@ -6881,217 +3801,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "claude request user=%s chat=%s len=%d voice_trigger=%s",
         user.id, chat.id, len(text), voice_trigger,
     )
+    _pending_text_remember(ctx, chat_key, msg, text)
     gslot = _gather_reserve(update, ctx, chat_key)
     if gslot is not None and _gather_fill(gslot, text, voice=voice_trigger):
         return
     await _dispatch_to_claude(update, ctx, text, send_voice_reply=voice_trigger)
 
 
-# --- вложения больше 20 МБ (bigfile.py) ---------------------------------------
-
-@dataclass
-class DownloadJob:
-    """Идущая большая загрузка: /cancel, /compose cancel и остановка бота
-    отменяют её задачу, общий MTProto-клиент при этом остаётся."""
-    chat_key: str
-    generation: int | None  # поколение compose-буфера, если кусок в нём
-    task: asyncio.Future | None = None
-    cancelled: bool = False
-
-
-def _downloads_cancel(app: Any, chat_key: str | None = None, *, generation: int | None = None) -> int:
-    """Отменить большие загрузки темы (или все). Сколько отменено."""
-    jobs: dict[int, DownloadJob] = app.bot_data.get("downloads") or {}
-    n = 0
-    for job in list(jobs.values()):
-        if chat_key is not None and job.chat_key != chat_key:
-            continue
-        if generation is not None and job.generation != generation:
-            continue
-        if job.cancelled:
-            continue
-        job.cancelled = True
-        if job.task is not None:
-            job.task.cancel()
-        n += 1
-    return n
-
-
-_PROGRESS_EVERY_SEC = 5.0
-
-
-async def _quiet_edit(status: Any, text: str) -> None:
-    """Сбой сообщения о ходе загрузки (удалено, RetryAfter) загрузку не роняет."""
-    if status is None:
-        return
-    try:
-        await status.edit_text(text)
-    except Exception:
-        log.debug("download status edit failed (ignored)", exc_info=True)
-
-
-async def _progress_ticker(status: Any, progress: bigfile.Progress, label: str) -> None:
-    last = ""
-    while True:
-        await asyncio.sleep(_PROGRESS_EVERY_SEC)
-        if not progress.total:
-            continue
-        text = _("⏳ качаю «{name}», {size}: {pct}%").format(
-            name=label, size=bigfile.mb(progress.total), pct=progress.percent)
-        if text != last:
-            await _quiet_edit(status, text)
-            last = text
-
-
-def _mtproto(app: Any, cfg: Config) -> bigfile.BotMTProto:
-    client: bigfile.BotMTProto | None = app.bot_data.get("mtproto")
-    if client is None:
-        client = bigfile.BotMTProto(
-            session_path=cfg.state_dir / "telethon-bot.session",
-            api_id=cfg.telegram_api_id, api_hash=cfg.telegram_api_hash,
-            bot_token=cfg.telegram_bot_token, timeout_sec=cfg.big_download_timeout_sec,
-        )
-        app.bot_data["mtproto"] = client
-    return client
-
-
-# Повтор скачивания через Bot API при сетевом сбое. Скачивание только читает,
-# дубля не бывает, поэтому повторяем и тайм-аут. BadRequest (в том числе
-# «File is too big») наследует NetworkError, но повтором не лечится.
-# Случай 23.10.2026: getFile голосового упал по TimedOut, голосовое потеряно.
-_DOWNLOAD_RETRY_DELAYS = (2.0, 5.0)
-
-
-async def _download_retrying(file_obj: Any, target: Path) -> None:
-    delays = iter(_DOWNLOAD_RETRY_DELAYS)
-    while True:
-        try:
-            tg_file = await file_obj.get_file()
-            await tg_file.download_to_drive(custom_path=str(target))
-            return
-        except NetworkError as e:
-            delay = None if isinstance(e, BadRequest) else next(delays, None)
-            if delay is None:
-                raise
-            log.warning("download failed (%s), retry in %.0fs", e, delay)
-            await asyncio.sleep(delay)
-
-
-async def _fetch_attachment(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_obj: Any, size: int | None,
-    target: Path, label: str, chat_key: str, gslot: GatherSlot | None,
-    slot: Reservation | None, hold: bool,
-) -> str | None:
-    """Скачать вложение в target. До 20 МБ через Bot API (getFile), больше
-    через MTProto под токеном бота. Неизвестный размер идёт через Bot API,
-    отказ «File is too big» переводит на MTProto.
-
-    "small"/"big" при успехе, None при сбое (Ивану уже сказано словами).
-    "big" с hold=True: вызывающий держит единицу active_work (перезапуск ждёт
-    файл до Claude) и обязан её вернуть или передать пачке склейки.
-    """
-    msg = update.message
-    if not bigfile.needs_mtproto(size):
-        try:
-            await _download_retrying(file_obj, target)
-            return "small"
-        except Exception as e:
-            if not bigfile.too_big_for_bot_api(e):
-                log.exception("attachment download failed chat_key=%s", chat_key)
-                await msg.reply_text(_("⚠️ не удалось скачать вложение"))
-                return None
-            log.info("bot api refused file as too big chat_key=%s, using mtproto", chat_key)
-    return await _fetch_big(update, ctx, size=size, target=target, label=label,
-                            chat_key=chat_key, gslot=gslot, slot=slot, hold=hold)
-
-
-async def _fetch_big(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, size: int | None, target: Path,
-    label: str, chat_key: str, gslot: GatherSlot | None, slot: Reservation | None,
-    hold: bool,
-) -> str | None:
+async def on_edited_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сообщение ещё ждёт склейки или пачки хода: правка подменяет его текст.
+    Иначе до Claude она не доходит, он получает исходный: одной строкой без
+    звука, а не молча (аудит очереди, находка 7)."""
     cfg: Config = ctx.application.bot_data["cfg"]
-    app = ctx.application
-    bd = app.bot_data
-    msg = update.message
-    size_text = bigfile.mb(size) if size else _("размер неизвестен")
-    if bd.get("draining") or bd.get("stopping"):
-        await msg.reply_text(_("♻️ бот готовится к перезапуску: большой файл не скачиваю, "
-                               "пришли его после рестарта"))
-        return None
-    if not cfg.telegram_api_id or not cfg.telegram_api_hash:
-        await msg.reply_text(_(
-            "⚠️ файл «{name}» ({size}) больше 20 МБ, а скачивание больших файлов не настроено: "
-            "нет TELEGRAM_API_ID и TELEGRAM_API_HASH в .env бота"
-        ).format(name=label, size=size_text))
-        return None
-    client = _mtproto(app, cfg)
-    # Загрузка это работа для перезапуска: проверка draining выше и счёт без
-    # await между ними.
-    bd["active_work"] = bd.get("active_work", 0) + 1
-    keep = False
-    batch = gslot[0] if gslot is not None else None
-    buf = _compose_current(ctx, chat_key, slot) if slot is not None else None
-    for holder in (batch, buf):
-        if holder is not None:
-            holder.slow += 1
-    job = DownloadJob(chat_key=chat_key, generation=slot[0] if slot is not None else None)
-    jobs: dict[int, DownloadJob] = bd.setdefault("downloads", {})
-    jobs[id(job)] = job
-    progress = bigfile.Progress()
-    status = None
-    ticker: asyncio.Task | None = None
-    try:
-        try:
-            status = await msg.reply_text(
-                _("⏳ «{name}», {size}: жду, пока докачается другой файл").format(name=label, size=size_text)
-                if client.busy else
-                _("⏳ качаю «{name}», {size}").format(name=label, size=size_text)
-            )
-        except Exception:
-            log.debug("download status send failed (ignored)", exc_info=True)
-        ticker = asyncio.ensure_future(_progress_ticker(status, progress, label))
-        dl = asyncio.ensure_future(client.download(
-            msg.chat_id, msg.message_id, target, max_bytes=cfg.document_max_size_bytes,
-            min_free=cfg.download_min_free_bytes, progress=progress))
-        job.task = dl
-        if job.cancelled:  # /cancel пришёл, пока отправлялось сообщение «качаю»
-            dl.cancel()
-        try:
-            got = await dl
-        except asyncio.CancelledError:
-            if not job.cancelled:
-                raise
-            log.info("big download cancelled chat_key=%s", chat_key)
-            await _quiet_edit(status, _("🗑 загрузка «{name}» отменена").format(name=label))
-            return None
-        except bigfile.FetchError as e:
-            log.warning("big download failed chat_key=%s: %s", chat_key, e)
-            text = str(e)
-        except Exception as e:
-            log.exception("big download failed chat_key=%s", chat_key)
-            text = _("⚠️ не удалось скачать «{name}»: {err}").format(name=label, err=type(e).__name__)
-        else:
-            elapsed = time.monotonic() - progress.started
-            log.info("big download done chat_key=%s size=%d sec=%.1f", chat_key, got, elapsed)
-            await _quiet_edit(status, _("✅ скачал «{name}», {size} за {sec} с").format(
-                name=label, size=bigfile.mb(got), sec=int(elapsed)))
-            keep = hold
-            return "big"
-        if status is not None:
-            await _quiet_edit(status, text)
-        else:
-            await msg.reply_text(text)
-        return None
-    finally:
-        if ticker is not None:
-            ticker.cancel()
-        jobs.pop(id(job), None)
-        for holder in (batch, buf):
-            if holder is not None:
-                holder.slow -= 1
-        if not keep:
-            bd["active_work"] -= 1
+    msg = update.edited_message
+    if msg is None or (msg.text or "").startswith("/") or not _is_allowed(cfg, update):
+        return
+    chat_key = _chat_key(update)[0]
+    text = _text_in_context(cfg, msg, _forward_note(msg) + (msg.text or ""))
+    # Сверка и подмена без await: флаш не заберёт кусок посреди.
+    swapped = _pending_text_swap(ctx, chat_key, msg.message_id, text)
+    with contextlib.suppress(Exception):
+        await msg.reply_text(_("✏️ правка учтена: Claude получит новый текст") if swapped else
+                             _("✏️ правка до Claude не дошла: напиши поправку новым сообщением"),
+                             disable_notification=True)
+
+
+# --- вложения больше 20 МБ (bigfile.py) ---------------------------------------
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7430,7 +4165,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
         else:
             try:
-                await _download_retrying(msg.voice, tmp)
+                await _download_retrying(msg.voice, tmp, _slot_holders(ctx, chat_key, gslot, slot))
             except Exception:
                 log.exception("voice download failed user=%s", user.id if user else None)
                 _compose_release(ctx, chat_key, slot)
@@ -7458,6 +4193,20 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     log.info("voice transcribed user=%s chat=%s len=%d", user.id, msg.chat_id, len(heard))
+    urgent = _urgent_word(msg, heard)
+    if urgent is not None:
+        # Голосовое «стоп» за рулём действует как текстовое (аудит очереди,
+        # находка 6): место голосового в склейке освобождается до проверки,
+        # иначе своё же пустое место было бы «есть что отменить».
+        _compose_release(ctx, chat_key, slot)
+        _gather_release(gslot)
+        if _something_to_stop(ctx, chat_key):
+            # Эхо расшифровки не нужно: подтверждение остановки его заменяет.
+            await on_cancel(update, ctx, nosend=urgent == "nosend")
+            return
+        # Остановить нечего: слово идёт Claude обычным путём, место заново.
+        slot = None if ask or deal_id else _compose_reserve(ctx, chat_key)
+        gslot = None if ask or deal_id else _gather_reserve(update, ctx, chat_key)
     # Эхо расшифровки без звука (звенеть должен ответ) и кусками по лимиту и без права уронить запрос: длинная
     # расшифровка (больше 4096) или сбой отправки теряли голосовое целиком
     # (ревью 12.10.2026).
@@ -7531,9 +4280,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Отправка от имени Ивана: решение только с её собственной карточки и без
     # окна ⏩ (кнопок окна на ней нет, подставленный callback окно не
     # откроет). Ревью Codex 12.10.2026.
+    # Карточка плана так же: её ✅ выдаёт права на весь запуск (ревью Codex 29.10).
     pending_now = registry.get(approval_id)
     if pending_now is not None and (_is_outbound_send(pending_now.tool_name)
-                                    or MAILSEND_CARD_KEY in pending_now.tool_input):
+                                    or MAILSEND_CARD_KEY in pending_now.tool_input
+                                    or PLAN_CARD_KEY in pending_now.tool_input):
         msg = query.message
         expected_chat = (pending_now.target_chat_id if pending_now.target_chat_id is not None
                          else cfg.primary_chat_id)
@@ -7550,7 +4301,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
-                _("⚠️ approval {aid} уже закрыт (таймаут или дубль)").format(aid=approval_id)
+                _("⚠️ карточка уже закрыта: истёк срок, ран закончился или её уже нажали")
             )
         except Exception:
             pass
@@ -7570,13 +4321,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target_key = getattr(resolved, "origin_key", "") or burst_target_key(chat_id, thread_id)
         burst_activated_until = burst_set(ctx, target_key, burst_duration, chat_id, thread_id)
     if burst_activated_until is not None:
-        emoji, label = "⏩", _("allow + auto-approve до {until}").format(until=format_burst_local(burst_activated_until))
+        line = _("⏩ одобрено, окно без карточек до {until}").format(
+            until=format_burst_local(burst_activated_until))
+    elif decision_for_hook == "allow":
+        line = _("✅ одобрено")
     else:
-        emoji = "✅" if decision_for_hook == "allow" else "❌"
-        label = f"{decision_for_hook} · aid={approval_id}"
+        line = _("❌ отклонено")
+    log.info("approve decision aid=%s %s", approval_id, decision)
+    # Решение дописывается в саму карточку (аудит удобства 31.10.2026): новое
+    # сообщение «✅ allow · aid=…» со звуком приходило на каждое нажатие.
+    # Не вышло (карточка у предела длины, сбой правки): прежним сообщением.
+    card_html = getattr(query.message, "text_html", None) or ""
+    if card_html and len(card_html) + len(line) + 2 <= TELEGRAM_MESSAGE_LIMIT:
+        try:
+            await query.edit_message_text(f"{card_html}\n\n{line}", parse_mode="HTML")
+            return
+        except Exception:
+            log.warning("approval card edit failed aid=%s, reply instead", approval_id, exc_info=True)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"{emoji} {label}")
+        await query.message.reply_text(line, disable_notification=True)
     except Exception:
         log.exception("failed to finalise approval message")
 
@@ -7603,8 +4367,9 @@ def _is_card_of(msg, pending, expected_chat: int) -> bool:
     """Сообщение и есть карточка pending: тот же чат и тема, а в клавиатуре
     самого сообщения его кнопка. callback_data Telegram не сверяет с кнопками
     сообщения, а клавиатуру сообщения подставить нельзя (ревью Codex 29.10).
-    Карточке отправки от имени Ивана номер не подбирается никогда."""
-    if _is_outbound_send(pending.tool_name) or MAILSEND_CARD_KEY in pending.tool_input:
+    Карточке отправки от имени Ивана и плана номер не подбирается никогда."""
+    if (_is_outbound_send(pending.tool_name) or MAILSEND_CARD_KEY in pending.tool_input
+            or PLAN_CARD_KEY in pending.tool_input):
         return False
     # Тема как в _chat_key: у General message_thread_id бывает, но это не тема.
     thread = getattr(msg, "message_thread_id", None) if getattr(msg, "is_topic_message", False) else None
@@ -7721,734 +4486,6 @@ async def _attachment_cleanup_loop(cfg: Config) -> None:
             log.exception("cleanup error (continuing)")
 
 
-def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
-    """Wake-фабрика для POST /event {"wake": true} и для пробуждений после рестарта."""
-    cfg: Config = app.bot_data["cfg"]
-
-    async def _event_wake(
-        chat_id: int, thread_id: int | None, prompt: str, fresh: bool = False,
-        untrusted: bool = False, silent: bool = False, event_id: str | None = None,
-        deal_asks: bool = False,
-    ) -> None:
-        if untrusted:
-            # Текст события в ограждении: ран идёт свежей своей сессией, и её
-            # первое сообщение иначе закрепило бы память за заказчиком из
-            # чужого письма (ограждённое роутер Свода не считает).
-            prompt = _(UNTRUSTED_PROMPT_NOTE) + tasks.fence(prompt)
-        store = events.event_dir(cfg.state_dir)
-        seen = {"started": False, "expired": False}
-
-        def run_started() -> None:
-            # До подачи промпта: после рестарта такое событие не повторяется.
-            # Пометка не записалась: файл остаётся принятым и держит ключ от
-            # повтора отправителя; повтор после аварии посреди этого рана
-            # возможен, это сбой диска, в журнал (ревью Codex 22.10.2026).
-            seen["started"] = True
-            if not _event_mark(store, event_id, status="started", started_at=time.time()):
-                log.error("event %s: started mark failed, a crash now would repeat the run", event_id)
-
-        def still_live() -> bool:
-            # Срок проверяется и под замком темы: событие могло ждать чужой ран.
-            rec = events.load(store, event_id)
-            seen["expired"] = rec is not None and events.expired(rec)
-            return not seen["expired"]
-
-        # handle_event запускает пробуждение отдельной задачей, флаг живёт в её
-        # копии контекста; reset нужен, только если позвать без своей задачи.
-        token = _SILENT_RUN.set(silent)
-        deal_token = _DEAL_ASKS.set(deal_asks and not untrusted)
-        outcome = None
-        try:
-            update = _synthetic_update(app.bot, chat_id, thread_id)
-            ctx = ContextTypes.DEFAULT_TYPE(application=app)
-            # Событие уже принято (200): ожидание перезапуска его не отклоняет.
-            refused = await _dispatch_to_claude(
-                update, ctx, prompt, send_voice_reply=False, unattended=True, fresh=fresh,
-                untrusted=untrusted, admitted=True,
-                on_run_start=run_started if event_id else None,
-                still_wanted=still_live if event_id else None, deferred=event_id is not None,
-                event_ref=_event_ref(store, event_id, silent, deal_asks),
-            )
-            # Отказ остановкой до старта: файл остаётся принятым, после
-            # рестарта пробуждение уйдёт само. Иначе событие отработано, в
-            # том числе пропуском по лимиту или переносом в /at (один владелец).
-            # Остановка бота до старта процесса тоже ждёт рестарта: run_claude
-            # тогда отвечает «отменено», а не отказом (ревью 22.10.2026).
-            stopped = not seen["started"] and bool(app.bot_data.get("stopping"))
-            if not (refused is True and not seen["started"]) and not stopped:
-                outcome = ("ran" if seen["started"] else "expired" if seen["expired"] else "not started")
-        except Exception:
-            log.exception("event wake failed chat=%s", chat_id)
-            outcome = "error"
-        finally:
-            _DEAL_ASKS.reset(deal_token)
-            _SILENT_RUN.reset(token)
-        if event_id and outcome:
-            if outcome == "expired":
-                log.warning("event %s expired while waiting, not started", event_id)
-                await _event_expired_note(app, events.load(store, event_id))
-            _event_mark(store, event_id, status="done", outcome=outcome, done_at=time.time())
-        key = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
-        if outcome in ("not started", "expired", "error") and _is_workshop(cfg, key):
-            # Тема мастерской заглушена: что наряд не запустился (лимит, срок,
-            # сбой), Иван узнаёт в личке (проект Домового 22.10.2026).
-            with contextlib.suppress(Exception):
-                await app.bot.send_message(cfg.primary_chat_id, _(
-                    "🛠 Мастерская: «{what}» не запустилось ({why}), подробности в теме мастерской").format(
-                        what=(events.load(store, event_id) or {}).get("title") or "?",
-                        why={"not started": _("лимит или отказ, перенос назван в теме"),
-                             "expired": _("срок вышел"), "error": _("сбой")}[outcome]))
-
-    return _event_wake
-
-
-def _event_mark(store: Path, event_id: str | None, **fields: Any) -> bool:
-    if not event_id:
-        return True
-    try:
-        return events.update(store, event_id, **fields) is not None
-    except (OSError, ValueError):
-        log.exception("event store update failed id=%s", event_id)
-        return False
-
-
-def _event_ref(store: Path, event_id: str | None, silent: bool, deal_asks: bool = False) -> dict | None:
-    """Что событие передаёт отложенному запуску при лимите: сам id (после
-    рестарта событие с заданием /at не будится второй раз), срок и тишину
-    (ревью Codex 22.10.2026)."""
-    if not event_id:
-        return None
-    rec = events.load(store, event_id)
-    # deal_asks только истиной: задание /at без поля шлёт обычные карточки.
-    return {"event_id": event_id, "expires_at": rec.get("expires_at") if rec else None, "silent": silent,
-            "deal_asks": True if deal_asks else None}
-
-
-def _event_show_target(app: Application, rec: dict) -> tuple[int, int | None, str]:
-    """Куда сказать о событии: в его чат, а для мастерской в личку с 🛠."""
-    cfg: Config = app.bot_data["cfg"]
-    key = f"{rec['chat_id']}:{rec['thread_id']}" if rec.get("thread_id") is not None else str(rec["chat_id"])
-    if _is_workshop(cfg, key):
-        return cfg.primary_chat_id, None, _("🛠 Мастерская: ")
-    return rec["chat_id"], rec.get("thread_id"), ""
-
-
-async def _event_expired_note(app: Application, rec: dict | None) -> None:
-    """Строка в чат: пробуждение устарело, не дождавшись очереди или рестарта."""
-    if not rec:
-        return
-    with contextlib.suppress(Exception):
-        chat_id, thread_id, head = _event_show_target(app, rec)
-        await app.bot.send_message(
-            chat_id, head + _("⌛ Пробуждение «{source}: {title}» устарело, пока ждало очереди или "
-                              "перезапуска, и не запускалось.").format(
-                source=rec.get("source"), title=rec.get("title")),
-            message_thread_id=thread_id, disable_notification=True)
-
-
-async def _events_resume(app: Application) -> None:
-    """После рестарта: непринятые к старту пробуждения будятся с пометкой,
-    сколько ждали; прерванные посреди рана не повторяются, а называются в
-    чате; просроченные выбрасываются со строкой в чат; перенесённые лимитом
-    в /at остаются заданию (ревью Codex 22.10.2026). Каждая запись отдельно:
-    испорченная не мешает остальным."""
-    cfg: Config = app.bot_data["cfg"]
-    store = events.event_dir(cfg.state_dir)
-    try:
-        wake, interrupted, stale = await asyncio.to_thread(events.startup, store, None,
-                                                           app.bot_data.get("boot_id"))
-    except Exception:
-        log.exception("event store scan failed")
-        return
-    deferred: set[str] = set()
-    at_store: SessionStore | None = app.bot_data.get("at_jobs")
-    for entry in list((at_store.data if at_store is not None else {}).values()):
-        with contextlib.suppress(Exception):
-            deferred.add(str(json.loads(entry["v"]).get("event_id") or ""))
-    now = time.time()
-    wake_fn = app.bot_data.get("event_wake")
-    tasks_set: set[asyncio.Task] = app.bot_data.setdefault("event_wake_tasks", set())
-    for kind, rec in [("stale", r) for r in stale] + [("cut", r) for r in interrupted] + [("wake", r) for r in wake]:
-        try:
-            eid = rec["id"]
-            if rec["id"] in deferred:
-                _event_mark(store, eid, status="done", outcome="deferred", done_at=now)
-            elif kind == "stale":
-                log.warning("event %s (%s: %s) expired while the bot was down, dropped",
-                            eid, rec.get("source"), rec.get("title"))
-                await _event_expired_note(app, rec)
-                _event_mark(store, eid, status="done", outcome="expired", done_at=now)
-            elif kind == "cut":
-                log.warning("event %s interrupted by restart mid-run, not repeated", eid)
-                when = datetime.fromtimestamp(float(rec.get("accepted_at") or now)).strftime("%H:%M")
-                show_chat, show_thread, head = _event_show_target(app, rec)
-                await app.bot.send_message(
-                    show_chat, head + _("⚠️ Пробуждение «{source}: {title}» (получено в {when}) оборвал "
-                                        "перезапуск бота посреди рана. Повторять не стал: что успело "
-                                        "сделаться, видно по журналу и чату.").format(
-                        source=rec.get("source"), title=rec.get("title"), when=when),
-                    message_thread_id=show_thread, disable_notification=rec.get("silent") is True)
-                # Пометка после доставки: не дошло, скажет при следующем старте.
-                _event_mark(store, eid, status="done", outcome="interrupted", done_at=now)
-            elif wake_fn is not None:
-                fresh, untrusted, silent = events.resume_flags(rec, now)
-                accepted = float(rec["accepted_at"])
-                note = _("(Событие получено в {when}, ждало {minutes} мин: бот перезапускался.)\n\n").format(
-                    when=datetime.fromtimestamp(accepted).strftime("%H:%M"), minutes=int((now - accepted) // 60))
-                log.warning("event %s resumed after restart (untrusted=%s fresh=%s)", eid, untrusted, fresh)
-                # Учёт как у принятого события: перезапуск по заявке его дождётся.
-                app.bot_data["admitted_events"] = app.bot_data.get("admitted_events", 0) + 1
-                task = asyncio.create_task(wake_fn(
-                    rec["chat_id"], rec.get("thread_id"), note + str(rec.get("prompt") or ""),
-                    fresh, untrusted=untrusted, silent=silent, event_id=eid,
-                    deal_asks=rec.get("deal_asks") is True))
-                tasks_set.add(task)
-                task.add_done_callback(tasks_set.discard)
-
-                def _release(_t: asyncio.Task) -> None:
-                    app.bot_data["admitted_events"] -= 1
-
-                task.add_done_callback(_release)
-        except Exception:
-            log.exception("event %s resume failed", rec.get("id"))
-
-
-async def _on_post_init(app: Application) -> None:
-    cfg: Config = app.bot_data["cfg"]
-    # Метка запуска: события, принятые этим процессом до восстановления, оно
-    # не трогает (ревью Codex 22.10.2026).
-    app.bot_data["boot_id"] = uuid.uuid4().hex[:12]
-    # Недокачанные большие файлы прошлого процесса (авария, SIGKILL).
-    parts = bigfile.clean_parts(cfg.state_dir / "attachments")
-    if parts:
-        log.warning("removed %d stale .part downloads", parts)
-    # Раны прошлого процесса мертвы: одобренные отклики снова с кнопками,
-    # взятые без итога «результат неизвестен». До сервера событий и опроса
-    # Telegram, чтобы ни один ран и ни одно нажатие не застали старое.
-    otklik_base = otklik.otklik_dir(cfg.state_dir)
-    try:
-        recovered = await asyncio.to_thread(otklik.recover, otklik_base)
-    except Exception:
-        log.exception("otklik: startup recovery failed")
-        recovered = []
-    async def _otklik_after_restart() -> None:
-        for rec in recovered:
-            log.warning("otklik %s: %s after restart", rec["id"], rec["status"])
-            if rec["status"] == "unknown":
-                await _otklik_unknown_notice(app.bot, rec, otklik_base)
-        # Остальное перерисует синхронизация: восстановленные в pending и
-        # отставшие с прошлых сбоев.
-        await _otklik_sync(app.bot, otklik_base)
-    app.bot_data["otklik_sync"] = asyncio.get_running_loop().create_task(_otklik_after_restart())
-    registry: ApprovalRegistry = app.bot_data["registry"]
-    session_targets: dict[str, tuple[int, int | None]] = app.bot_data["session_targets"]
-    # Wake-фабрика для POST /event {"wake": true}: approval.py не может
-    # импортировать bot (цикл), поэтому отдаём замыкание через bot_data.
-    # Ставим ДО старта сервера: иначе событие, пришедшее в первые миллисекунды,
-    # получило бы ok=true и осталось только уведомлением.
-    app.bot_data["event_wake"] = _make_event_wake(app)
-
-    app.bot_data["task_new"] = lambda *a, **kw: _task_from_http(
-        ContextTypes.DEFAULT_TYPE(application=app), *a, **kw)
-    app.bot_data["restart_begin"] = lambda chat_key, reason, commit: _restart_begin(
-        app, chat_key, reason, commit)
-
-    aio_app = build_aiohttp_app(app, cfg, registry, session_targets)
-    runner = web.AppRunner(aio_app)
-    await runner.setup()
-    site = web.TCPSite(runner, cfg.approve_http_host, cfg.approve_http_port)
-    await site.start()
-    app.bot_data["approval_runner"] = runner
-    warn_if_no_shared_secret(cfg)
-    app.bot_data["started_at"] = time.time()
-    log.info("approval HTTP server on %s:%s", cfg.approve_http_host, cfg.approve_http_port)
-
-    openai_client = make_client(cfg)
-    app.bot_data["openai"] = openai_client
-    log.info("voice features: %s", "enabled" if openai_client else "DISABLED (no OPENAI_API_KEY)")
-
-    # Меню команд при вводе «/» в клиенте. Заодно перетирает стейл-меню,
-    # оставшееся на токене от прошлых ботов.
-    try:
-        await app.bot.set_my_commands([
-            BotCommand("status", _("что сейчас происходит")),
-            BotCommand("login", _("восстановить вход Claude или Codex")),
-            BotCommand("cancel", _("прервать текущий claude-процесс")),
-            BotCommand("reset", _("сбросить сессию (force = прибить и сбросить)")),
-            BotCommand("keys", _("кнопки под полем ввода (off = убрать)")),
-            BotCommand("plan", _("сначала план с кнопками, выполнение после ✅")),
-            BotCommand("task", _("завести тему задачи: /task что сделать")),
-            BotCommand("auto", _("окно auto-approve: 15m|1h|off")),
-            BotCommand("compose", _("копить сообщения, /go отправит одним промптом")),
-            BotCommand("go", _("отправить compose-буфер")),
-            BotCommand("at", _("отложенный промпт: 45m|14:30 <текст>")),
-            BotCommand("resume", _("подцепить одну из последних сессий")),
-            BotCommand("export", _("сессия темы → Markdown-файл")),
-            BotCommand("handback", _("команда для продолжения в терминале")),
-            BotCommand("usage", _("расход текущего 5-часового окна")),
-            BotCommand("effort", _("глубина рассуждений в этой ветке")),
-            BotCommand("model", _("модель claude для этой ветки")),
-            BotCommand("scope", _("пометка темы (проект/контекст)")),
-            BotCommand("start", _("справка по командам")),
-        ])
-    except Exception:
-        log.exception("set_my_commands failed (continuing)")
-
-    # TTL cleanup для state/attachments/. Запускаем как фоновую таску, чтобы
-    # она была отменяема и не зависала между рестартами через apscheduler.
-    app.bot_data["cleanup_task"] = asyncio.create_task(_attachment_cleanup_loop(cfg))
-    # Задачи из новостей: застрявшие посреди рана возвращаются до приёма
-    # обновлений (позже это сломало бы уже новый ран, ревью Codex 13.10);
-    # уборка тем утром до подборки и раз при старте с проверкой прав.
-    try:
-        await _tasks_recover(ContextTypes.DEFAULT_TYPE(application=app))
-    except (OSError, ValueError) as e:
-        log.error("news tasks recovery failed: %s", e)
-    app.job_queue.run_daily(_tasks_housekeeping, name="news-tasks",
-                            time=dtime(8, 45, tzinfo=local_zone()))
-    app.job_queue.run_once(_tasks_startup, when=30, name="news-tasks-start")
-    # Сообщение о перезапуске по заявке: после старта приёма обновлений.
-    app.job_queue.run_once(_restart_announce, when=3, name="restart-announce")
-
-    # Восстановить отложенные /at-промпты после рестарта. Просроченные (бот
-    # лежал в момент срабатывания) уходят сразу (delay клампится к 1с).
-    at_store: SessionStore = app.bot_data["at_jobs"]
-    restored = 0
-    for jid, entry in list(at_store.data.items()):
-        try:
-            payload = json.loads(entry["v"])
-            _schedule_at_job(app, jid, payload)
-            restored += 1
-        except Exception:
-            log.exception("at-job %s повреждён — удаляю", jid)
-            at_store.remove(jid)
-    if restored:
-        log.info("restored %d scheduled /at job(s)", restored)
-
-    # Сигналы остановки PTB заменяются своими: те же SIGINT, SIGTERM и
-    # SIGABRT, но флаг остановки ставится до выхода из цикла (_on_stop_signal).
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGABRT):
-        try:
-            loop.add_signal_handler(sig, _on_stop_signal, app)
-        except (NotImplementedError, RuntimeError, ValueError):
-            log.warning("stop signal handler not set for %s", sig)
-
-    # Принятые до рестарта пробуждения: после восстановления задач, /at и
-    # сигналов остановки, иначе ран прочёл бы старый статус задачи, а
-    # остановка в эту минуту не выставила бы флаг (ревью 22.10.2026).
-    try:
-        await _events_resume(app)
-    except Exception:
-        log.exception("event resume failed")
-    # Принятые и не начатые ответы дел уходят, оборванные называются (проект В1, 2.8).
-    try:
-        await _deals_resume(app)
-    except Exception:
-        log.exception("deal resume failed")
-
-
-def _parse_chat_key(chat_key: str) -> tuple[int, int | None]:
-    """chat_key → (chat_id, thread_id). Format: '<chat_id>' или '<chat_id>:<thread_id>'."""
-    if ":" in chat_key:
-        chat_str, thread_str = chat_key.split(":", 1)
-        return int(chat_str), (int(thread_str) if thread_str else None)
-    return int(chat_key), None
-
-
-async def _send_shutdown_notice_via_api(
-    bot_token: str, chat_key: str, text: str, timeout_sec: float = 5.0
-) -> None:
-    """Прямой POST к Telegram bot API. Bot client уже shut down в post_shutdown,
-    поэтому app.bot.send_message не работает — используем raw HTTPS."""
-    try:
-        chat_id, thread_id = _parse_chat_key(chat_key)
-    except Exception:
-        log.warning("cannot parse chat_key=%s for shutdown notice", chat_key)
-        return
-    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    if thread_id is not None:
-        payload["message_thread_id"] = thread_id
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    log.warning(
-                        "shutdown notice POST returned %s for chat_key=%s", resp.status, chat_key
-                    )
-    except Exception:
-        log.exception("shutdown notice POST failed for chat_key=%s", chat_key)
-
-
-_STOP_GRACE_SEC = 30.0
-
-
-def _on_stop_signal(app: Application) -> None:
-    """SIGINT, SIGTERM или SIGABRT: остановка бота (ревью 12.10.2026).
-
-    PTB в Application.stop() ждёт задачи обработчиков и задания /at, а
-    уведомление и SIGTERM ранам в _on_post_shutdown идут только после этого:
-    к тому времени раны уже кончились. Под systemd claude получал SIGTERM сам
-    и Иван видел «отменено (signal -15)»; из терминала (Ctrl+C) claude в своей
-    сессии сигнала не получал, и остановка ждала конца рана. Поэтому здесь,
-    до ожидания: флаг stopping (новые раны не стартуют, прерванный ран
-    отвечает «бот перезапускается», пока клиент Telegram жив), SIGTERM
-    группам идущих ранов и SIGKILL оставшимся через _STOP_GRACE_SEC. Дальше
-    как у PTB: SystemExit выводит run_polling на штатную остановку.
-    """
-    _terminate_runs(app)
-    raise SystemExit
-
-
-def _terminate_runs(app: Application) -> None:
-    """Флаг stopping, SIGTERM группам идущих ранов, SIGKILL оставшимся через
-    _STOP_GRACE_SEC. Общее для сигнала остановки и перезапуска по заявке."""
-    app.bot_data["stopping"] = True
-    # Большая загрузка может идти до получаса, а stop() ждёт обработчики.
-    _downloads_cancel(app)
-    procs: dict[str, asyncio.subprocess.Process] = app.bot_data.get("procs") or {}
-    alive = [(ck, p) for ck, p in list(procs.items()) if p.returncode is None]
-    for ck, p in alive:
-        log.warning("stop signal: SIGTERM to claude proc pid=%s (chat_key=%s)", p.pid, ck)
-        kill_process_tree(p, signal.SIGTERM)
-
-    def _kill_left() -> None:
-        for ck, p in alive:
-            if p.returncode is None:
-                log.warning("claude proc pid=%s (chat_key=%s) ignored SIGTERM, SIGKILL", p.pid, ck)
-                kill_process_tree(p, signal.SIGKILL)
-
-    if alive:
-        asyncio.get_running_loop().call_later(_STOP_GRACE_SEC, _kill_left)
-
-
-# --- перезапуск по заявке (restart.py) -----------------------------------------
-
-def _workshop_busy(app: Application) -> bool:
-    cfg: Config = app.bot_data["cfg"]
-    key = getattr(cfg, "workshop_chat_key", "")
-    lock = app.bot_data.get("chat_locks", {}).get(key) if key else None
-    waiting = app.bot_data.get("lock_waiting", {}).get(key, 0) if key else 0
-    return bool(lock is not None and lock.locked()) or waiting > 0
-
-
-async def _restart_wait_workshop(app: Application, req: dict, drain: Any) -> None:
-    """Первый шаг перезапуска: дождаться конца работы мастерской. Личка и её
-    события тем временем работают; «/cancel мастерская» ускорит."""
-    run = app.bot_data.get("workshop_run") or {}
-    since = datetime.fromtimestamp(run["since"]).strftime("%H:%M") if run.get("since") else "?"
-    await _restart_notify(app, req, _("♻️ Перезапуск ждёт конца работы мастерской «{what}» с {since}; "
-                                      "личка работает как обычно. «/cancel мастерская» ускорит.").format(
-        what=run.get("what") or "?", since=since), True)
-    while _workshop_busy(app) and not drain.cancelled and not drain.now_event.is_set():
-        await asyncio.sleep(5)
-
-
-def _restart_active(app: Application) -> int:
-    """Сколько работы ещё идёт: обработки сообщений (_dispatch_to_claude) и
-    принятые события, которые ещё не дошли до неё."""
-    return (app.bot_data.get("active_work", 0) + app.bot_data.get("admitted_events", 0)
-            + len(app.bot_data.get("event_wake_tasks") or ()))
-
-
-def _restart_keyboard(rid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(_("Перезапустить сейчас"), callback_data=f"rst:now:{rid}"),
-        InlineKeyboardButton(_("Ждать"), callback_data=f"rst:wait:{rid}"),
-        InlineKeyboardButton(_("Отменить"), callback_data=f"rst:cancel:{rid}"),
-    ]])
-
-
-async def _restart_notify(app: Application, req: dict, text: str, ask: bool = False) -> None:
-    try:
-        chat_id, thread_id = _parse_chat_key(req["chat_key"])
-        await app.bot.send_message(
-            chat_id=chat_id, message_thread_id=thread_id, text=text,
-            reply_markup=_restart_keyboard(req["id"]) if ask else None,
-        )
-    except Exception:
-        log.exception("restart notice failed (ignored)")
-
-
-def _restart_reschedule_at(app: Application) -> None:
-    """/at, отклонённые на время ожидания, остались на диске без задания:
-    при отмене заявки вернуть их в очередь (иначе ждали бы до рестарта)."""
-    at_store: SessionStore = app.bot_data["at_jobs"]
-    running: set[str] = app.bot_data.get("at_running") or set()
-    for jid, entry in list(at_store.data.items()):
-        if jid in running or app.job_queue.get_jobs_by_name(f"at:{jid}"):
-            continue
-        try:
-            _schedule_at_job(app, jid, json.loads(entry["v"]))
-        except Exception:
-            log.exception("at-job %s не восстановлен после отмены перезапуска", jid)
-
-
-async def _restart_abort(app: Application, req: dict, text: str) -> None:
-    cfg: Config = app.bot_data["cfg"]
-    drain = app.bot_data.get("restart_drain")
-    if drain is not None:
-        drain.cancelled = True
-    app.bot_data["restart_drain"] = None
-    app.bot_data["draining"] = False
-    app.bot_data.pop("draining_keys", None)
-    restart.clear_request(cfg.state_dir)
-    _restart_reschedule_at(app)
-    log.warning("restart request %s aborted: %s", req.get("id"), text.splitlines()[0])
-    await _restart_notify(app, req, text)
-
-
-async def _restart_exit(app: Application, req: dict) -> None:
-    """Код проверен: заявка в фазе restarting на диск, штатный выход с
-    EXIT_RESTART, systemd поднимет бота снова (Restart=on-failure)."""
-    cfg: Config = app.bot_data["cfg"]
-    req = {**req, "phase": restart.PHASE_RESTARTING}
-    restart.save_request(cfg.state_dir, req)
-    log.warning("restart request %s: exiting with %s", req["id"], restart.EXIT_RESTART)
-    app.bot_data["exit_code"] = restart.EXIT_RESTART
-    # Обычно работы уже нет; после «Перезапустить сейчас» идущие раны получают
-    # SIGTERM и отвечают «бот перезапускается, ран прерван».
-    _terminate_runs(app)
-    app.stop_running()
-
-
-async def _restart_begin(app: Application, chat_key: str, reason: str, commit: str) -> tuple[int, dict]:
-    """Приём заявки из /restart (approval.handle_restart)."""
-    # Под замком: проверка «заявки нет» и установка новой через await
-    # to_thread иначе пропускали бы вторую заявку (ревью Codex 13.10.2026).
-    lock: asyncio.Lock = app.bot_data.setdefault("restart_lock", asyncio.Lock())
-    async with lock:
-        return await _restart_begin_locked(app, chat_key, reason, commit)
-
-
-async def _restart_begin_locked(app: Application, chat_key: str, reason: str,
-                                commit: str) -> tuple[int, dict]:
-    cfg: Config = app.bot_data["cfg"]
-    if app.bot_data.get("stopping"):
-        return 503, {"error": "bot is stopping"}
-    drain = app.bot_data.get("restart_drain")
-    if drain is not None:
-        return 202, {"ok": True, "id": drain.req["id"], "duplicate": True}
-    problem = await asyncio.to_thread(restart.code_problem, commit)
-    if problem:
-        return 409, {"error": problem}
-    if _is_workshop(cfg, chat_key):
-        # Заявка из мастерской: ход перезапуска и кнопки в личке, тема заглушена.
-        chat_key = str(cfg.primary_chat_id)
-    req = restart.new_request(chat_key, reason, commit)
-    restart.save_request(cfg.state_dir, req)
-    # Ожидание в два шага (проект Домового 22.10.2026): пока идёт наряд
-    # мастерской, новую работу не берёт только она, личка работает; общее
-    # ожидание начинается, когда мастерская свободна (_restart_run).
-    workshop_busy = _workshop_busy(app)
-    if workshop_busy:
-        app.bot_data["draining_keys"] = {cfg.workshop_chat_key}
-    else:
-        app.bot_data["draining"] = True
-
-    async def notify(text: str, ask: bool) -> None:
-        await _restart_notify(app, req, text, ask)
-
-    async def do_restart() -> None:
-        await _restart_exit(app, req)
-
-    async def abort(text: str) -> None:
-        await _restart_abort(app, req, text)
-
-    drain = restart.Drain(
-        req=req, active=lambda: _restart_active(app), notify=notify,
-        validate=restart.validate_code, code_problem=restart.code_problem,
-        restart=do_restart, abort=abort,
-    )
-    app.bot_data["restart_drain"] = drain
-
-    async def _run() -> None:
-        try:
-            if workshop_busy:
-                await _restart_wait_workshop(app, req, drain)
-                if drain.cancelled:
-                    return
-                app.bot_data.pop("draining_keys", None)
-                app.bot_data["draining"] = True
-            await drain.run()
-        except Exception as e:
-            log.exception("restart drain failed")
-            if not drain.cancelled:
-                await _restart_abort(app, req, _("❌ Перезапуск отменён из-за ошибки: {error_type}: {error}").format(error_type=type(e).__name__, error=e))
-
-    app.bot_data["restart_task"] = asyncio.create_task(_run())
-    log.warning("restart request %s accepted: chat=%s reason=%r", req["id"], chat_key, reason)
-    return 202, {"ok": True, "id": req["id"]}
-
-
-async def on_restart_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопки долгого ожидания: «Перезапустить сейчас», «Ждать», «Отменить»."""
-    cfg: Config = ctx.application.bot_data["cfg"]
-    query = update.callback_query
-    if query is None:
-        return
-    user = update.effective_user
-    if user is None or user.id not in cfg.allowed_user_ids:
-        return
-    parts = (query.data or "").split(":")
-    action, rid = (parts[1], parts[2]) if len(parts) == 3 else ("", "")
-    drain = ctx.application.bot_data.get("restart_drain")
-    if drain is None or drain.req.get("id") != rid:
-        await _answer_quietly(query, _("Эта заявка уже не действует"))
-        return
-    with contextlib.suppress(Exception):
-        await query.edit_message_reply_markup(reply_markup=None)
-    if action == "now":
-        await _answer_quietly(query, _("Проверяю код и перезапускаю"))
-        drain.now_event.set()
-    elif action == "cancel":
-        await _answer_quietly(query, _("Заявка отменена"))
-        await _restart_abort(ctx.application, drain.req, _("Заявка на перезапуск отменена, бот берёт работу как обычно."))
-    else:
-        await _answer_quietly(query, _("Жду дальше"))
-
-
-async def _restart_announce(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """После старта: сообщить о перезапуске по заявке и закрыть её.
-
-    Заявка в фазе pending значит, что бот остановили до перезапуска (сигнал,
-    сбой): она потеряна, повторять её сам бот не будет."""
-    app = ctx.application
-    cfg: Config = app.bot_data["cfg"]
-    req = restart.load_request(cfg.state_dir)
-    if req is None:
-        return
-    restart.clear_request(cfg.state_dir)
-    if req.get("phase") != restart.PHASE_RESTARTING:
-        await _restart_notify(app, req, _("⚠️ Бот остановился раньше, чем дошло до перезапуска по заявке. "
-                                        "Если правка ещё нужна, подай заявку снова."))
-        return
-    head, _unused = await asyncio.to_thread(restart.git_state)
-    version = head[:7] or _("неизвестна")
-    note = "" if not req.get("commit") or head == req["commit"] else \
-        _(" (в заявке был {commit})").format(commit=req['commit'][:7])
-    await _restart_notify(app, req, _("✅ Бот перезапущен по заявке: {reason}. "
-                                    "Версия {version}{note}.").format(
-        reason=req.get('reason') or _("без причины"), version=version, note=note))
-
-
-async def _on_post_stop(app: Application) -> None:
-    manager = app.bot_data.get("login_manager")
-    if manager is not None:
-        await manager.close()
-
-
-async def _on_post_shutdown(app: Application) -> None:
-    cleanup_task: asyncio.Task | None = app.bot_data.get("cleanup_task")
-    if cleanup_task is not None:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("cleanup task raised on shutdown")
-    runner: web.AppRunner | None = app.bot_data.get("approval_runner")
-    if runner is not None:
-        await runner.cleanup()
-        log.info("approval HTTP server stopped")
-    openai_client = app.bot_data.get("openai")
-    if openai_client is not None:
-        try:
-            await openai_client.close()
-        except Exception:
-            log.exception("openai client close failed")
-    mtproto: bigfile.BotMTProto | None = app.bot_data.get("mtproto")
-    if mtproto is not None:
-        await mtproto.close()
-    cancel_tasks: set[asyncio.Task[None]] = app.bot_data.get("cancel_tasks") or set()
-    if cancel_tasks:
-        await asyncio.gather(*list(cancel_tasks), return_exceptions=True)
-    wake_tasks: set[asyncio.Task] = app.bot_data.get("event_wake_tasks") or set()
-    if wake_tasks:
-        for task in list(wake_tasks):
-            task.cancel()
-        await asyncio.gather(*list(wake_tasks), return_exceptions=True)
-    # Ожидания выхода процессов, не вышедших после SIGKILL: удержание проекта
-    # в памяти бота рестарт не переживает (ревью Codex 14.10).
-    exit_waits: set[asyncio.Task] = app.bot_data.get("task_exit_waits") or set()
-    for task in list(exit_waits):
-        task.cancel()
-    if exit_waits:
-        await asyncio.gather(*list(exit_waits), return_exceptions=True)
-    burst_tasks: dict[str, asyncio.Task] = app.bot_data.get("burst_expiry_tasks") or {}
-    for task in list(burst_tasks.values()):
-        if not task.done():
-            task.cancel()
-    if burst_tasks:
-        await asyncio.gather(*list(burst_tasks.values()), return_exceptions=True)
-    procs: dict[str, asyncio.subprocess.Process] = app.bot_data.get("procs") or {}
-    active = [(ck, p) for ck, p in list(procs.items()) if p.returncode is None]
-    if active:
-        # Уведомляем юзеров (через прямой Telegram API — bot client уже мёртв
-        # в post_shutdown). Без этого юзер видит загадочное "отменено
-        # (signal 143)" и не понимает что бот рестартуется.
-        # Обычно сюда уже никто не доходит: Application.stop() ждёт раны до
-        # post_shutdown, их гасит _on_stop_signal, а «бот перезапускается»
-        # пишет сам _dispatch_to_claude. Ветка запасная, для остановки без
-        # сигнала (ревью 12.10.2026).
-        cfg: Config | None = app.bot_data.get("cfg")
-        if cfg is not None:
-            await asyncio.gather(
-                *(
-                    _send_shutdown_notice_via_api(
-                        cfg.telegram_bot_token,
-                        ck,
-                        _("♻️ Бот перезапускается, эта сессия будет прервана. "
-                          "Дождись пары секунд и повтори запрос."),
-                    )
-                    for ck, _unused in active
-                ),
-                return_exceptions=True,
-            )
-        # Расширенный grace (30 сек) — даёт claude-процессам время дописать
-        # последний ответ в Telegram и завершиться сами. /cancel оставляет
-        # default 5 сек: там юзер явно нажал и не ждёт долго.
-        await asyncio.gather(
-            *(_terminate_and_wait(ck, p, grace_sec=30.0) for ck, p in active),
-            return_exceptions=True,
-        )
-
-
-async def _terminate_and_wait(chat_key: str, proc: asyncio.subprocess.Process, *, grace_sec: float = 5.0) -> None:
-    """SIGTERM всей pgroup, подождать grace_sec, SIGKILL если живы. Гарантирует,
-    что к концу shutdown ни claude, ни его дети не остаются зомбями."""
-    log.warning("terminating claude proc pid=%s (chat_key=%s) on shutdown", proc.pid, chat_key)
-    if proc.returncode is not None:
-        return
-    kill_process_tree(proc, signal.SIGTERM)
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=grace_sec)
-        return
-    except asyncio.TimeoutError:
-        log.warning("claude proc pid=%s did not exit in %ss; sending SIGKILL to pgroup", proc.pid, grace_sec)
-    kill_process_tree(proc, signal.SIGKILL)
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=2.0)
-    except asyncio.TimeoutError:
-        log.error("claude proc pid=%s did not die after SIGKILL", proc.pid)
-
-
-async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Глобальный error handler PTB. Без него необработанное исключение
-    обработчика (сетевой флап Telegram, баг) видно только в логе, а
-    пользователь смотрит в тишину и не знает, дошёл ли запрос."""
-    log.error("unhandled error in handler", exc_info=ctx.error)
-    if isinstance(update, Update) and update.effective_message is not None:
-        try:
-            await update.effective_message.reply_text(
-                _("⚠️ внутренняя ошибка при обработке — смотри логи бота, повтори запрос")
-            )
-        except Exception:
-            log.debug("error notice failed (ignored)", exc_info=True)
-
-
 # Ран без звука (/event с silent и wake): всё, что бот шлёт в Telegram из
 # задачи пробуждения и из задач, созданных ею (ответ, куски, файлы, вопрос
 # кнопками, «встанет в очередь»), уходит с disable_notification. Флаг в
@@ -8462,6 +4499,13 @@ _SILENT_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar("silent_run",
 # Ран пробуждения с флагом "asks": "deal" (утро Домового): его вопросы
 # становятся делами (опыт В1, docs/design-2026-10-26-v1.md).
 _DEAL_ASKS: contextvars.ContextVar[bool] = contextvars.ContextVar("deal_asks", default=False)
+# Ран по чужому тексту (untrusted): сообщения без превью ссылок. Превью
+# заставляет сервер Telegram сходить по адресу из ответа, а в адрес ран мог
+# положить прочитанное из почты или файлов по указанию из письма: это его
+# единственный выход наружу (аудит outbound 31.10.2026). Ставит
+# _dispatch_to_claude, читает _SilentAwareBot.
+_NO_PREVIEW_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar("no_preview_run", default=False)
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 class _SilentAwareBot(ExtBot):
@@ -8477,7 +4521,18 @@ class _SilentAwareBot(ExtBot):
     async def _send_message(self, endpoint: str, data: dict, *args: Any, **kwargs: Any) -> Any:
         if _SILENT_RUN.get() and "disable_notification" in kwargs:
             kwargs["disable_notification"] = True
+        if (_NO_PREVIEW_RUN.get() and endpoint in ("sendMessage", "editMessageText")
+                and not isinstance(kwargs.get("link_preview_options"), LinkPreviewOptions)):
+            kwargs["link_preview_options"] = _NO_PREVIEW
         return await super()._send_message(endpoint, data, *args, **kwargs)
+
+
+# Умолчание PTB 5 с: Telegram отвечает дольше и на сообщения, которые принял,
+# и каждая новая отправка получала ложный сбой (случаи 22-31.10.2026). Дольше
+# ждать незачем: неподтверждённое уже не считается сбоем (replies.is_unconfirmed).
+TELEGRAM_READ_TIMEOUT = 30
+# Предел текста одного сообщения Telegram.
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 def build_app(cfg: Config) -> Application:
@@ -8486,7 +4541,8 @@ def build_app(cfg: Config) -> Application:
         # Свой класс бота ради ранов без звука. Пул соединений задан явно, как
         # у ApplicationBuilder с .token() (256): с .bot() пул ставит не builder,
         # и так он не зависит от умолчания HTTPXRequest в другой версии PTB.
-        .bot(_SilentAwareBot(cfg.telegram_bot_token, request=HTTPXRequest(connection_pool_size=256)))
+        .bot(_SilentAwareBot(cfg.telegram_bot_token, request=HTTPXRequest(
+            connection_pool_size=256, read_timeout=TELEGRAM_READ_TIMEOUT)))
         .concurrent_updates(True)
         .post_init(_on_post_init)
         .post_stop(_on_post_stop)
@@ -8555,12 +4611,14 @@ def build_app(cfg: Config) -> Application:
     app.bot_data["burst_expiry_tasks"] = {}
     # ~EDITED: правка отправленного сообщения не должна ни ронять обработчики
     # (update.message=None → AttributeError), ни ПОВТОРНО выполнять команды —
-    # правка старого «/reset force» убивала бы живую сессию. Молча игнорируем.
+    # правка старого «/reset force» убивала бы живую сессию. Правку обычного
+    # текста берёт on_edited_text (только весть), правка команды игнорируется.
     not_edited = ~filters.UpdateType.EDITED
     # Пересланная «/reset force» это чужой текст, а не команда пользователя:
     # командные обработчики пересылку не берут, её получает on_text как данные.
     own_command = not_edited & ~filters.FORWARDED
     app.add_handler(CommandHandler("start", on_start, filters=own_command))
+    app.add_handler(CommandHandler("help", on_start, filters=own_command))
     app.add_handler(CommandHandler("reset", on_reset, filters=own_command))
     app.add_handler(CommandHandler("cancel", on_cancel, filters=own_command))
     app.add_handler(CommandHandler("status", on_status, filters=own_command))
@@ -8597,6 +4655,7 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_restart_pick, pattern=r"^rst:"))
     app.add_handler(CallbackQueryHandler(on_task_pick, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(on_otklik_pick, pattern=r"^otk:"))
+    app.add_handler(CallbackQueryHandler(on_otklik_all_pick, pattern=r"^otka:"))
     app.add_handler(CallbackQueryHandler(on_handoff_pick, pattern=r"^ho:"))
     app.add_handler(CallbackQueryHandler(on_plan_pick, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_model_pick, pattern=r"^model:"))
@@ -8613,6 +4672,10 @@ def build_app(cfg: Config) -> Application:
     ))
     app.add_handler(MessageHandler(
         filters.TEXT & (~filters.COMMAND | filters.FORWARDED) & not_edited, on_text,
+    ))
+    # Правка текста (не команды): только сказать, что до Claude она не дошла.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.EDITED_MESSAGE & filters.TEXT & ~filters.COMMAND, on_edited_text,
     ))
     app.add_error_handler(_on_error)
     return app

@@ -20,7 +20,7 @@ BACKLOG.md).
 19.10.2026).
 
 Здесь чистая часть и хранилище: реестр state/news_digest/tasks.json под
-замком файла. Telegram и запуск агента в bot.py."""
+замком файла. Telegram и запуск агента в tg_tasks.py."""
 from __future__ import annotations
 
 import contextlib
@@ -68,8 +68,6 @@ CALLBACK_PREFIX = "nt"
 OPEN_STATUSES = ("creating", "thinking", "proposed", "running", "done", "failed")
 # Под потолком MAX_OPEN: всё, кроме выполненных (ждут только закрытия).
 ACTIVE_STATUSES = ("creating", "thinking", "proposed", "running", "failed")
-# Сообщение в теме идёт обдумыванием, только чтением (ревью Codex 13.10).
-THINKING_STATUSES = ("creating", "thinking", "proposed", "done", "failed")
 CLOSABLE = ("thinking", "proposed", "done", "failed")
 GONE_KEEP = timedelta(days=40)
 

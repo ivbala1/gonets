@@ -555,6 +555,10 @@ class Config:
     hangs_file: Path | None = None
     hangs_chat_keys: frozenset[str] = frozenset()
     workshop_chat_key: str = ""
+    # Карточка плана: одно «✅ Делай план» пускает остальные шаги запуска, кроме
+    # исключений (approval._plan_card_tags). PLAN_CARDS=0 выключает (шаг 2 карточек,
+    # решение Ивана 29.10.2026).
+    plan_cards: bool = False
     workshop_model: str = "opus"
     workshop_effort: str = "high"
     workshop_scope: str = ""
@@ -926,6 +930,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
                 )
     codex_prefix = os.environ.get("CODEX_PREFIX", "gpt:").strip() or "gpt:"
     workshop_chat_key = os.environ.get("WORKSHOP_CHAT_KEY", "").strip()
+    plan_cards = os.environ.get("PLAN_CARDS", "1").strip().lower() in ("1", "true", "yes", "on")
     if workshop_chat_key and not re.fullmatch(r"-?\d+:\d+", workshop_chat_key):
         print(f"[config] WARNING: WORKSHOP_CHAT_KEY={workshop_chat_key!r} не вида <chat>:<thread>, мастерская выключена",
               file=sys.stderr)
@@ -999,6 +1004,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         approve_guarded_data_paths=approve_guarded_data_paths,
         approve_guarded_data_hint=guarded_hint,
         workshop_chat_key=workshop_chat_key,
+        plan_cards=plan_cards,
         agent_role_chat_keys=frozenset(
             k.strip() for k in os.environ.get("AGENT_ROLE_CHAT_KEYS", "").split(",") if k.strip()),
         hangs_file=Path(os.environ["HANGS_FILE"].strip()).expanduser()

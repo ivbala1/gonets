@@ -316,13 +316,24 @@ def send(letter: Letter, user: str, password: str) -> tuple[str, dict[str, Any]]
     документации Google не нашли; проверить на первом письме)."""
     msg = build_message(letter, user)
     ctx = ssl.create_default_context()
+    sending = False
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=SMTP_TIMEOUT_SEC) as smtp:
             smtp.login(user, password)
+            sending = True
             refused = smtp.send_message(msg, from_addr=user, to_addrs=list(letter.to + letter.cc))
     except smtplib.SMTPAuthenticationError as e:
         raise MailError(_("Gmail не принял логин: код {code}").format(code=e.smtp_code)) from e
-    except (smtplib.SMTPException, OSError) as e:
+    except (smtplib.SMTPServerDisconnected, OSError) as e:
+        if sending:
+            # Обрыв во время передачи: ответ на конец письма мог потеряться
+            # после приёма. «Не ушло» вело к новой карточке и второму письму
+            # (аудит outbound 31.10.2026).
+            raise MailError(_("SMTP: связь оборвалась при отправке ({error}): письмо могло уйти. "
+                              "Проверь «Отправленные» в Gmail, прежде чем просить новую карточку").format(
+                                  error=type(e).__name__)) from e
+        raise MailError(f"SMTP: {type(e).__name__}: {e}") from e
+    except smtplib.SMTPException as e:
         raise MailError(f"SMTP: {type(e).__name__}: {e}") from e
     return str(msg["Message-ID"]), dict(refused)
 

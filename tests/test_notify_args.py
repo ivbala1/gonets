@@ -19,6 +19,8 @@ def _fake_cfg():
         primary_chat_id=111,
         telegram_bot_token="TOKEN",
         telegram_text_limit=4096,
+        allowed_user_ids=frozenset({111}),
+        allowed_chat_ids=frozenset({-1, -100500}),
     )
 
 
@@ -165,14 +167,15 @@ class NotifyArgsTests(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue(), post
 
     def test_pin_second_chunk_failure_still_prints_first_id(self):
-        # Первая часть доставлена, вторая упала по таймауту: id нужен вызывающему,
-        # иначе он перешлёт всё заново; закрепа нет.
+        # Первая часть доставлена, вторая не ушла (нет соединения): id нужен
+        # вызывающему, иначе он перешлёт всё заново; закрепа нет. Таймаут чтения
+        # сбоем не считается (неподтверждённая часть, аудит outbound 31.10.2026).
         rc, out, err, post = self._run_chunked(
-            ["--pin", "0123456789"], [_ok_response(7), notify.httpx.ReadTimeout("x")]
+            ["--pin", "0123456789"], [_ok_response(7), notify.httpx.ConnectError("x")]
         )
         self.assertEqual(rc, 1)
         self.assertEqual(out, "message_id: 7\n")
-        self.assertIn("HTTP error: ReadTimeout", err)
+        self.assertIn("HTTP error: ConnectError", err)
         self.assertEqual(post.call_count, 2)
 
     def test_pin_second_chunk_http_status_failure_still_prints_first_id(self):
@@ -250,6 +253,44 @@ class NotifyArgsTests(unittest.TestCase):
             with patch.object(notify.httpx, "post", return_value=bad):
                 rc = notify.main(["текст"])
         self.assertEqual(rc, 1)
+
+class NotifyAllowedChatTests(unittest.TestCase):
+    """--chat-id только в разрешённые чаты, как POST /event (задание guard2,
+    outbound.md п. 10): агент без карточки не пишет ботом в чужую группу."""
+
+    def test_foreign_chat_refused(self):
+        cfg = _fake_cfg()
+        with patch.object(notify, "load_config", return_value=cfg):
+            with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                rc = notify.main(["--chat-id", "-777", "чужим"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+
+    def test_foreign_chat_refused_for_unpin(self):
+        cfg = _fake_cfg()
+        with patch.object(notify, "load_config", return_value=cfg):
+            with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                rc = notify.main(["--chat-id", "-777", "--unpin", "5"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+
+    def test_skill_send_message_keeps_configured_chat(self):
+        # Таймеры скиллов шлют в чат из своей настройки .env: не ломаем.
+        cfg = _fake_cfg()
+        with patch.object(notify, "load_config", return_value=cfg):
+            with patch.object(notify.httpx, "post", return_value=_ok_response(7)):
+                rc, mid = notify.send_message(["--chat-id", "-777", "--", "сводка"])
+        self.assertEqual((rc, mid), (0, 7))
+
+    def test_allowed_group_and_private_pass(self):
+        cfg = _fake_cfg()
+        for chat in ("-100500", "111"):
+            with self.subTest(chat=chat):
+                with patch.object(notify, "load_config", return_value=cfg):
+                    with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                        rc = notify.main(["--chat-id", chat, "т"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(post.call_args.kwargs["json"]["chat_id"], int(chat))
 
 
 if __name__ == "__main__":
