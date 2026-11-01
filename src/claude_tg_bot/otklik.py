@@ -41,7 +41,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,10 @@ OTKLIK_DIRNAME = "otkliki"
 LOCK_NAME = ".lock"
 CALLBACK_PREFIX = "otk"
 # Поколение кнопок между хешем и действием; кнопки до 22.10.2026 без него (0).
+BATCH_PREFIX = "otka"
+BATCH_FRESH_HOURS = 2           # старые ждущие в пачку не попадают
+BATCH_MAX = 20                  # все названы в сообщении с кнопкой
+_BATCH_RE = re.compile(r"otka:([0-9a-f]{12})")
 _CALLBACK_RE = re.compile(r"otk:([0-9a-f]{12}):([0-9a-f]{12}):(?:(\d{1,6}):)?([oescr])")
 _ID_RE = re.compile(r"[0-9a-f]{12}")
 # Итоги, которые ставит агент командой done; остальные ставит бот по кнопке.
@@ -168,6 +172,11 @@ def new_record(title: str, channel: str, text: str) -> dict[str, Any]:
     }
 
 
+def parse_batch_callback(data: str) -> str | None:
+    m = _BATCH_RE.fullmatch(data or "")
+    return m.group(1) if m else None
+
+
 def parse_callback(data: str) -> tuple[str, str, int, str] | None:
     m = _CALLBACK_RE.fullmatch(data or "")
     return (m.group(1), m.group(2), int(m.group(3) or 0), m.group(4)) if m else None
@@ -252,6 +261,34 @@ def pick(base: Path, oid: str, sha: str, gen: int, action: str,
         rec.update(note="", updated=_now())
         save(base, rec)
         return rec
+
+
+def _batch_path(base: Path, bid: str) -> Path:
+    return base / "batches" / f"{bid}.json"
+
+
+def pick_all(base: Path, bid: str, chat_id: int, message_id: int) -> list[dict[str, Any]]:
+    """«✅ Все N»: файл пачки держит хеш и поколение каждого показанного
+    отклика, запись одобряет та же `pick`. Устаревшую запись (решена отдельно,
+    заменена) пачка пропускает, а не одобряет. Файл снимается сразу: второе
+    нажатие ничего не делает."""
+    path = _batch_path(base, bid)
+    with locked(base):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise Refused(_("Кнопка устарела: эта пачка уже решена")) from e
+        if data.get("chat_id") != chat_id or data.get("message_id") != message_id:
+            raise Refused(_("Кнопка устарела: эта пачка уже решена"))
+        path.unlink(missing_ok=True)
+    picked = []
+    for item in data.get("items") or []:
+        try:
+            picked.append(pick(base, item["id"], item["sha"], int(item["gen"]), "o",
+                               int(item["chat_id"]), int(item["message_id"])))
+        except (Refused, KeyError, TypeError, ValueError, OSError):
+            continue  # не записалось: отклик остаётся с кнопками, остальные идут
+    return picked
 
 
 def take(base: Path, oid: str, chat_key: str) -> dict[str, Any]:
@@ -542,6 +579,44 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
     return 0
 
 
+def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
+    """Одно сообщение с кнопкой «✅ Все N» под показанной пачкой: только свежие
+    карточки этого чата, каждая названа в списке. Ждущих меньше двух: ничего,
+    хватает кнопки на карточке. Кнопка последней, как у карточки: сообщение,
+    потом файл пачки, потом кнопка."""
+    source = chat_key or str(primary_chat_id)
+    fresh_from = (datetime.now() - timedelta(hours=BATCH_FRESH_HOURS)).isoformat(timespec="seconds")
+    with locked(base):
+        recs = [r for r in _records(base) if r.get("status") == "pending" and r.get("message_id")
+                and r.get("chat_id") is not None and source_of(r) == source
+                and str(r.get("created") or "") >= fresh_from][-BATCH_MAX:]
+    if len(recs) < 2:
+        print(_("otklik: ждущих меньше двух, кнопка не нужна"))
+        return 0
+    lines = [_("📨 Ждут «ок»: {count}").format(count=len(recs))]
+    lines += [f"{i}. {r['title'][:150]}" for i, r in enumerate(recs, 1)]
+    bid = uuid.uuid4().hex[:12]
+    res = _bot_api("sendMessage", {"chat_id": primary_chat_id, "text": "\n".join(lines)})
+    if res is None:
+        return 1
+    path = _batch_path(base, bid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with locked(base):
+        path.write_text(json.dumps({
+            "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
+            "items": [{"id": r["id"], "sha": r["sha"], "gen": gen_of(r), "chat_id": r["chat_id"],
+                       "message_id": r["message_id"]} for r in recs]}), encoding="utf-8")
+    if _bot_api("editMessageReplyMarkup", {
+        "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
+        "reply_markup": {"inline_keyboard": [[{"text": _("✅ Все {count}").format(count=len(recs)),
+                                               "callback_data": f"{BATCH_PREFIX}:{bid}"}]]},
+    }) is None:
+        path.unlink(missing_ok=True)
+        return 1
+    print(f"otklik batch {bid}: {len(recs)}")
+    return 0
+
+
 def _print_text(rec: dict[str, Any]) -> None:
     print(_("Куда: {channel}\nПопытка: {attempt}\n---\n{text}").format(
         channel=rec['channel'], attempt=(rec.get("attempt") or {}).get("id"), text=rec['text']))
@@ -600,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--channel", required=True, help="куда уйдёт и что приложено")
     p_new.add_argument("--file", required=True, help="файл с точным текстом отклика")
     p_new.add_argument("--replaces", default="", help="отклик, который этот заменяет (правка по ✏️)")
+    sub.add_parser("all", help="прислать кнопку «✅ Все N» под пачкой ждущих откликов")
     p_take = sub.add_parser("take", help="взять одобренный текст для отправки")
     p_take.add_argument("--id", required=True)
     p_done = sub.add_parser("done", help="отметить итог отправки")
@@ -626,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
             sources = (frozenset({str(cfg.primary_chat_id), getattr(cfg, "workshop_chat_key", "")} - {""})
                        | cfg.approve_auto_chat_keys)
             return _cmd_new(args, base, cfg.primary_chat_id, chat_key, sources)
+        if args.cmd == "all":
+            return _cmd_all(base, cfg.primary_chat_id, chat_key)
         if args.cmd == "take":
             return _cmd_take(args, base, chat_key)
         if args.cmd == "show":

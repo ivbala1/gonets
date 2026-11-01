@@ -43,12 +43,3 @@ def strip_model_lines(reply: str) -> str:
     """Ответ без строк «Висит», написанных моделью: при непустом файле их
     заменяют строки бота, иначе срочное шло бы дважды."""
     return _MODEL_LINE.sub("", reply).rstrip()
-
-
-def with_hangs(reply: str, lines: list[str]) -> str:
-    """Ответ со строками «Висит» в конце. Пустой ответ остаётся пустым:
-    молчаливый ран не должен превращаться в сообщение."""
-    if not lines or not reply.strip():
-        return reply
-    body = strip_model_lines(reply)
-    return (body + "\n\n" if body else "") + "\n".join(lines)

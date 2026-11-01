@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 from telegram import MessageEntity, ReplyParameters, Update
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 from .claude_runner import ClaudeResult
@@ -41,14 +41,30 @@ _NOT_SENT_CAUSES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 # группа упёрлась в лимит, итоговый план с кнопками потерялся.
 _FLOOD_RETRIES = 2
 _FLOOD_WAIT_MAX = 60.0
+# Дольше этого отправка попадает в журнал: по нему видно, что медленно,
+# Telegram или сеть (голосовые стали упираться в таймаут с 23.10.2026).
+_SLOW_SEND_SEC = 3.0
+
+
+def is_unconfirmed(e: BaseException) -> bool:
+    """Запрос ушёл, ответа Telegram не дождались: сообщение обычно доходит,
+    иногда минуты спустя (случаи 30-31.10.2026: 1, 5 и 125 с после таймаута).
+    Это не отказ, и слать то же самое заново значит слать дубль."""
+    return isinstance(e, TimedOut) and isinstance(e.__cause__, httpx.ReadTimeout)
 
 
 async def _send_retrying(send: Callable[[], Awaitable[Any]]) -> Any:
     delays = iter(_SEND_RETRY_DELAYS)
     floods = 0
     while True:
+        started = time.monotonic()
         try:
-            return await send()
+            try:
+                return await send()
+            finally:
+                took = time.monotonic() - started
+                if took > _SLOW_SEND_SEC:
+                    log.info("reply send took %.1fs", took)
         except RetryAfter as e:
             ra = e.retry_after
             wait = (ra.total_seconds() if isinstance(ra, timedelta) else float(ra or 0)) + 1
@@ -63,6 +79,18 @@ async def _send_retrying(send: Callable[[], Awaitable[Any]]) -> Any:
                 raise
             log.warning("reply send failed before connect (%s), retry in %.0fs", e, delay)
             await asyncio.sleep(delay)
+
+
+async def _send_once(send: Callable[[], Awaitable[Any]]) -> Any:
+    """Отправка куска ответа: неподтверждённый кусок не обрывает ответ, хвост
+    уходит дальше, а вызывающие не шлют уже ушедшее заново."""
+    try:
+        return await _send_retrying(send)
+    except TimedOut as e:
+        if not is_unconfirmed(e):
+            raise
+        log.warning("reply send unconfirmed by Telegram, not repeated")
+        return None
 
 
 async def send_reply_text(cfg: Config, update: Update, text: str) -> None:
@@ -86,7 +114,7 @@ async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
             return msg.reply_document(document=buf, filename="claude-reply.txt",
                                       caption=f"{head}\n{caption}" if head else caption)
 
-        await _send_retrying(doc)
+        await _send_once(doc)
         return
     # Первый кусок цитирует настоящее сообщение Ивана (проект Домового 22.10.2026,
     # 1.8): в личке видно, на что ответ. Сообщение удалено: ответ всё равно уходит
@@ -103,22 +131,22 @@ async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
         quote = None
         try:
             if not entities:
-                await _send_retrying(lambda chunk=chunk, extra=extra: msg.reply_text(chunk, **extra))
+                await _send_once(lambda chunk=chunk, extra=extra: msg.reply_text(chunk, **extra))
                 continue
             try:
-                await _send_retrying(lambda plain=plain, entities=entities, extra=extra:
-                                     msg.reply_text(plain, entities=entities, **extra))
+                await _send_once(lambda plain=plain, entities=entities, extra=extra:
+                                 msg.reply_text(plain, entities=entities, **extra))
             except BadRequest:
                 if extra:
                     raise
                 # Сущности не приняты: ответ важнее шрифтов.
                 log.exception("markup entities rejected, sending raw")
-                await _send_retrying(lambda chunk=chunk: msg.reply_text(chunk))
+                await _send_once(lambda chunk=chunk: msg.reply_text(chunk))
         except BadRequest:
             if not extra:
                 raise
             log.warning("quoted reply rejected, sending without quote", exc_info=True)
-            await _send_retrying(lambda chunk=chunk: msg.reply_text(chunk))
+            await _send_once(lambda chunk=chunk: msg.reply_text(chunk))
 
 
 def _quote_of(msg) -> ReplyParameters | None:
@@ -130,6 +158,7 @@ def _quote_of(msg) -> ReplyParameters | None:
 
 async def send_voice_caption(msg, audio: bytes, caption: str, reply_markup=None) -> Any:
     """Голосовой ответ с подписью; разметка в подписи та же, что в тексте."""
+    log.info("voice send bytes=%d", len(audio))
     plain, entities = render_markup(caption)
     if not entities:
         return await _send_retrying(lambda: msg.reply_voice(
@@ -634,9 +663,54 @@ def extract_loud_marker(text: str) -> tuple[bool, str]:
     return True, cleaned.strip()
 
 
+# Метка тишины: ран сторожа или слушателя, где от Ивана ничего не нужно, не шлёт
+# ничего, строка остаётся в журнале и всплывает утром или вечером (решение Ивана
+# 01.11.2026: «сторож молчит, значит нового нет»).
+_QUIET_RE = re.compile(r"[ \t]*<<QUIET>>")
+
+
+def extract_quiet_marker(text: str) -> tuple[bool, str]:
+    """Есть ли <<QUIET>> вне кодовых блоков → (да или нет, текст без меток)."""
+    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    found = False
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal found
+        if any(start <= m.start() < end for start, end in fences):
+            return m.group(0)
+        found = True
+        return ""
+
+    cleaned = _QUIET_RE.sub(_sub, text)
+    return (True, cleaned.strip()) if found else (False, text)
+
+
+# Сколько отметок одного вида называть в футере; остальные числом (журнал audit полный).
+_RUN_NOTES_SHOWN = 8
+
+
+def format_run_notes(items: list[tuple[str, str]]) -> list[str]:
+    """Отметки хода (approval.add_run_note) строками футера: по строке на
+    вид, повторы один раз, в порядке появления."""
+    groups: dict[str, list[str]] = {}
+    for kind, item in items:
+        seen = groups.setdefault(kind, [])
+        if item not in seen:
+            seen.append(item)
+    labels = {"auto": _("✍️ без карточки: {items}"), "memory": _("💾 в память: {items}")}
+    lines = []
+    for kind, seen in groups.items():
+        text = ", ".join(seen[:_RUN_NOTES_SHOWN])
+        if len(seen) > _RUN_NOTES_SHOWN:
+            text += _(" и ещё {n}").format(n=len(seen) - _RUN_NOTES_SHOWN)
+        lines.append(labels.get(kind, kind + ": {items}").format(items=text))
+    return lines
+
+
 async def send_cost_footer(
     cfg: Config, update: Update, result: ClaudeResult, model_note: str = "", *, warn_reset: bool = True,
-) -> None:
+    notes: list[str] | tuple[str, ...] = (),
+) -> bool:
     """Короткий футер: цена ответа, сессии и контекст. model_note это
     напоминание о недефолтной модели ветки («🤖 opus ⏳»), пусто на дефолте;
     в теме задачи к нему дописан расход задачи («задача ≈$1.35»).
@@ -647,15 +721,35 @@ async def send_cost_footer(
     (claude_runner._answer_cost), контекст это вход последнего запроса
     основного диалога, а не сумма по запросам рана, как до 13.10.2026: по ней
     предупреждение срабатывало почти всегда (ревью Codex). Шлём только при
-    расходе по сессии: $0-ошибки, cancel, 404 без футера."""
+    расходе по сессии: $0-ошибки, cancel, 404 без футера.
+
+    notes: служебные строки хода (новая сессия, запись без карточки, подача в
+    память), идут последними строками футера и шлют его и без расхода (ux2,
+    01.11.2026). True: футер отправлен, notes доставлены."""
+    footer = _cost_line(cfg, result, model_note, warn_reset)
+    text = "\n".join(([footer] if footer else []) + list(notes))
+    if not text:
+        return False
+    try:
+        # Без звука: футер идёт сразу за ответом, второй звонок на один ход
+        # лишний (аудит удобства 31.10.2026).
+        await update.message.reply_text(text, disable_notification=True)
+        return True
+    except Exception:
+        log.exception("cost footer send failed")
+        return False
+
+
+def _cost_line(cfg: Config, result: ClaudeResult, model_note: str, warn_reset: bool) -> str:
+    """Строка расхода футера; пусто, если сказать нечего."""
     if not cfg.show_cost_footer or result.session_cost_usd <= 0:
-        return
+        return ""
     warn = warn_reset and cfg.context_warn_tokens > 0 and result.context_tokens >= cfg.context_warn_tokens
     # Дешёвый ответ без строки (решение Ивана 22.10.2026); строка остаётся,
     # если есть что сказать: большой контекст, недефолтная модель, расход задачи.
     if (result.cost_usd is not None and result.cost_usd < getattr(cfg, "cost_footer_min_usd", 0.0)
             and not warn and not model_note):
-        return
+        return ""
     if result.cost_usd is not None:
         cost = _("💸 ${cost:.2f} (сессия ${session:.2f})").format(
             cost=result.cost_usd, session=result.session_cost_usd)
@@ -675,12 +769,9 @@ async def send_cost_footer(
     footer = cost + (f" · {ctx}" if ctx else "")
     if model_note:
         footer += f" · {model_note}"
-    if warn_reset and cfg.context_warn_tokens > 0 and result.context_tokens >= cfg.context_warn_tokens:
+    if warn:
         footer += _("\n⚠️ контекст большой: /reset удешевит и ускорит следующие ответы")
-    try:
-        await update.message.reply_text(footer)
-    except Exception:
-        log.exception("cost footer send failed")
+    return footer
 
 
 # Случай 25.10.2026: GPX 2 МБ загружен, но ответ Telegram не пришёл за 5 с
@@ -699,7 +790,7 @@ async def send_files(update: Update, files: list[Path]) -> None:
         except Exception as e:
             log.exception("SEND_FILE failed for %s", fpath)
             # Тайм-аут чтения: файл обычно загружен, не пришло подтверждение (но не всегда).
-            if isinstance(e.__cause__, httpx.ReadTimeout):
+            if is_unconfirmed(e):
                 text = _("⚠️ Telegram не подтвердил отправку файла {name}: он мог дойти, проверь чат выше")
             else:
                 text = _("⚠️ не удалось отправить файл {name}")
@@ -709,15 +800,27 @@ async def send_files(update: Update, files: list[Path]) -> None:
                 pass
 
 
+def _fit_utf16(text: str, limit: int) -> int:
+    """Сколько первых знаков text умещается в limit единиц UTF-16."""
+    used = 0
+    for i, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            return i
+    return len(text)
+
+
 def split_for_telegram(text: str, limit: int) -> list[str]:
-    if len(text) <= limit:
+    # Лимит Telegram в единицах UTF-16, эмодзи вне BMP по две: кусок по
+    # числу знаков отвергался целиком (аудит очереди 31.10.2026).
+    if _utf16_len(text) <= limit:
         return [text]
     out: list[str] = []
     remaining = text
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit)
-        if cut < limit // 2:  # мало что выиграли — режем жёстко
-            cut = limit
+    while (fit := max(_fit_utf16(remaining, limit), 1)) < len(remaining):
+        cut = remaining.rfind("\n", 0, fit)
+        if cut < fit // 2:  # мало что выиграли — режем жёстко
+            cut = fit
         out.append(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
     if remaining:

@@ -65,7 +65,6 @@ class SecretFileReadTests(_Base):
             f"cat {_HOME}/.claude/.credentials.json",
             "cat ~/.ssh/id_ed25519",
             "cat ~/.ssh/config",
-            "ls ~/.ssh",
             "cat /proc/self/environ",
             "strings /proc/1/environ",
             "cat ~/.codex/auth.json",
@@ -94,6 +93,8 @@ class SecretFileReadTests(_Base):
 
     def test_ordinary_reads_still_pass(self) -> None:
         self.ok(
+            # Только имена и сведения о файлах, без содержимого (П1 guard-2.md).
+            "ls ~/.ssh",
             "sed -n 1,20p README.md",
             "cat src/x.py",
             "cat .env.example",

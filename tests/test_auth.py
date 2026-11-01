@@ -302,17 +302,34 @@ class TelegramAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(CODE, str(ctx.bot.send_message.call_args_list))
 
     async def test_stale_edited_group_and_foreign_codes_never_enter_model(self):
-        for update in (self.update(CODE), self.update(CODE, edited=True), self.update(CODE, chat_id=-1), self.update(CODE, user_id=2)):
-            ctx = self.setup_context()
-            await self.guard(update, ctx)
-            if update.edited_message or update.effective_chat.id < 0 or update.effective_user.id != 1:
-                ctx.application.bot_data["login_manager"].submit.assert_not_awaited()
+        # Без входа код не уходит никуда; при идущем входе Ивана правка,
+        # группа и чужой человек тоже не подают код (раньше проверка стояла
+        # под if и первый случай не проверялся, вход в тесте не шёл вовсе).
+        for session in (None, LoginSession("claude", 1, 1, accepts_code=True)):
+            for update in (self.update(CODE), self.update(CODE, edited=True), self.update(CODE, chat_id=-1),
+                           self.update(CODE, user_id=2)):
+                own = (update.message is not None and update.effective_chat.id == 1
+                       and update.effective_user.id == 1)
+                if own and session is not None:
+                    continue  # обычный код Ивана во время входа: другой тест
+                with self.subTest(session=bool(session), update=update.to_dict()):
+                    ctx = self.setup_context(session=session)
+                    await self.guard(update, ctx)
+                    submit = ctx.application.bot_data["login_manager"].submit
+                    if own:  # без входа submit ответит «нет ожидающего входа»
+                        submit.assert_awaited_once_with(1, 1, CODE)
+                    else:
+                        submit.assert_not_awaited()
 
     async def test_quoted_code_and_other_commands_during_login_are_blocked(self):
         ctx = self.setup_context(session=LoginSession("claude", 1, 1))
         for text in ("hello", "/compose hello", "/at 5m hello"):
             await self.guard(self.update(text), ctx)
-        await self.guard(self.update("hello", quote=f"/authcode {CODE}"), self.setup_context())
+        ctx.application.bot_data["login_manager"].submit.assert_not_awaited()
+        ctx = self.setup_context()
+        await self.guard(self.update("hello", quote=f"/authcode {CODE}"), ctx)
+        ctx.application.bot_data["login_manager"].submit.assert_not_awaited()
+        self.assertNotIn(CODE, str(ctx.bot.send_message.call_args_list))
 
     async def test_hex_hash_without_login_reaches_model(self):
         # Хеш коммита (40) и sha256 (64) вне входа уходят модели, во время

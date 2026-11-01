@@ -129,6 +129,30 @@ class ReviewFindingsTests(unittest.TestCase):
         self.assertEqual(level("rtk grep --pre=sh x ."), ORANGE)
         self.assertFalse(classify("Bash", {"command": "rtk proxy grep -n -E 'a|b' README.md"}).secret)
 
+    def test_systemctl_environment_is_secret(self) -> None:
+        # `Environment=` службы со значениями токенов (ревью 29.10.2026).
+        for cmd in ("systemctl --user show x", "systemctl show x -p Environment",
+                    "systemctl show x -pEnvironment", "systemctl show x --property=Id,Environment",
+                    "systemctl show x -p Id -p UnsetEnvironment", "systemctl cat x",
+                    "systemctl --user show-environment", "sudo systemctl show x",
+                    "ssh pc systemctl --user cat x", "systemctl --timestamp utc cat x",
+                    "systemctl --user --when 5 show x", "systemctl dump",
+                    "systemctl --user dump x", "systemd-analyze --user dump",
+                    "systemctl show x -p SetCredential", "systemctl show x -p ExecStart",
+                    r"systemctl show x -p 'Environ\ment'", "systemctl -P Environment show x",
+                    "systemctl show x -p Id -P Environment", "systemctl show x -p Id -aPEnvironment",
+                    "systemctl --prop Environment show x -p Id", "systemctl --ty service show x",
+                    "systemctl --timestamp utc show-environment"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(classify("Bash", {"command": cmd}).secret)
+        for cmd in ("systemctl show x -p Id,MainPID", "systemctl --user status x",
+                    "systemctl --user list-timers", "systemctl --user show x -p MainPID --value",
+                    "systemctl --user show x -p ActiveState -p SubState",
+                    "systemctl --user show x -p ExecMainStartTimestamp",
+                    "systemctl show x -P MainPID"):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(classify("Bash", {"command": cmd}).secret)
+
     def test_card_never_exceeds_telegram_limit(self) -> None:
         path = "/tmp/" + "/".join(["a" * 100] * 25)
         card = _format_tool_call("Write", {"file_path": path, "content": "<" * 2000}, "s")

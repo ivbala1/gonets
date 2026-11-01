@@ -408,8 +408,11 @@ class TaskTopicModelTests(unittest.TestCase):
     def test_exec_goes_through_the_same_run(self) -> None:
         """Выполнение после «Делай» идёт через _dispatch_to_claude, то есть
         через тот же run_claude с model=_model_for(...)."""
-        src = (Path(__file__).resolve().parents[1] / "src/claude_tg_bot/bot.py").read_text()
-        self.assertIn("await _dispatch_to_claude(upd, ctx, tasks.exec_prompt(task)", src)
+        pkg = Path(__file__).resolve().parents[1] / "src/claude_tg_bot"
+        src = (pkg / "bot.py").read_text()
+        # Темы задач с 01.11.2026 в tg_tasks.py, имена bot там через _b.
+        self.assertIn("await _b._dispatch_to_claude(upd, ctx, tasks.exec_prompt(task)",
+                      (pkg / "tg_tasks.py").read_text())
         self.assertEqual(src.count("await run_claude("), src.count("model=_model_for(ctx, cfg, chat_key)"))
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -578,3 +579,63 @@ class OtklikPickTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OtklikBatchTests(unittest.TestCase):
+    """«✅ Все N»: пачка одобряет только то, что показано, с той же сверкой."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.recs = []
+        for n in (1, 2, 3):
+            rec = otklik.new_record(f"Роль {n}", "hh", f"текст {n}")
+            rec.update(status="pending", chat_id=5, message_id=100 + n, source="5")
+            otklik.save(self.base, rec)
+            self.recs.append(rec)
+        path = otklik._batch_path(self.base, "b" * 12)
+        path.parent.mkdir()
+        path.write_text(json.dumps({"chat_id": 5, "message_id": 200, "items": [
+            {"id": r["id"], "sha": r["sha"], "gen": otklik.gen_of(r), "chat_id": 5, "message_id": r["message_id"]}
+            for r in self.recs]}), encoding="utf-8")
+
+    def test_all_approved(self) -> None:
+        picked = otklik.pick_all(self.base, "b" * 12, 5, 200)
+        self.assertEqual({r["status"] for r in picked}, {"approved"})
+        self.assertEqual(len(picked), 3)
+
+    def test_decided_one_is_skipped_not_approved(self) -> None:
+        r = self.recs[0]
+        otklik.pick(self.base, r["id"], r["sha"], otklik.gen_of(r), "s", 5, r["message_id"])
+        picked = otklik.pick_all(self.base, "b" * 12, 5, 200)
+        self.assertEqual(len(picked), 2)
+        self.assertEqual(otklik.load(self.base, r["id"])["status"], "skipped")
+
+    def test_second_press_and_foreign_message_refused(self) -> None:
+        with self.assertRaises(otklik.Refused):
+            otklik.pick_all(self.base, "b" * 12, 5, 999)
+        otklik.pick_all(self.base, "b" * 12, 5, 200)
+        with self.assertRaises(otklik.Refused):
+            otklik.pick_all(self.base, "b" * 12, 5, 200)
+
+    def test_callback_does_not_match_single_pattern(self) -> None:
+        self.assertEqual(otklik.parse_batch_callback("otka:" + "a" * 12), "a" * 12)
+        self.assertIsNone(otklik.parse_callback("otka:" + "a" * 12))
+
+    def test_cli_takes_only_fresh_and_button_goes_last(self) -> None:
+        old = otklik.new_record("Старый", "hh", "текст")
+        old.update(status="pending", chat_id=5, message_id=99, source="5", created="2026-01-01T00:00:00+04:00")
+        otklik.save(self.base, old)
+        calls = []
+
+        def api(method, payload):
+            calls.append(method)
+            return {"result": {"message_id": 200}}
+
+        with patch.object(otklik, "_bot_api", api):
+            self.assertEqual(otklik._cmd_all(self.base, 5, "5"), 0)
+        self.assertEqual(calls, ["sendMessage", "editMessageReplyMarkup"])
+        batches = [p for p in (self.base / "batches").glob("*.json") if p.stem != "b" * 12]
+        ids = {i["id"] for i in json.loads(batches[0].read_text(encoding="utf-8"))["items"]}
+        self.assertEqual(ids, {r["id"] for r in self.recs})

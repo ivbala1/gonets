@@ -627,8 +627,8 @@ class QueueTests(_TaskBase):
         msg.text = "стоп, не трогай CHANGELOG"
         later = asyncio.ensure_future(botmod.on_text(_update(msg), self.ctx))
         await asyncio.sleep(0.05)
-        self.assertTrue(any(_("⏳ claude ещё работает над прошлым запросом, этот встанет в очередь. "
-                               "/cancel прервёт текущий, «!текст» прервёт его и сразу отправит поправку") in t
+        self.assertTrue(any(_("⏳ ещё отвечаю на прошлое: новое уйдёт одним следующим сообщением. "
+                               "«стоп» остановит, «!текст» прервёт и сразу отправит поправку") in t
                              for t in self.topic_texts(msg)))
         self.gate.set()
         await first
@@ -679,13 +679,13 @@ class QueueTests(_TaskBase):
         self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
         self.assertEqual(self.task("t7-5")["status"], "thinking")
 
-    async def test_two_waiting_messages_last_one_proposes(self) -> None:
-        # Два уточнения ждут замка темы: проект даёт ответ на последнее, а не
-        # первый обработчик с чужим номером хода (ревью Codex 16.10)
+    async def test_two_waiting_messages_go_in_one_turn(self) -> None:
+        # Два уточнения, пришедшие, пока тема занята, уходят одним ходом с
+        # рамкой (пачка хода, решение Ивана 29.10.2026), проект один.
         self.put_command()
         lock = botmod._chat_lock(self.ctx, f"{GROUP}:{THREAD}")
         await lock.acquire()
-        self.replies = ["Понял так: только README\n<<DO>>", "Понял так: README и CHANGELOG\n<<DO>>"]
+        self.replies = ["Понял так: README и CHANGELOG\n<<DO>>"]
         one, two = _msg(), _msg()
         one.text, two.text = "только README", "и CHANGELOG тоже"
         first = asyncio.ensure_future(botmod.on_text(_update(one), self.ctx))
@@ -697,10 +697,14 @@ class QueueTests(_TaskBase):
         await second
         await self.settle()
         task = self.task("t7-5")
+        self.assertEqual(len(self.runs), 1)
+        prompt = self.runs[0]["prompt"]
+        self.assertIn(_(botmod.PACK_NOTE), prompt)
+        self.assertLess(prompt.index("только README"), prompt.index("и CHANGELOG тоже"))
         self.assertEqual(task["status"], "proposed")
         self.assertIn("CHANGELOG", task["plan"])
-        self.assertEqual(self.do_markups(one), [])
-        self.assertEqual(len(self.do_markups(two)), 1)
+        self.assertEqual(len(self.do_markups(one)), 1)
+        self.assertEqual(self.do_markups(two), [])
 
     async def test_ask_button_answer_drops_proposal(self) -> None:
         # Ответ кнопкой вопроса идёт мимо касания: проект всё равно снимается (ревью Codex 16.10)
@@ -1379,7 +1383,7 @@ class ReviewFixTests(_TaskBase):
 
     async def test_no_proposal_while_ivan_messages_gather(self) -> None:
         self.put_command()
-        self.bot_data["gather_batches"] = {f"{GROUP}:{THREAD}": SimpleNamespace(sealed=False, cancelled=False)}
+        self.bot_data["gather_batches"] = {f"{GROUP}:{THREAD}": SimpleNamespace(sealed=False, cancelled=False, items=[None])}
         self.replies = [f"{PLAN}\n<<DO>>"]
         await botmod._dispatch_to_claude(_update(_msg()), self.ctx, "что с README?", send_voice_reply=False)
         await self.settle()

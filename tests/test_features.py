@@ -215,8 +215,8 @@ class VoiceSeriesTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(all(c.kwargs["reply_markup"] is None for c in msg.reply_voice.call_args_list))
 
-    def _series(self, reply: str, tts=None, max_chars: int = 4000):
-        msg = SimpleNamespace(reply_voice=AsyncMock(), reply_text=AsyncMock())
+    def _series(self, reply: str, tts=None, max_chars: int = 4000, voice=None):
+        msg = SimpleNamespace(reply_voice=voice or AsyncMock(), reply_text=AsyncMock())
         ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
         with tempfile.TemporaryDirectory() as tmp:
             cfg = SimpleNamespace(telegram_caption_limit=1024, voice_reply_max_chars=max_chars,
@@ -254,6 +254,78 @@ class VoiceSeriesTests(unittest.TestCase):
         ok, msg = self._series("Короткий ответ.", tts=AsyncMock(side_effect=RuntimeError))
         self.assertFalse(ok)
         msg.reply_voice.assert_not_awaited()
+
+    @staticmethod
+    def _unconfirmed() -> Exception:
+        err = TimedOut()
+        err.__cause__ = httpx.ReadTimeout("")
+        return err
+
+    def _note(self, msg) -> str:
+        # Записка с кнопкой одна, ответ текстом не повторяется.
+        msg.reply_text.assert_awaited_once()
+        note = msg.reply_text.call_args
+        self.assertTrue(note.kwargs["reply_markup"].inline_keyboard[0][0].callback_data.startswith("vtext:"))
+        return note.args[0]
+
+    def test_unconfirmed_voice_no_text_copy(self) -> None:
+        # Случаи 30-31.10.2026: Telegram не подтвердил голосовое за 5 с, бот
+        # послал ответ текстом, голосовое всё равно пришло.
+        ok, msg = self._series("Короткий ответ.", voice=AsyncMock(side_effect=self._unconfirmed()))
+        self.assertTrue(ok)
+        msg.reply_voice.assert_awaited_once()
+        self.assertNotIn("Короткий ответ.", self._note(msg))
+
+    def test_unconfirmed_part_series_goes_on(self) -> None:
+        reply = "\n\n".join(f"Абзац {i}. " + "слово " * 150 for i in range(3))
+        n = len(plan_voice_series(reply, 1024)[0])
+        self.assertGreater(n, 2)
+        ok, msg = self._series(reply, voice=AsyncMock(side_effect=[None, self._unconfirmed()] + [None] * n))
+        self.assertTrue(ok)
+        self.assertEqual(msg.reply_voice.await_count, n)
+        note = self._note(msg)
+        self.assertIn(f"2/{n}", note)
+        self.assertNotIn("Абзац", note)
+
+    def test_unconfirmed_part_rest_as_text(self) -> None:
+        # Куски сверх лимита синтеза уходят текстом, кроме неподтверждённого.
+        reply = "\n\n".join(f"Абзац {i}. " + "слово " * 150 for i in range(4))
+        ok, msg = self._series(reply, max_chars=1000, voice=AsyncMock(side_effect=self._unconfirmed()))
+        self.assertTrue(ok)
+        self.assertEqual(msg.reply_text.await_count, 2)
+        self.assertTrue(msg.reply_text.await_args_list[0].kwargs["reply_markup"])
+        rest = msg.reply_text.await_args_list[1].args[0]
+        self.assertIn("Абзац 3.", rest)
+        self.assertNotIn("Абзац 0.", rest)
+
+    def test_unconfirmed_save_fails_sends_text(self) -> None:
+        # Кнопке нечего открыть: ответ важнее дубля.
+        with patch.object(botmod, "save_full_text", side_effect=OSError("disk full")):
+            ok, msg = self._series("Короткий ответ.", voice=AsyncMock(side_effect=self._unconfirmed()))
+        self.assertTrue(ok)
+        msg.reply_text.assert_awaited_once()
+        self.assertEqual(msg.reply_text.call_args.args[0], "Короткий ответ.")
+
+    def test_unconfirmed_note_failed_sends_text(self) -> None:
+        msg = SimpleNamespace(reply_voice=AsyncMock(side_effect=self._unconfirmed()),
+                              reply_text=AsyncMock(side_effect=[NetworkError("down"), None]))
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(telegram_caption_limit=1024, voice_reply_max_chars=4000,
+                                  state_dir=Path(tmp), telegram_text_limit=4000,
+                                  large_reply_as_file_threshold=12000)
+            with patch.object(botmod, "synthesize", AsyncMock(return_value=b"ogg")):
+                ok = asyncio.run(botmod._send_voice_series(
+                    cfg, ctx, SimpleNamespace(message=msg), 42, object(), "Короткий ответ."))
+        self.assertTrue(ok)
+        self.assertEqual(msg.reply_text.call_args.args[0], "Короткий ответ.")
+
+    def test_other_timeout_still_falls_back_to_text(self) -> None:
+        err = TimedOut()
+        err.__cause__ = httpx.WriteTimeout("")
+        ok, msg = self._series("Короткий ответ.", voice=AsyncMock(side_effect=err))
+        self.assertFalse(ok)
+        msg.reply_text.assert_not_awaited()
 
     def test_full_text_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,9 +435,23 @@ class SendReplyInlineCodeTests(unittest.TestCase):
         err = self._net_err(TimedOut(), httpx.ReadTimeout(""))
         msg = SimpleNamespace(reply_text=AsyncMock(side_effect=[err, None]))
         with patch("claude_tg_bot.replies.asyncio.sleep", AsyncMock()):
-            with self.assertRaises(TimedOut):
-                asyncio.run(send_reply_text(self._cfg(), SimpleNamespace(message=msg), "просто текст"))
+            asyncio.run(send_reply_text(self._cfg(), SimpleNamespace(message=msg), "просто текст"))
         self.assertEqual(msg.reply_text.await_count, 1)
+
+    def test_read_timeout_keeps_following_chunks(self) -> None:
+        # Хвост длинного ответа не теряется из-за таймаута на его начале.
+        err = self._net_err(TimedOut(), httpx.ReadTimeout(""))
+        msg = SimpleNamespace(reply_text=AsyncMock(side_effect=[err, None]))
+        cfg = SimpleNamespace(**{**vars(self._cfg()), "telegram_text_limit": 20})
+        asyncio.run(send_reply_text(cfg, SimpleNamespace(message=msg), "слово " * 6))
+        self.assertEqual(msg.reply_text.await_count, 2)
+
+    def test_read_timeout_on_file_reply_not_raised(self) -> None:
+        err = self._net_err(TimedOut(), httpx.ReadTimeout(""))
+        msg = SimpleNamespace(reply_document=AsyncMock(side_effect=err), reply_text=AsyncMock())
+        cfg = SimpleNamespace(**{**vars(self._cfg()), "large_reply_as_file_threshold": 5})
+        asyncio.run(send_reply_text(cfg, SimpleNamespace(message=msg), "длинный текст"))
+        msg.reply_document.assert_awaited_once()
 
     def test_retry_gives_up(self) -> None:
         errs = [self._net_err(NetworkError("httpx.ConnectError: "), httpx.ConnectError("")) for _ in range(3)]
@@ -937,3 +1023,11 @@ class DiffCardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuietMarkerTests(unittest.TestCase):
+    def test_marker_removed_outside_code(self) -> None:
+        from claude_tg_bot.replies import extract_quiet_marker
+        self.assertEqual(extract_quiet_marker("<<QUIET>>"), (True, ""))
+        self.assertEqual(extract_quiet_marker("текст"), (False, "текст"))
+        self.assertEqual(extract_quiet_marker("```\n<<QUIET>>\n```"), (False, "```\n<<QUIET>>\n```"))

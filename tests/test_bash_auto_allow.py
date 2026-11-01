@@ -577,7 +577,7 @@ class SystemAndGhReadTests(unittest.TestCase):
             "systemctl --user status claude-tg-bot.service --no-pager",
             "systemctl --user show x -p ActiveEnterTimestamp",
             "systemctl --user list-timers --all", "systemctl status nginx",
-            "systemctl --user is-active x", "systemctl cat x --property=Id",
+            "systemctl --user is-active x", "systemctl show x --property=Id,MainPID",
             "gh pr list --state open --limit 30", "gh pr view 12 --json title -q .title",
             "gh issue view 3 -R owner/repo", "gh run list", "gh repo view",
         ):
@@ -590,6 +590,14 @@ class SystemAndGhReadTests(unittest.TestCase):
             "systemctl -Hprod status x", "systemctl --machine=m status x",
             "systemctl --user restart x", "systemctl --user edit x", "systemctl status 'x'*",
             "systemctl --user --unknown status x", "systemctl",
+            # Окружение службы со значениями (ревью 29.10.2026).
+            "systemctl --user show x", "systemctl show x -p Environment",
+            "systemctl show x --property=Id,Environment", "systemctl show x -p Id -p Environment",
+            "systemctl show x --property Environment", "systemctl show x -p ''",
+            "systemctl --user cat x", "systemctl cat x --property=Id",
+            "systemctl show-environment", "systemctl --user show x -p",
+            "systemctl show x -p SetCredential", "systemctl show x -p ExecStart",
+            r"systemctl show x -p 'Environ\ment'", r"systemctl show x --property='Environ\ment'",
             "gh pr view 12 --web", "gh pr view 12 '--web'", "gh pr checks 12 -w",
             "gh pr checks 12 -iw", "gh run view 1 --log", "gh run view 1 --log-failed",
             "gh pr merge 12", "gh api -X POST repos/x/y", "gh pr list *", "gh alias set x y",

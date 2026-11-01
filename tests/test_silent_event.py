@@ -317,9 +317,14 @@ class SilentWakeRunTests(unittest.IsolatedAsyncioTestCase):
         task = await self._event({"source": "Домовой", "title": "Вечер", "wake": True,
                                   "prompt": "вечер"})
         await task
-        loud = self._loud()
-        # Уведомление, ответ и футер.
-        self.assertEqual(len(loud), 3)
+        sent = self._loud()
+        # Уведомление и ответ со звуком; футер без звука всегда (аудит
+        # удобства 31.10.2026).
+        footer = [d for _e, d in sent if (d.get("text") or "").startswith("💸")]
+        self.assertEqual(len(footer), 1)
+        self.assertIs(footer[0].get("disable_notification"), True)
+        loud = [(e, d) for e, d in sent if d not in footer]
+        self.assertEqual(len(loud), 2)
         for endpoint, data in loud:
             with self.subTest(endpoint=endpoint, text=(data.get("text") or "")[:30]):
                 self.assertFalse(data.get("disable_notification", False))

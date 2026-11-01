@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import limits
+from . import limits, runs
 from .auth import is_auth_error
 from .config import agent_env
 from .i18n import _
@@ -148,15 +148,26 @@ class SessionStore:
         if path.exists():
             try:
                 raw = json.loads(path.read_text() or "{}")
-            except json.JSONDecodeError:
-                log.warning("sessions file %s is corrupt, starting fresh", path)
+            except ValueError:  # не JSON или не UTF-8: бот должен стартовать
+                # Копия рядом: первая же запись перезапишет файл, и сессии
+                # всех тем пропали бы без следа (аудит 31.10.2026).
+                kept = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+                try:
+                    os.replace(path, kept)
+                except OSError:
+                    kept = path
+                log.warning("sessions file %s is corrupt, kept as %s, starting fresh", path, kept)
                 raw = {}
             now = time.time()
             for k, v in (raw.items() if isinstance(raw, dict) else []):
                 if isinstance(v, dict):
                     val = str(v.get("v", ""))
                     if val:
-                        self.data[k] = {"v": val, "ts": float(v.get("ts", 0.0) or 0.0)}
+                        try:
+                            ts = float(v.get("ts", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            ts = 0.0
+                        self.data[k] = {"v": val, "ts": ts}
                 elif isinstance(v, str) and v:
                     # legacy голая строка — мигрируем, ts=now (grace-окно).
                     self.data[k] = {"v": v, "ts": now}
@@ -228,6 +239,8 @@ class ClaudeResult:
     # Ответвление с точки вопроса не открылось: сессию вопроса сжали (точки в
     # ней больше нет) или её файла нет. Дело тогда отвечает по-старому.
     fork_failed: bool = False
+    # Процесс снят сигналом (/cancel, «стоп», «!»-поправка, /reset force).
+    signalled: bool = False
 
 
 @dataclass
@@ -922,6 +935,8 @@ async def run_claude(
             # Обратная мапа: session_id -> destination (chat_id, thread_id).
             # Нужна handle_approve, который из hook payload получает только sid.
             session_targets[active_sid] = (target_chat_id, target_thread_id)
+        # Номер этого запуска: разрешение на план живёт до его конца (runs.py).
+        run_id = runs.start(active_sid)
         if unattended_sids is not None:
             # Пометка «человека за клавиатурой нет»: handle_approve не применит
             # к этой сессии открытое окно /auto.
@@ -953,6 +968,7 @@ async def run_claude(
                 session_registry[chat_key] = real
             if session_targets is not None and session_targets.pop(old, None) is not None:
                 session_targets[real] = (target_chat_id, target_thread_id)
+            runs.rebind(old, real, run_id)
             for marks in (unattended_sids, untrusted_sids):
                 if marks is not None and old in marks:
                     marks.discard(old)
@@ -1133,6 +1149,7 @@ async def run_claude(
                 session_registry.pop(chat_key, None)
             if session_targets is not None:
                 session_targets.pop(active_sid, None)
+            runs.end(active_sid, run_id)
             if unattended_sids is not None:
                 unattended_sids.discard(active_sid)
             if untrusted_sids is not None:
@@ -1232,6 +1249,10 @@ async def run_claude(
             return ClaudeResult(
                 text=_("⛔ отменено (signal {signal})").format(signal=att.returncode),
                 session_id=att.active_sid, is_error=True, texts=tuple(att.result_texts),
+                # По requests бот знает, что сессия уже на диске (сохранение
+                # sid свежей сессии после отмены, аудит 10.2026).
+                **_request_fields(att),
+                signalled=True,
             )
         # Часть фатальных ошибок claude (refusal, недоступная модель, лимиты, API)
         # уходит в stdout, а не в stderr — в stream-json это финальное событие
@@ -1282,11 +1303,15 @@ async def run_claude(
         raw = att.stdout.decode(errors="replace")
         log.warning("claude stream без result-события; first 200 chars: %r", raw[:200])
         # session_id не узнаем от claude — возвращаем тот, с которым запустились.
-        # raw — NDJSON-события, пользователю целиком не показываем.
+        # raw — NDJSON-события, пользователю их не показываем: раньше уходили
+        # первые 1000 знаков сырого потока как обычный ответ (аудит 10.2026).
+        # Это ошибка рана: такой ответ не становится проектом задачи и итогом
+        # выполнения, а sid свежей сессии бот сохранит по requests.
         return ClaudeResult(
-            text=raw[:1000] or _("[пустой ответ]"),
-            session_lost=not att.resumed,
-            session_id=att.active_sid,
+            text=_("⚠️ claude завершился без итогового ответа (rc={rc}), подробности в журнале бота").format(
+                rc=att.returncode),
+            session_id=att.active_sid, is_error=True, texts=tuple(att.result_texts),
+            **_request_fields(att),
         )
 
     result_text = out.get("result") or out.get("response") or _("[пустой ответ]")

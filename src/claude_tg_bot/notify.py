@@ -32,18 +32,20 @@ from .i18n import _
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI-обёртка: код возврата 0/1. message_id не нужен, см. send_message."""
-    rc, _unused = _run(argv)
+    """CLI-обёртка: код возврата 0/1. message_id не нужен, см. send_message.
+    Из командной строки (так зовёт агент) `--chat-id` только в чаты бота."""
+    rc, _unused = _run(argv, any_chat=False)
     return rc
 
 
 def send_message(argv: list[str]) -> tuple[int, int | None]:
     """То же, что main, но отдаёт ещё и message_id ПЕРВОГО отправленного чанка
-    (якорь, по которому отправитель может узнать ответ человека)."""
+    (якорь, по которому отправитель может узнать ответ человека). Скиллы
+    шлют в свои чаты из .env (NEWS_TG_CHAT_ID и др.), их не сверяем."""
     return _run(argv)
 
 
-def _run(argv: list[str] | None = None) -> tuple[int, int | None]:
+def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, int | None]:
     parser = argparse.ArgumentParser(prog="claude_tg_bot.notify", add_help=True)
     parser.add_argument("text", nargs="*", help="текст; пусто = читается stdin")
     parser.add_argument("--chat-id", type=int, default=None, help="целевой чат (default: личка)")
@@ -113,6 +115,14 @@ def _run(argv: list[str] | None = None) -> tuple[int, int | None]:
 
     thread_id: int | None
     if args.chat_id is not None:
+        # Только чаты бота, как POST /event: личка разрешённого пользователя
+        # или группа из TELEGRAM_ALLOWED_CHAT_IDS. Агент без карточки иначе
+        # писал бы ботом в любую группу, где бот состоит (задание guard2).
+        if not any_chat and args.chat_id not in cfg.allowed_chat_ids \
+                and args.chat_id not in cfg.allowed_user_ids:
+            print(_("notify: чат {chat} не из разрешённых (TELEGRAM_ALLOWED_CHAT_IDS)").format(
+                chat=args.chat_id), file=sys.stderr)
+            return 1, None
         chat_id, thread_id = args.chat_id, args.thread_id
     else:
         chat_id, thread_id = cfg.primary_chat_id, None
@@ -166,6 +176,13 @@ def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: 
         # bot-токеном и через traceback утёк бы в journald вызывающих юнитов.
         try:
             r = httpx.post(url, json=payload, timeout=10.0)
+        except httpx.ReadTimeout:
+            # Запрос ушёл, ответа нет: часть обычно доходит (случаи 30-31.10.2026,
+            # replies.is_unconfirmed). Код 1 давал повтор вызывающим (сводка
+            # чатов слала себя ещё раз) и обрывал остаток (аудит outbound).
+            print(_("notify: Telegram не подтвердил часть {n}, не повторяю: она могла дойти").format(
+                n=idx + 1), file=sys.stderr)
+            continue
         except httpx.HTTPError as e:
             print(f"notify: HTTP error: {type(e).__name__}", file=sys.stderr)
             _print_id_on_failure(args.pin, first_message_id)
