@@ -123,9 +123,16 @@ class RunClaudeSpawnTests(unittest.TestCase):
         self.assertEqual(self._values(args, "--disallowedTools"), self._values(ordinary, "--disallowedTools"))
         allowed = self._values(args, "--allowedTools")
         self.assertEqual(allowed, list(claude_runner.UNTRUSTED_ALLOWED_TOOLS))
-        # Grep и Glob в --allowedTools добавляют инструменты, которых нет у обычного рана.
-        self.assertFalse({"Grep", "Glob"} & set(allowed))
-        self.assertNotIn("--allowedTools", ordinary)
+        # Grep и Glob в --allowedTools добавляют инструменты в набор: они должны
+        # быть названы обоим ранам, иначе наборы разойдутся (кэш, cc9a712).
+        search = {"Grep", "Glob"}
+        self.assertEqual(search & set(allowed), search & set(self._values(ordinary, "--allowedTools")))
+
+    def test_ordinary_run_gets_search_tools(self) -> None:
+        """Нативный Claude Code без названия в --allowedTools убирает Grep и
+        Glob, и агент ищет через Bash grep -r, а это карточка (03.11.2026)."""
+        args, _ = self._spawn()
+        self.assertEqual(set(self._values(args, "--allowedTools")), {"Grep", "Glob"})
 
     def test_untrusted_run_locks_by_ask(self) -> None:
         args, kwargs = self._spawn_untrusted()
@@ -433,13 +440,21 @@ class HandleApproveWebFetchTests(unittest.TestCase):
 
     def test_public_url_passes(self) -> None:
         self.assertEqual(self._decide("https://api.open-meteo.com/v1/forecast?x=1"),
-                         {"decision": "allow", "reason": "webfetch:auto"})
+                         {"decision": "allow", "reason": "default"})
 
-    def test_local_and_ip_urls_go_to_card(self) -> None:
-        for url in ("http://127.0.0.1:8788/health", "http://localhost/x", "http://192.168.1.50/",
-                    "http://127.0.0.1.nip.io/", "file:///home/u/.env", "http://router.lan/"):
+    def test_local_and_ip_urls_card(self) -> None:
+        # guard3, Н8 (docs/audit-2026-11/guard3-decisions.md): loopback и
+        # IP-литерал причиной «запрос во внутреннюю сеть». Карточка не ушла:
+        # итог deny.
+        for url in ("http://127.0.0.1:8788/health", "http://localhost/x", "http://192.168.1.50/"):
             with self.subTest(url=url):
-                self.assertEqual(self._decide(url)["reason"], "telegram send failed")
+                self.assertEqual(self._decide(url)["decision"], "deny")
+
+    def test_other_local_names_pass(self) -> None:
+        # Прочее без карточки: узкое правило Н8 не берёт имена (nip.io, .lan).
+        for url in ("http://127.0.0.1.nip.io/", "file:///home/u/.env", "http://router.lan/"):
+            with self.subTest(url=url):
+                self.assertEqual(self._decide(url)["decision"], "allow")
 
 
 class SharedSecretWarningTests(unittest.TestCase):
@@ -532,7 +547,9 @@ class HookSettingsDenyEnvTests(unittest.TestCase):
         module = config.HOOK_APPROVE_MODULE
         commands = (f"/v/bin/python -m {module} || true", f"/v/bin/python -m {module}; exit 0",
                     f"echo {module}", f'bash -c "python -m {module}"',
-                    f"/v/bin/python -m {module} --x", f"/v/bin/node -m {module}")
+                    f"/v/bin/python -m {module} --x", f"/v/bin/node -m {module}",
+                    # Без -P текущий каталог первым в sys.path (guard3, Н2).
+                    f"/v/bin/python -m {module}", f"python3 -I -P -m {module}")
         for command in commands:
             with self.subTest(command=command), self.assertRaises(RuntimeError) as cm:
                 self._validate_changed(lambda e, h: h.update(command=command))
@@ -543,7 +560,8 @@ class HookSettingsDenyEnvTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(RuntimeError) as cm:
                 self._validate_changed(lambda e, h: h.update({key: value}))
             self.assertIn("строгой форме", str(cm.exception))
-        for command in (f"python3 -m {module}", f"'/a b/.venv/bin/python3.14' -m {module}"):
+        for command in (f"python3 -P -m {module}", f"'/a b/.venv/bin/python3.14' -P -m {module}",
+                        f"python3 -I -m {module}"):
             with self.subTest(command=command):
                 self._validate_changed(lambda e, h: h.update(command=command, statusMessage="ok"))
 

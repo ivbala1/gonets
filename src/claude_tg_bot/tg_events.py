@@ -83,21 +83,25 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
         finally:
             _b._DEAL_ASKS.reset(deal_token)
             _b._SILENT_RUN.reset(token)
+        noted = False
         if event_id and outcome:
             if outcome == "expired":
                 log.warning("event %s expired while waiting, not started", event_id)
-                await _event_expired_note(app, events.load(store, event_id))
+                noted = await _event_expired_note(app, events.load(store, event_id))
             _event_mark(store, event_id, status="done", outcome=outcome, done_at=time.time())
         key = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
-        if outcome in ("not started", "expired", "error") and _b._is_workshop(cfg, key):
+        if outcome in ("not started", "expired", "error") and not noted and _b._is_workshop(cfg, key):
             # Тема мастерской заглушена: что наряд не запустился (лимит, срок,
-            # сбой), Иван узнаёт в личке (проект Домового 22.10.2026).
+            # сбой), Иван узнаёт в личке (проект Домового 22.10.2026). Строка
+            # «устарело» уже ушла в личку: второй о том же не нужно. Звук по
+            # тишине события.
             with contextlib.suppress(Exception):
                 await app.bot.send_message(cfg.primary_chat_id, _(
                     "🛠 Мастерская: «{what}» не запустилось ({why}), подробности в теме мастерской").format(
                         what=(events.load(store, event_id) or {}).get("title") or "?",
                         why={"not started": _("лимит или отказ, перенос назван в теме"),
-                             "expired": _("срок вышел"), "error": _("сбой")}[outcome]))
+                             "expired": _("срок вышел"), "error": _("сбой")}[outcome]),
+                    disable_notification=silent)
 
     return _event_wake
 
@@ -133,10 +137,11 @@ def _event_show_target(app: Application, rec: dict) -> tuple[int, int | None, st
     return rec["chat_id"], rec.get("thread_id"), ""
 
 
-async def _event_expired_note(app: Application, rec: dict | None) -> None:
-    """Строка в чат: пробуждение устарело, не дождавшись очереди или рестарта."""
+async def _event_expired_note(app: Application, rec: dict | None) -> bool:
+    """Строка в чат: пробуждение устарело, не дождавшись очереди или рестарта.
+    Всегда без звука. True: строка ушла."""
     if not rec:
-        return
+        return False
     with contextlib.suppress(Exception):
         chat_id, thread_id, head = _event_show_target(app, rec)
         await app.bot.send_message(
@@ -144,6 +149,8 @@ async def _event_expired_note(app: Application, rec: dict | None) -> None:
                               "перезапуска, и не запускалось.").format(
                 source=rec.get("source"), title=rec.get("title")),
             message_thread_id=thread_id, disable_notification=True)
+        return True
+    return False
 
 
 async def _events_resume(app: Application) -> None:

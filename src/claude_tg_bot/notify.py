@@ -29,6 +29,7 @@ import httpx
 
 from .config import load_config, local_zone
 from .i18n import _
+from . import reactions
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,6 +192,8 @@ def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: 
             print(f"notify: sendMessage failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
             _print_id_on_failure(args.pin, first_message_id)
             return 1, first_message_id
+        with contextlib.suppress(AttributeError, ValueError, KeyError, TypeError):
+            reactions.remember(chat_id, int(r.json()["result"]["message_id"]), ch, cfg.state_dir)
         if idx == 0:  # id только первой части: ответ без id не должен подменяться id второй
             try:
                 first_message_id = int(r.json()["result"]["message_id"])

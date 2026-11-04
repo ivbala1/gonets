@@ -13,7 +13,6 @@
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import contextlib
 import difflib
@@ -41,10 +40,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application
 
-from . import audit, danger, events, mailsend, otklik, runs
+from . import audit, danger, events, mailsend, outbound, runs, serious
 from .burst import burst_target_key
 from .config import LOOPBACK_HOSTS, Config
 from .i18n import _, N_
+from .outbound import _esc, _esc_truncate
 from .replies import is_unconfirmed
 
 log = logging.getLogger(__name__)
@@ -69,271 +69,12 @@ AUDIT_LOG_NAME = "audit.jsonl"
 # Set оставлен пустым, чтобы при необходимости снова что-то исключить точечно.
 _BURST_DENY_TOOLS: frozenset[str] = frozenset()
 
-# Отправка наружу от имени Ивана (Telegram его аккаунтом, письмо из его
-# Gmail): всегда карточка, раньше любых автоаппрувов (чат Домового,
-# фоновый ран, окно /auto). Тап ✅ по карточке с адресатом, текстом и файлом и
-# есть «ок» на точный текст: правило держит бот, а не дисциплина агента.
-# Совет GPT Sol и решение Ивана 12.10.2026. Ловим по серверу и глаголу, а
-# не списком имён: у серверов есть send_voice, send_album, edit_message,
-# send_scheduled_message, slack_send_message (ревью Codex 12.10.2026).
-_OUTBOUND_SERVERS = frozenset({"telegram", "claude_ai_Gmail", "claude_ai_Slack"})
-# Те же почта и Slack из плагинов (`plugin_engineering_gmail`), аудит guard
-# 31.10.2026. Telegram плагина отвечает своим ботом в разрешённые чаты, а не
-# аккаунтом Ивана: не сюда.
-_OUTBOUND_PLUGIN_RE = re.compile(r"plugin_[\w.-]+_(?:gmail|slack)", re.IGNORECASE)
-_OUTBOUND_VERB_RE = re.compile(r"(?:[a-z]+_)?(?:send|reply|forward|edit|post|schedule)[a-z_]*")
-# Отправка, содержимое которой карточка показать не может: пересылка
-# (переслать можно что угодно из чужого чата) и письмо по номеру черновика
-# (сам черновик пишется без карточки). Такое бот отклоняет сразу.
-_OUTBOUND_FORWARD_RE = re.compile(r"(?:[a-z]+_)?forward[a-z_]*")
-
-
-def _is_outbound_send(tool_name: str) -> bool:
-    parts = tool_name.split("__", 2)
-    return (len(parts) == 3 and parts[0] == "mcp"
-            and (parts[1] in _OUTBOUND_SERVERS or bool(_OUTBOUND_PLUGIN_RE.fullmatch(parts[1])))
-            and bool(_OUTBOUND_VERB_RE.fullmatch(parts[2])))
-
-
-def _outbound_refusal(tool_name: str, tool_input: dict[str, Any]) -> str | None:
-    """Причина отказа отправке, которую нельзя показать на карточке целиком."""
-    short_tool = tool_name.split("__", 2)[-1]
-    if _OUTBOUND_FORWARD_RE.fullmatch(short_tool):
-        return _("пересылку агент не делает: отправь текст сам целиком")
-    if tool_input.get("draftId"):
-        return _("письмо по черновику не отправляется: передай адресатов, тему и текст целиком")
-    return None
-
-
-# Письмо модулем mailsend (Bash, вложения файлом): та же карточка отправки,
-# что у Gmail MCP (решение Ивана 13.10.2026). Карточку строит бот из файлов в
-# момент запроса: снимок письма кладётся во вход карточки под этим ключом, а
-# по ✅ бот пишет билет с хешем снимка. mailsend отправляет только письмо с
-# тем же хешем, поэтому правка текста или вложения после карточки и запуск
-# мимо карточки дают отказ.
-MAILSEND_CARD_KEY = "_mailsend"
 # Карточка плана (шаг 2 карточек, решение Ивана 29.10.2026): текст плана во
 # входе карточки под этим ключом. Агент просит её командой скилла plan; права
 # выдаёт только нажатие «✅ Делай план», и только запросившему запуску (runs.py).
 PLAN_CARD_KEY = "_plan"
 # План целиком на одной карточке: Иван одобряет то, что прочёл.
 PLAN_TEXT_MAX = 2500
-# Признак исполнения mailsend, а не упоминания: запуск модулем, файл модуля
-# скриптом интерпретатора, импорт в коде (python -c, heredoc).
-_MAILSEND_RUN_RE = re.compile(
-    r"-m\s*['\"]?claude_tg_bot\.mailsend\b"
-    r"|\bpython[\d.]*['\"]?\s+(?:-\S+\s+)*(?:-m\s*['\"]?mailsend\b|['\"]?(?:\S*/)?mailsend\.py\b)"
-    r"|\bimport\s+claude_tg_bot\.mailsend\b"
-    r"|\bfrom\s+claude_tg_bot(?:\.mailsend\s+import\b|\s+import\b[^;\n]*\bmailsend\b)"
-    r"|\b(?:import_module|run_module)\(\s*['\"]claude_tg_bot\.mailsend\b"
-)
-# Команды, которые текст аргументов только читают или пишут: упоминание
-# mailsend в них письма не отправит.
-_TEXT_TOOLS = frozenset({"git", "grep", "egrep", "fgrep", "rg", "echo", "printf", "cat",
-                         "sed", "head", "tail", "less", "wc", "diff", "ls"})
-# Обёртки перед настоящей командой: `timeout 60 git ...` это git.
-_CMD_WRAPPERS = frozenset({"env", "timeout", "nice", "nohup", "sudo", "exec", "command",
-                           "time", "stdbuf", "setsid", "strace", "ltrace"})
-_HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|\Z)|\Z)", re.S)
-_MAILSEND_MODULE = "claude_tg_bot.mailsend"
-_PYTHON_RE = re.compile(r"(?:\S*/)?python3?(?:\.\d+)?")
-_SHELL_OPS = frozenset("();<>|&")
-_MAILSEND_FORM = "[cd DIR &&] .venv/bin/python -m claude_tg_bot.mailsend --to ... --body-file ..."
-
-
-def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] | None:
-    """Аргументы mailsend из простой команды `[cd DIR &&] PY -m
-    claude_tg_bot.mailsend ...` и каталог для относительных путей. Подстановки,
-    конвейеры, bash -c, heredoc и переменные не разбираются: None."""
-    # Перенос строки через `\` bash убирает до разбора; в одинарных кавычках
-    # он остался бы, но такой путь или тема дадут другой хеш, то есть отказ.
-    cmd = cmd.replace("\\\n", "")
-    if any(c in cmd for c in "$`\\\n\r"):
-        return None
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        tokens = list(lex)
-    except ValueError:
-        return None
-    base = Path(cwd) if cwd and Path(cwd).is_absolute() else None
-    if tokens[:1] == ["cd"]:
-        if len(tokens) < 3 or tokens[2] != "&&":
-            return None
-        target = Path(tokens[1]).expanduser()
-        if not target.is_absolute():
-            if base is None:
-                return None
-            target = base / target
-        base = target
-        tokens = tokens[3:]
-    if (len(tokens) < 3 or not _PYTHON_RE.fullmatch(tokens[0])
-            or tokens[1:3] != ["-m", _MAILSEND_MODULE]):
-        return None
-    argv = tokens[3:]
-    if any(t and set(t) <= _SHELL_OPS for t in argv):
-        return None
-    return argv, base
-
-
-def _command_head(tokens: list[str]) -> str:
-    """Имя команды простого куска: без присваиваний VAR=..., обёрток и их ключей."""
-    for t in tokens:
-        if (re.fullmatch(r"\w+=.*", t, re.S) or t.startswith("-")
-                or re.fullmatch(r"[\d.]+[smhd]?", t) or Path(t).name in _CMD_WRAPPERS):
-            continue
-        return Path(t).name
-    return ""
-
-
-def _substitutions(cmd: str) -> list[str]:
-    """Тексты подстановок $(...) и `...`. Скобки считаются без учёта кавычек,
-    незакрытая подстановка идёт до конца строки."""
-    out = [m.group(1) for m in re.finditer(r"`([^`]*)`?", cmd)]
-    for m in re.finditer(r"\$\(", cmd):
-        depth, j = 1, m.end()
-        while j < len(cmd) and depth:
-            depth += {"(": 1, ")": -1}.get(cmd[j], 0)
-            j += 1
-        out.append(cmd[m.end():j - 1 if depth == 0 else j])
-    return out
-
-
-def _mailsend_runs(cmd: str, depth: int = 0) -> bool:
-    """Команда исполняет mailsend (_MAILSEND_RUN_RE), в том числе через bash -c,
-    $(...), heredoc и обёртки. Упоминание в аргументах _TEXT_TOOLS (сообщение
-    коммита, шаблон grep, текст echo) не в счёт. Что не разобралось, считается
-    исполнением: лишняя карточка дешевле."""
-    cmd = cmd.replace("\\\n", "")
-    if not _MAILSEND_RUN_RE.search(cmd):
-        return False
-    # Тело heredoc: код для интерпретатора и оболочки, просто текст для cat и git.
-    bodies: list[tuple[str, str]] = []
-
-    def cut(m: re.Match[str]) -> str:
-        line = cmd[:m.start()].rsplit("\n", 1)[-1]
-        bodies.append((re.split(r"\$\(|[;|&(`]", line)[-1], m.group(4)))
-        return m.group(3)
-
-    shell = _HEREDOC_RE.sub(cut, cmd)
-    for opener, body in bodies:
-        if _command_head(opener.split()) not in _TEXT_TOOLS and _MAILSEND_RUN_RE.search(body):
-            return True
-    # Подстановка исполняется и внутри аргумента любой команды. Глубокую
-    # вложенность не разбираем: признак внутри уже считается исполнением.
-    for inner in _substitutions(shell):
-        if _MAILSEND_RUN_RE.search(inner) and (depth >= 3 or _mailsend_runs(inner, depth + 1)):
-            return True
-    try:
-        # Перевод строки разделяет команды; внутри кавычек `;` остаётся текстом.
-        lex = shlex.shlex(shell.replace("\n", ";"), posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        tokens = list(lex)
-    except ValueError:
-        return True
-    part: list[str] = []
-    for t in tokens + [";"]:
-        if t and set(t) <= _SHELL_OPS:
-            if _command_head(part) not in _TEXT_TOOLS and _MAILSEND_RUN_RE.search(" ".join(part)):
-                return True
-            part = []
-        else:
-            part.append(t)
-    return False
-
-
-def _mailsend_check(cmd: str, cwd: str | None) -> tuple[str, Any]:
-    """Что делать с Bash-командой про mailsend: ("", None) не про него;
-    ("dry", None) сухой прогон или справка, обычный путь; ("card", снимок)
-    карточка письма; ("mention", None) запуск не простой формой, карточка
-    команды мимо автоаппрувов; ("deny", причина) письмо всё равно не уйдёт."""
-    if not _mailsend_runs(cmd):
-        return "", None
-    parsed = _mailsend_argv(cmd, cwd)
-    if parsed is None:
-        return "mention", None
-    argv, base = parsed
-    if "-h" in argv or "--help" in argv:
-        return "dry", None
-    try:
-        args = mailsend.build_parser().parse_args(argv)
-        if args.dry_run:
-            return "dry", None
-        letter = mailsend.load_letter(args, dirs=mailsend.attach_dirs(),
-                                      limit=mailsend.max_bytes(), base=base)
-    except (mailsend.MailError, argparse.ArgumentError) as e:
-        return "deny", f"mailsend: {e}"
-    return "card", {
-        "to": list(letter.to), "cc": list(letter.cc), "subject": letter.subject,
-        "reply_to": letter.reply_to_id, "body": letter.body,
-        "attachments": [{"name": a.name, "size": len(a.data), "path": a.path}
-                        for a in letter.attachments],
-        "digest": letter.digest(),
-    }
-
-
-def _human_size(size: int) -> str:
-    if size < 1024:
-        return _("{size} Б").format(size=size)
-    if size < 1024 * 1024:
-        return _("{size:.1f} КБ").format(size=size / 1024)
-    return _("{size:.1f} МБ").format(size=size / 1024 / 1024)
-
-
-# Адресаты на карточке отправки: строка до этого предела, длиннее с пометкой.
-_RECIPIENTS_CAP = 300
-# Вложений поимённо на карточке письма, остальные числом (все по 📄).
-_MAIL_ATTACH_SHOWN = 5
-
-
-def _format_mailsend(mail: dict[str, Any], text_cap: int = TRUNCATE_PAYLOAD) -> str:
-    """Карточка письма mailsend: адресаты, тема, вложения с размером, текст
-    до text_cap (длинная карточка ужимает текст, а не теряет письмо)."""
-    if mail.get("warning"):
-        return (_("⚠️ <b>команда запускает mailsend не простой формой</b>: письмо так не уйдёт, "
-                  "без ✅ на карточке письма mailsend откажет. Форма для письма: "
-                  "<code>{form}</code>").format(form=_esc(_MAILSEND_FORM)))
-    to, cc = ", ".join(mail.get("to") or []), ", ".join(mail.get("cc") or [])
-    lines = [_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"),
-             _("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(to, _RECIPIENTS_CAP))]
-    if cc:
-        lines.append(_("копия: <code>{cc}</code>").format(cc=_esc_truncate(cc, _RECIPIENTS_CAP)))
-    if max(len(_esc(to)), len(_esc(cc))) > _RECIPIENTS_CAP:
-        lines.append(_("⚠️ <b>адресатов больше, чем видно: список целиком по 📄</b>"))
-    if mail.get("reply_to"):
-        lines.append(_("ответ на письмо: <code>{reply_to}</code>").format(reply_to=_esc_truncate(str(mail['reply_to']), 300)))
-    lines.append(_("тема письма: {subject}").format(subject=_esc_truncate(str(mail.get('subject') or ''), 300)))
-    atts = mail.get("attachments") or []
-    if atts:
-        shown = ", ".join(
-            f"<code>{_esc_truncate(str(a.get('name')), 200)}</code> ({_human_size(int(a.get('size') or 0))})"
-            for a in atts[:_MAIL_ATTACH_SHOWN])
-        if len(atts) > _MAIL_ATTACH_SHOWN:
-            shown += _(" и ещё {n} (все по 📄)").format(n=len(atts) - _MAIL_ATTACH_SHOWN)
-        lines.append(_("вложения: ") + shown)
-    body = str(mail.get("body") or "")
-    lines.append(_("текст письма:\n<pre>{body}</pre>").format(body=_esc_truncate(body, text_cap)))
-    if len(_esc(body)) > text_cap:
-        lines.append(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"))
-    return "\n".join(lines)
-
-
-def _mailsend_full_view(mail: dict[str, Any]) -> str:
-    if mail.get("warning"):
-        return _("--- mailsend ---\nкоманда не простой формой, письмо так не уйдёт.\nФорма: {form}").format(form=_MAILSEND_FORM)
-    lines = [_("--- письмо (mailsend) ---"), _("Кому: {to}").format(to=', '.join(mail.get('to') or []))]
-    if mail.get("cc"):
-        lines.append(_("Копия: {cc}").format(cc=', '.join(mail['cc'])))
-    if mail.get("reply_to"):
-        lines.append(_("Ответ на: {reply_to}").format(reply_to=mail['reply_to']))
-    lines.append(_("Тема: {subject}").format(subject=mail.get('subject')))
-    for a in mail.get("attachments") or []:
-        lines.append(_("Вложение: {name} ({size} байт) из {path}").format(
-            name=a.get('name'), size=a.get('size'), path=a.get('path')))
-    lines.append(_("sha256 письма: {digest}").format(digest=mail.get('digest')))
-    lines += ["", _("--- текст письма ---"), str(mail.get("body") or "")]
-    return "\n".join(lines)
 
 
 @dataclass
@@ -360,6 +101,22 @@ class Pending:
     deadline: float = 0.0
     # HTML отправленной карточки: итог срока дописывается в неё правкой.
     card_html: str = ""
+    # Текст карточки, как его показывает Telegram: на ✅ сверяется с текстом
+    # сообщения в нажатии. Агент знает ключ бота и мог переписать карточку
+    # через Bot API (проект 03.11.2026, п. 4).
+    card_text: str = ""
+    # Сервер заказчика: «change» или пусто (serious.customer_kind). Изменению
+    # окно ⏩ не положено, кнопок окна на его карточке нет.
+    customer: str = ""
+    # Отправка людям мимо карточки отправки (serious.Outbound): окно ⏩ тоже
+    # не положено.
+    sends: bool = False
+    # Клавиатура карточки, как её нарисовал бот (keyboard_rows): на ✅
+    # сверяется с клавиатурой сообщения в нажатии, подмена подписи кнопки
+    # даёт отказ (ревью 03.11.2026).
+    card_keyboard: tuple = ()
+    # Сущности текста из ответа Telegram (entity_rows); None: ответа не было.
+    card_entities: tuple | None = None
 
 
 class ApprovalRegistry:
@@ -429,30 +186,6 @@ class ApprovalRegistry:
         return len(self._items)
 
 
-def _esc(s: str) -> str:
-    """HTML-escape для Telegram parse_mode=HTML."""
-    return html.escape(s, quote=False)
-
-
-def _esc_truncate(s: str, limit: int) -> str:
-    """Escape + обрезка по длине *escape-нутой* строки.
-
-    Важно обрезать ПОСЛЕ escape: один символ `<` превращается в `&lt;` (4 char).
-    Иначе обрезка до 2000 исходных символов может дать 8000+ escape-нутых
-    и выйти за Telegram-лимит 4096.
-    """
-    escaped = _esc(s)
-    if len(escaped) <= limit:
-        return escaped
-    cut = escaped[:limit]
-    # Если обрезали посреди HTML-entity (`&lt;`, `&amp;` и т.п.) — откатываемся
-    # до последнего `&`, у которого нет закрывающего `;` в хвосте.
-    last_amp = cut.rfind("&")
-    if last_amp >= 0 and ";" not in cut[last_amp:]:
-        cut = cut[:last_amp]
-    return cut + " …"
-
-
 _DANGER_REASONS_CAP = 400
 _DESCRIPTION_CAP = 200
 FULL_VIEW_THRESHOLD = 1500
@@ -470,9 +203,15 @@ def _danger_line(tool_name: str, tool_input: Any, cwd: str | None = None) -> str
     if verdict.red:
         reasons = "; ".join(verdict.red)
         return _("🔴 <b>ОПАСНО:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
-    if verdict.orange:
-        reasons = "; ".join(verdict.orange)
+    changes = [r for r in verdict.orange if r not in verdict.unknown]
+    if changes:
+        reasons = "; ".join(changes + verdict.unknown)
         return _("🟠 <b>Меняет:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
+    if verdict.orange:
+        # Изменений разбор не нашёл, но и чтение доказать не смог: подстановка,
+        # незнакомая программа. «Меняет» тут неправда (Иван 03.11.2026).
+        reasons = "; ".join(verdict.unknown)
+        return _("🟠 <b>Не разобрал, может и менять:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
     return _("🟡 опасного не нашёл (это не значит «безопасно»)")
 
 
@@ -501,7 +240,7 @@ def full_view_text(tool_name: str, tool_input: Any) -> str:
     хвостом: это полный вход, а не его пересказ."""
     main = _full_view_main(tool_name, tool_input)
     if isinstance(tool_input, dict):
-        shown = {"Bash": {"command", "description", MAILSEND_CARD_KEY},
+        shown = {"Bash": {"command", "description", outbound.MAILSEND_CARD_KEY},
                  "Write": {"file_path", "content"},
                  "Edit": {"file_path", "old_string", "new_string"}}.get(tool_name)
         if shown is not None:
@@ -512,7 +251,7 @@ def full_view_text(tool_name: str, tool_input: Any) -> str:
 
 
 def _full_view_main(tool_name: str, tool_input: Any) -> str:
-    if isinstance(tool_input, dict) and _is_outbound_send(tool_name):
+    if isinstance(tool_input, dict) and outbound.is_send(tool_name):
         # Вложения именем и размером: base64 в просмотре не нужен.
         shown = dict(tool_input)
         if isinstance(shown.get("attachments"), list):
@@ -521,15 +260,15 @@ def _full_view_main(tool_name: str, tool_input: Any) -> str:
                  "base64_chars": len(str(a.get("content") or ""))}
                 if isinstance(a, dict) else "?" for a in shown["attachments"]]
         texts = [_("--- {label} ---\n{value}").format(label=_(label), value=shown.pop(key))
-                 for key, label in _OUTBOUND_TEXT_FIELDS
+                 for key, label in outbound.TEXT_FIELDS
                  if shown.get(key) not in (None, "")]
         return (json.dumps(shown, ensure_ascii=False, indent=2) + "\n\n" + "\n\n".join(texts)).rstrip()
     if isinstance(tool_input, dict):
         if tool_name == "Bash":
             desc = str(tool_input.get("description", ""))
             head = _("# Пояснение агента: {desc}\n\n").format(desc=desc) if desc else ""
-            mail = tool_input.get(MAILSEND_CARD_KEY)
-            tail = f"\n\n{_mailsend_full_view(mail)}" if isinstance(mail, dict) else ""
+            mail = tool_input.get(outbound.MAILSEND_CARD_KEY)
+            tail = f"\n\n{outbound.mailsend_full_view(mail)}" if isinstance(mail, dict) else ""
             return head + str(tool_input.get("command", "")) + tail
         if tool_name == "Write":
             return f"{tool_input.get('file_path')}\n\n{tool_input.get('content', '')}"
@@ -557,9 +296,9 @@ def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: st
     # Отправка наружу: сырой текст вместо карточки терял заголовок «от твоего
     # имени», текст письма и адресата в конце длинной команды (аудит outbound
     # 31.10.2026). Ужимается текст сообщения, адресаты и тема остаются.
-    mail = tool_input.get(MAILSEND_CARD_KEY) if tool_name == "Bash" and isinstance(tool_input, dict) else None
+    mail = tool_input.get(outbound.MAILSEND_CARD_KEY) if tool_name == "Bash" and isinstance(tool_input, dict) else None
     if (isinstance(mail, dict) and not mail.get("warning")) or (
-            _is_outbound_send(tool_name) and isinstance(tool_input, dict)):
+            outbound.is_send(tool_name) and isinstance(tool_input, dict)):
         for cap in (1000, 400, 100):
             card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id, text_cap=cap)}"
             if len(card) <= CARD_TEXT_CAP:
@@ -589,10 +328,10 @@ def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: st
         # слова и стоит после оценки бота, а не вместо неё.
         note = (_("💬 <i>пояснение агента:</i> {desc}").format(desc=_esc_truncate(desc, _DESCRIPTION_CAP))
                 if desc else _("💬 <i>пояснения агента нет</i>"))
-        mail = tool_input.get(MAILSEND_CARD_KEY)
+        mail = tool_input.get(outbound.MAILSEND_CARD_KEY)
         if isinstance(mail, dict):
             # Письмо целиком важнее команды: команда коротко, полностью по 📄.
-            return (f"{header}\n{_format_mailsend(mail, text_cap)}\n{note}\n"
+            return (f"{header}\n{outbound.format_mailsend(mail, text_cap)}\n{note}\n"
                     f"<pre>{_esc_truncate(cmd, 400 if text_cap >= TRUNCATE_PAYLOAD else 150)}</pre>")
         body = _esc_truncate(cmd, TRUNCATE_PAYLOAD)
         return f"{header}\n{note}\n<pre>{body}</pre>"
@@ -679,67 +418,11 @@ def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: st
         prompt = str(tool_input.get("prompt", ""))
         body = url + (f"\n\n{prompt}" if prompt else "")
         return f"{header}\n<pre>{_esc_truncate(body, TRUNCATE_PAYLOAD)}</pre>"
-    if _is_outbound_send(tool_name):
-        return f"{header}\n{_format_outbound(tool_input, text_cap)}"
+    if outbound.is_send(tool_name):
+        return f"{header}\n{outbound.format_card(tool_input, text_cap)}"
     # generic fallback
     dumped = json.dumps(tool_input, ensure_ascii=False, indent=2)
     return f"{header}\n<pre>{_esc_truncate(dumped, TRUNCATE_PAYLOAD)}</pre>"
-
-
-_OUTBOUND_TEXT_FIELDS = (("message", N_("текст")), ("text", N_("текст")), ("caption", N_("подпись")),
-                         ("body", N_("текст письма")), ("htmlBody", N_("HTML письма")))
-
-
-def _format_outbound(tool_input: dict[str, Any], text_cap: int = TRUNCATE_PAYLOAD) -> str:
-    """Карточка отправки: кому, тема, файлы, все текстовые поля. Это то, на
-    что Иван даёт «ок», поэтому поля называются словами, а не JSON, и ни одно
-    отправляемое поле не прячется за другим (ревью Codex 12.10.2026)."""
-    lines = [_("📤 <b>отправка от твоего имени</b>")]
-    to = tool_input.get("to") or tool_input.get("chat_id")
-    if to not in (None, ""):
-        lines.append(_("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(str(to), 300)))
-    for key, label in (("cc", _("копия")), ("bcc", _("скрытая копия")),
-                       ("message_id", _("ответ на сообщение")),
-                       ("replyToMessageId", _("ответ на письмо")),
-                       ("replyThreadId", _("в переписке")), ("draftId", _("черновик")),
-                       ("topic_id", _("тема"))):
-        val = tool_input.get(key)
-        if val not in (None, "", []):
-            lines.append(f"{label}: <code>{_esc_truncate(str(val), 300)}</code>")
-    subject = tool_input.get("subject")
-    if subject:
-        lines.append(_("тема письма: {subject}").format(subject=_esc_truncate(str(subject), 300)))
-    files = tool_input.get("file_path")
-    if files:
-        names = files if isinstance(files, list) else [files]
-        lines.append(_("файл: ") + ", ".join(f"<code>{_esc_truncate(str(n), 200)}</code>" for n in names))
-    attachments = tool_input.get("attachments")
-    if isinstance(attachments, list) and attachments:
-        names = [str(a.get("filename") or _("без имени")) if isinstance(a, dict) else "?"
-                 for a in attachments]
-        lines.append(_("вложения: ") + ", ".join(f"<code>{_esc_truncate(n, 200)}</code>" for n in names))
-    for key in ("account", "parse_mode"):
-        val = tool_input.get(key)
-        if val not in (None, ""):
-            lines.append(f"{key}: <code>{_esc_truncate(str(val), 100)}</code>")
-    texts = [(_(label), str(tool_input[key])) for key, label in _OUTBOUND_TEXT_FIELDS
-             if tool_input.get(key) not in (None, "")]
-    clipped = False
-    for label, text in texts:
-        lines.append(f"{label}:\n<pre>{_esc_truncate(text, text_cap)}</pre>")
-        clipped = clipped or len(_esc(text)) > text_cap
-    if not texts and not files and not attachments:
-        lines.append(_("<i>текста нет</i>"))
-    if clipped:
-        lines.append(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"))
-    known = {"to", "chat_id", "cc", "bcc", "message_id", "replyToMessageId", "replyThreadId",
-             "draftId", "topic_id", "subject", "file_path", "attachments", "account",
-             "parse_mode"} | {k for k, _unused in _OUTBOUND_TEXT_FIELDS}
-    rest = {k: v for k, v in tool_input.items() if k not in known and v not in (None, "", [])}
-    if rest:
-        lines.append(_("<i>прочее:</i> <code>{rest}</code>").format(
-            rest=_esc_truncate(json.dumps(rest, ensure_ascii=False), 400)))
-    return "\n".join(lines)
 
 
 _FILE_TOOLS_FOR_WHITELIST = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
@@ -1894,13 +1577,20 @@ def _bash_command_is_safe(command: str, *patterns: re.Pattern[str],
     # Одна `;` в конце ничего не запускает, а пустой сегмент после неё слал
     # карточкой целую читающую команду (разбор 20.10.2026). `\;` не снимается.
     cmd = re.sub(r"(?<!\\);\s*$", "", command.strip()).rstrip()
-    if not cmd:
+    # `\` с переводом строки bash склеивает по своим правилам: не разобрано.
+    if not cmd or danger.has_continuation(cmd):
+        return False
+    # Шаблон, ставший флагом, во всех каталогах, где команда может оказаться:
+    # сегменты ниже помнят один каталог после cd, а `(cd x); find *` идёт в
+    # исходном (ревью Codex 03.11.2026).
+    if _glob_hits_option(cmd, cwd or str(Path.cwd())):
         return False
     sanitized = _BASH_SAFE_REDIRECT_RE.sub("", cmd)
     segments = _scan_bash_segments(sanitized)
     if segments is None:
         return False
     current = cwd or str(Path.cwd())
+    moved = False
     for seg in segments:
         if not _segment_ok(seg, patterns, current):
             return False
@@ -1908,7 +1598,13 @@ def _bash_command_is_safe(command: str, *patterns: re.Pattern[str],
             parts = shlex.split(_unwrap_segment(seg.strip()) or "")
         except ValueError:
             return False
+        # После cd имена grep -r сверять не с чем: в `(cd x); grep -r k proj`
+        # bash каталог не сменил (ревью Opus 03.11.2026).
+        if moved and parts and danger._program(parts[0]) in _GREP_FAMILY \
+                and danger._searches_tree(["grep", *parts[1:]], None):
+            return False
         if parts[:1] == ["cd"]:
+            moved = True
             if len(parts) != 2 or parts[1].startswith("-"):
                 return False
             current = str(Path(current, Path(parts[1]).expanduser()).resolve())
@@ -1970,8 +1666,9 @@ _MEMORY_READ_RE = re.compile(
 
 # Второе мнение Codex скиллом /2mind (решение Ивана 14.10.2026): остаток
 # лимита, имя модели и вызов обёрткой ask.py. Обёртка сама ставит Codex
-# песочницу `--sandbox read-only` и других его флагов не принимает, поэтому
-# прямой `codex exec` (там любой `--sandbox` и `-c`) остаётся на карточке.
+# песочницу `--sandbox read-only` и других его флагов не принимает. Прямой
+# `codex exec` без карточки только с `-s read-only` (serious._nested_agent,
+# guard3, Н1), прочие запуски Codex карточкой.
 # Скилл лежит в ~/.claude/skills, его правка идёт через карточку (danger).
 # Запрос к Codex только файлом прямо в state/2mind/ (туда Write без карточки,
 # `_whitelist_target_ok`): ответ и лог ask.py кладёт рядом с запросом, и
@@ -2645,18 +2342,37 @@ def _glob_hits_option(command: str, cwd: str | None) -> bool:
     words = _bash_words(plain)
     if words is None:
         return True
+    # После `cd` bash раскрывает шаблон в другом каталоге: `cd sub; find *`
+    # с файлом `-delete` в sub (ревью Codex 03.11.2026, было и раньше).
+    # Проверяются все каталоги, где команда могла оказаться: удался cd или
+    # нет, в подоболочке он или нет. Каталог не узнать: карточка.
+    dirs = {cwd} if cwd else set()
+    unknown = not cwd
+    prev = ""
     for word in words:
+        raw = "".join(ch for ch, _unused in word)
+        if prev in ("cd", "pushd"):
+            dirs.add(str(Path.home()))
+            # Кавычки, `~` и скобки bash раскрывает не так, как expanduser:
+            # `cd '~/sub'` и `cd {sub,}` (ревью Codex 03.11.2026).
+            if raw in ("-", "") or raw.startswith("-") or any(c in raw for c in "$`*?[~{},") \
+                    or any(quoted for _ch, quoted in word):
+                unknown = True
+            else:
+                dirs |= {os.path.normpath(os.path.join(d, os.path.expanduser(raw))) for d in dirs}
+        unknown = unknown or raw == "popd"
+        prev = raw
         if not any(ch in "*?[" and not quoted for ch, quoted in word):
             continue
-        if not cwd:
+        if unknown:
             return True
-        raw = "".join(ch for ch, _unused in word)
-        try:
-            matches = glob.glob(os.path.expanduser(raw), root_dir=cwd)
-        except (OSError, ValueError):
-            return True
-        if any(m.startswith("-") for m in matches):
-            return True
+        for d in dirs:
+            try:
+                matches = glob.glob(os.path.expanduser(raw), root_dir=d)
+            except (OSError, ValueError):
+                return True
+            if any(m.startswith("-") for m in matches):
+                return True
     return False
 
 
@@ -2687,7 +2403,9 @@ def _for_loop_steps(command: str, cwd: str | None) -> list[str] | None:
     файл с другими знаками в имени цикл не пропускает. Имя переменной в теле
     вне `$x` и `${x}` значит присваивание (`f=.env`, `read f`)."""
     text = command.strip()
-    if any(c in text for c in "\n#\\"):
+    # В одинарных кавычках оболочка ничего не разбирает: `tr '\n' ' '` и `'#'`
+    # там просто знаки (карточка 03.11.2026).
+    if any(c in _mask_single_quoted(text) for c in "\n#\\"):
         return None
     m = _FOR_LOOP_RE.fullmatch(danger._quote_mask(text))
     if m is None or m.group(1).endswith("_proxy") or _FOR_INNER_RE.search(m.group(3)):
@@ -2715,16 +2433,51 @@ def _for_loop_steps(command: str, cwd: str | None) -> list[str] | None:
     return [*steps, text[m.start("pipe"):]] if m.group("pipe") else steps
 
 
+# Цикл звеном цепочки: `cd x; find . | head; for f in a b; do …; done; ls`.
+# До и после него только `;`, `&&` или край команды; конвейер после `done`
+# такой разбор не берёт.
+_FOR_IN_SEQ_RE = re.compile(
+    r"(?:^|(?<=;)|(?<=&&))\s*for [a-z]\w* in [^;]+?\s*;\s*do\s+.+?\s*;\s*done"
+    r"(?=\s*(?:;|&&|$))")
+
+
+def _unroll_loop_in_sequence(command: str, cwd: str | None) -> str | None:
+    """Первый цикл цепочки развёрнут в команды прохода (`_for_loop_steps`),
+    остальное как есть: проверка чтения смотрит цепочку целиком, с `cd` до
+    цикла и переменными. None: не такой цикл, карточка. Шаблон в значениях
+    после `cd` раскрылся бы не там, где проверяется, такое тоже None."""
+    mask = danger._quote_mask(command)
+    m = _FOR_IN_SEQ_RE.search(mask)
+    if m is None:
+        return None
+    loop = command[m.start():m.end()].strip()
+    if command[:m.start()].strip() == "" and command[m.end():].strip() == "":
+        return None  # цикл целиком: его разбирает _for_loop_steps
+    words = loop.split(";", 1)[0].split(" in ", 1)[1]
+    if re.search(r"\b(?:cd|pushd|popd)\b", mask[:m.start()]) and glob.has_magic(words):
+        return None
+    steps = _for_loop_steps(loop, cwd)
+    if not steps:
+        return None
+    # Скобки держат `&&` после done за всем циклом, как в bash (/code-review).
+    return f"{command[:m.start()]} {{ {' ; '.join(steps)} ; }} {command[m.end():]}"
+
+
 def _danger_read_ok(command: str, cwd: str | None = None) -> bool:
     """Команда только читает: разбор danger.py не нашёл записи, запуска
     незнакомого и отправки, секрет она не трогает, и каждая её программа из
     списка читающих (`_read_program_ok`). Замер по 686 карточкам с апреля:
     среди 198 команд уровня «опасного не нашёл» изменений и отправок нет."""
+    if danger.has_continuation(command):
+        return False
     if _READ_SECRETISH_RE.search(command):
         return False
     loop = _for_loop_steps(command, cwd)
     if loop:
         return all(_danger_read_ok(step, cwd) for step in loop)
+    unrolled = _unroll_loop_in_sequence(command, cwd)
+    if unrolled is not None:
+        return _danger_read_ok(unrolled, cwd)
     if _FOR_ANY_RE.search(danger._quote_mask(command)):
         return False  # цикл, который разбор выше не взял: его переменные меняют чужое
     # Внутри одинарных кавычек `$` не раскрывается: `sed -n '$p'` и
@@ -2825,29 +2578,6 @@ def _is_under_any(target: Path, allowed: frozenset[Path]) -> bool:
     return False
 
 
-def _otklik_match(cfg: Config, pending: Pending, chat_id: int,
-                  thread_id: int | None) -> dict[str, Any] | None:
-    """Отклик, который этот чат взял на отправку, с тем же текстом, что в
-    карточке: для пометки (решение Ивана 22.10.2026: два нажатия остаются,
-    сверять проще). Адресата бот не сверяет: в отклике он записан свободным
-    текстом, поэтому Иван сверяет его сам с «Куда»."""
-    mail = pending.tool_input.get(MAILSEND_CARD_KEY)
-    if isinstance(mail, dict):
-        texts = [str(mail.get("body") or "")]
-    elif _is_outbound_send(pending.tool_name):
-        texts = [str(pending.tool_input[key]) for key, _label in _OUTBOUND_TEXT_FIELDS
-                 if pending.tool_input.get(key) not in (None, "")]
-    else:
-        return None
-    key = pending.origin_key or (f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id))
-    base = otklik.otklik_dir(cfg.state_dir)
-    for body in texts:
-        rec = otklik.outbound_match(base, key, body)
-        if rec is not None:
-            return rec
-    return None
-
-
 _PLAN_SKILL = "claude_tg_bot.skills.plan"
 # Ровно одна форма: путь питона, модуль и текст в одинарных кавычках до конца
 # команды. Внутри одинарных кавычек оболочка ничего не раскрывает, перевод
@@ -2892,6 +2622,12 @@ def _plan_request(tool_name: str, tool_input: dict[str, Any]) -> tuple[str, str]
     return ("ok", text)
 
 
+def _whitelist_hit(tool_name: str, tool_input: dict[str, Any], cfg: Config) -> bool:
+    target_path = _target_path(tool_name, tool_input)
+    return (target_path is not None and _is_under_any(target_path, cfg.approve_whitelist_paths)
+            and _whitelist_target_ok(target_path, cfg.state_dir))
+
+
 # Метки danger.py, с которыми действие и при одобренном плане идёт карточкой.
 _PLAN_CARD_TAGS = frozenset({danger.DELETE, danger.HISTORY, danger.PUBLISH, danger.POWER,
                              danger.DISK, danger.GUARD, danger.FETCH_EXEC, danger.UNPARSED})
@@ -2920,12 +2656,22 @@ _PIPED_RG_RE = re.compile(r"(?<!\|)\|(?!\|)&?\s*(?:rtk\s+(?:proxy\s+rg|rg|grep)|
 
 def _searches_tree(verdict: danger.Verdict, command: str, cwd: str | None) -> bool:
     piped = len(_PIPED_RG_RE.findall(danger._quote_mask(command)))
+    moved = False
     for prog, args, step_cwd in _steps(verdict, cwd):
         if prog in ("rg", "ripgrep") and piped and danger._rg_roots(args) == ["."]:
             piped -= 1
-        elif danger._searches_tree(["grep" if prog == "zgrep" else prog, *args], step_cwd):
+        elif danger._searches_tree(
+                ["grep" if prog == "zgrep" else prog, *args],
+                # `(cd x); grep -r k proj` и `true || cd x; …`: bash каталог не
+                # сменил, а _steps сменил. После cd имена grep -r сверять не с
+                # чем (ревью Opus 03.11.2026).
+                None if moved and prog in _GREP_FAMILY else step_cwd):
             return True
+        moved = moved or prog in ("cd", "pushd", "popd")
     return False
+
+
+_GREP_FAMILY = frozenset({"grep", "egrep", "fgrep", "zgrep"})
 
 
 _SSH_VALUE_FLAGS = frozenset({"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c",
@@ -3052,10 +2798,12 @@ async def send_approval_request(
                     "внешние сервисы и правка механизма подтверждений.") + "</i>")
     else:
         text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
+    if pending.customer == "change":
+        text = _("✏️ <b>изменение на сервере заказчика</b>: окно ⏩ его не пропускает") + "\n" + text
     if pending.origin_key:
         text = _("🛠 <b>Мастерская</b>") + "\n" + text
     try:
-        match = _otklik_match(cfg, pending, chat_id, thread_id)
+        match = outbound.otklik_match(cfg, pending, chat_id, thread_id)
     except Exception:
         log.warning("otklik match for card failed", exc_info=True)
         match = None
@@ -3087,8 +2835,9 @@ async def send_approval_request(
     # ⏩ burst-кнопки показываем для всех инструментов (см. _BURST_DENY_TOOLS):
     # окно auto-approve по решению Ивана покрывает любые действия.
     # Отправке от имени Ивана окно не положено: каждая идёт своей карточкой.
-    if (pending.tool_name not in _BURST_DENY_TOOLS and not _is_outbound_send(pending.tool_name)
-            and MAILSEND_CARD_KEY not in pending.tool_input and not isinstance(plan, dict)):
+    if (pending.tool_name not in _BURST_DENY_TOOLS and not outbound.is_send(pending.tool_name)
+            and outbound.MAILSEND_CARD_KEY not in pending.tool_input and not isinstance(plan, dict)
+            and pending.customer != "change" and not pending.sends):
         rows.append([
             InlineKeyboardButton("⏩ 15m", callback_data=f"appr:{pending.approval_id}:auto15"),
             InlineKeyboardButton("⏩ 1h", callback_data=f"appr:{pending.approval_id}:auto60"),
@@ -3097,6 +2846,13 @@ async def send_approval_request(
         rows.append([InlineKeyboardButton(
             _("📄 Полностью"), callback_data=f"apprfull:{pending.approval_id}")])
     kb = InlineKeyboardMarkup(rows)
+    pending.card_keyboard = keyboard_rows(kb)
+    # Текст и разметка до ответа Telegram: если ответа нет (таймаут чтения),
+    # на ✅ сверка идёт с ними, сущности из этой разметки допустимы
+    # (финальное ревью 03.11.2026). Ответ Telegram текст заменяет ниже.
+    pending.card_text = card_plain_text(text)
+    pending.card_html = text
+    pending.card_entities = None
     # PTB сам опускает message_thread_id=None — танец с kwargs не нужен.
     msg = await application.bot.send_message(
         chat_id=chat_id,
@@ -3109,7 +2865,62 @@ async def send_approval_request(
         write_timeout=CARD_SEND_TIMEOUT,
     )
     pending.telegram_message_id = msg.message_id
-    pending.card_html = text
+    if isinstance(getattr(msg, "text", None), str) and msg.text:
+        pending.card_text = msg.text
+        pending.card_entities = entity_rows(getattr(msg, "entities", None))
+
+
+def card_plain_text(card_html: str) -> str:
+    """Текст карточки без разметки, как его покажет Telegram."""
+    return html.unescape(re.sub(r"<[^>]+>", "", card_html)).strip()
+
+
+_BUTTON_KINDS = ("login_url", "switch_inline_query", "switch_inline_query_current_chat",
+                 "switch_inline_query_chosen_chat", "callback_game", "pay", "web_app", "copy_text")
+
+
+def keyboard_rows(markup: Any) -> tuple:
+    """Клавиатура для сверки: подпись, данные и адрес каждой кнопки."""
+    rows = getattr(markup, "inline_keyboard", None) or ()
+    return tuple(tuple((getattr(b, "text", None), getattr(b, "callback_data", None), getattr(b, "url", None),
+                        tuple(k for k in _BUTTON_KINDS if getattr(b, k, None) is not None)) for b in row)
+                 for row in rows)
+
+
+def entity_rows(entities: Any) -> tuple:
+    """Сущности текста для сверки: вид, место, адрес ссылки и язык кода."""
+    return tuple((str(getattr(e.type, "value", e.type)), e.offset, e.length, getattr(e, "url", None),
+                  getattr(e, "language", None), getattr(e, "custom_emoji_id", None),
+                  getattr(getattr(e, "user", None), "id", None)) for e in (entities or ()))
+
+
+# Сущности, которые Telegram сам находит в тексте без разметки.
+AUTO_ENTITIES = frozenset({"url", "mention", "hashtag", "cashtag", "bot_command", "email", "phone_number"})
+_TAG_ENTITIES = {"b": "bold", "strong": "bold", "i": "italic", "em": "italic", "code": "code", "pre": "pre",
+                 "a": "text_link", "u": "underline", "ins": "underline", "s": "strikethrough",
+                 "strike": "strikethrough", "del": "strikethrough", "blockquote": "blockquote"}
+
+
+def _norm_space(text: str) -> str:
+    return " ".join(text.split())
+
+
+def card_matches(pending: Pending, message: Any) -> bool:
+    """Сообщение из нажатия показывает то, что бот сам отправил: текст (без
+    различий в пробелах и переводах строк), клавиатура и сущности текста.
+    Ответа Telegram при отправке не было: сущности только те, что дала бы
+    разметка карточки, и найденные Telegram сам (спойлер на адресате нет)."""
+    shown = getattr(message, "text", None)
+    if not pending.card_text or not isinstance(shown, str) or _norm_space(shown) != _norm_space(pending.card_text):
+        return False
+    if not pending.card_keyboard or keyboard_rows(getattr(message, "reply_markup", None)) != pending.card_keyboard:
+        return False
+    got = entity_rows(getattr(message, "entities", None))
+    if pending.card_entities is not None:
+        return got == pending.card_entities
+    allowed = AUTO_ENTITIES | {_TAG_ENTITIES[t] for t in re.findall(r"<([a-z]+)", pending.card_html or "")
+                               if t in _TAG_ENTITIES}
+    return all(e[0] in allowed for e in got)
 
 
 # bot_data[RUN_NOTES][ключ темы]: строки футера идущего хода темы (ux2, 01.11.2026).
@@ -3197,6 +3008,22 @@ SELF_RESTART_HINT = N_(
     ".venv/bin/python -m claude_tg_bot.restart_request --reason \"что поменялось\" "
     "(из ~/src/claude-tg-bot); бот перезапустится сам, когда закончится вся работа."
 )
+# Причина агенту на ❌ и на срок любой карточки хука (проект 03.11.2026, п. 4).
+CARD_DENIED_HINT = N_("Иван отказал сам на карточке: не повторяй этот вызов и ✅ не проси, "
+                      "спроси, что не так")
+CARD_TIMEOUT_HINT = N_("Иван не ответил на карточку за {mins} мин: повтори, только если он попросит")
+# Решение нажатия, когда карточка в Telegram (текст, кнопки) не та, что отправил бот.
+CARD_CHANGED = "deny:card-changed"
+CARD_CHANGED_HINT = N_("карточка в Telegram изменена не ботом (текст или кнопки), ✅ не принят: не правь "
+                       "сообщения бота, повтори вызов, если он нужен")
+# Изменение на сервере заказчика без пояснения: отказ без карточки (проект 03.11.2026, п. 6).
+CUSTOMER_DESCRIPTION_MIN = 40
+CUSTOMER_DESCRIPTION_HINT = N_("на сервере заказчика опиши в description, что меняешь, зачем и как откатить "
+                               "(не короче {n} знаков), и повтори вызов")
+# Изменение на сервере заказчика из фонового рана: отказ без карточки, как
+# отправка. Известное чтение причины не даёт и в фоне идёт без карточки.
+CUSTOMER_UNATTENDED_HINT = N_("фоновый ран: изменения у заказчика не делай, опиши в отчёте, что и зачем; "
+                              "сделает живой ран после «ок» Ивана")
 
 
 def _self_restart_refusal(tool_name: str, tool_input: dict) -> str | None:
@@ -3231,7 +3058,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     if not isinstance(tool_input, dict):
         tool_input = {"_raw": tool_input}
     # Вид карточки плана задаёт только бот: поле из входа агента отбрасывается
-    # (ревью Codex 29.10, как у MAILSEND_CARD_KEY).
+    # (ревью Codex 29.10, как у outbound.MAILSEND_CARD_KEY).
     tool_input = {k: v for k, v in tool_input.items() if k != PLAN_CARD_KEY}
 
     application: Application = request.app["application"]
@@ -3342,22 +3169,8 @@ async def handle_approve(request: web.Request) -> web.Response:
             tool_input=tool_input, decision="deny:guarded-data",
         )
         return web.json_response({"decision": "deny", "reason": guarded})
-    # Отправка от имени Ивана мимо всех автоаппрувов ниже, сразу на карточку
-    # (_OUTBOUND_SEND_RE).
-    outbound = _is_outbound_send(tool_name)
-    refusal = _outbound_refusal(tool_name, tool_input) if outbound else None
-    if refusal:
-        aid = uuid.uuid4().hex[:12]
-        log.info("approve deny aid=%s tool=%s (outbound: %s)", aid, tool_name, refusal)
-        await asyncio.to_thread(
-            _audit,
-            audit_path,
-            approval_id=aid,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            decision="deny:outbound",
-        )
-        return web.json_response({"decision": "deny", "reason": refusal})
+    # Отправка от имени Ивана мимо всех автоаппрувов ниже: решает outbound.decide.
+    sending = outbound.is_send(tool_name)
     # Этап плана (/plan и задачи до ✅): только чтение. Признак берётся и из
     # режима, присланного хуком, и из метки бота на сессии (plan_stage_sids):
     # режим CLI может прийти пустым. Читающее разрешается здесь, остальное
@@ -3374,7 +3187,11 @@ async def handle_approve(request: web.Request) -> web.Response:
         why_not = ""
         if plan_req[0] == "bad":
             why_not = plan_req[1]
-        elif not cfg.plan_cards or not run_id or target is None or is_unattended or plan_stage:
+        elif not cfg.plan_cards:
+            why_not = _("план не нужен: шаги идут без карточек, карточка только на опасное "
+                        "(удаление каталогов, отправка людям, серверы заказчиков, защита бота). "
+                        "Делай, что просил Иван")
+        elif not run_id or target is None or is_unattended or plan_stage:
             why_not = _("карточка плана здесь не выдаётся (фоновый ран, этап плана или режим "
                         "выключен): действуй по обычным правилам, каждое изменение карточкой")
         elif (session_id in exec_sids
@@ -3413,7 +3230,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             ok = target_path is not None and _two_mind_request(target_path, cfg.state_dir)
         elif tool_name == "WebFetch":
             ok = _curl_url_ok(str(tool_input.get("url", "")))
-        elif tool_name.startswith("mcp__") and not outbound:
+        elif tool_name.startswith("mcp__") and not sending:
             # Свой список читающих глаголов: настройка MCP_AUTO_ALLOW_REGEX
             # может разрешать и запись (ревью Codex 13.10).
             short_tool = tool_name.split("__", 2)[-1]
@@ -3421,7 +3238,7 @@ async def handle_approve(request: web.Request) -> web.Response:
                   or _todoist_read(tool_name))
         else:
             ok = False
-        force_card = not ok and task_think and tool_name not in _PLAN_WRITE_TOOLS and not outbound
+        force_card = not ok and task_think and tool_name not in _PLAN_WRITE_TOOLS and not sending
     if plan_stage and not force_card:
         aid = uuid.uuid4().hex[:12]
         log.info("approve %s aid=%s tool=%s (plan-stage)", "allow" if ok else "deny", aid, tool_name)
@@ -3440,39 +3257,101 @@ async def handle_approve(request: web.Request) -> web.Response:
                         "нужна эта команда, назови её владельцу словами."),
         })
     # Письмо модулем mailsend: карточка отправки, как у Gmail MCP
-    # (MAILSEND_CARD_KEY). Снимок письма считает только бот, поле из входа
+    # (outbound.MAILSEND_CARD_KEY). Снимок письма считает только бот, поле из входа
     # агента отбрасывается.
     mail_kind, mail_info = "", None
     if tool_name == "Bash":
-        tool_input = {k: v for k, v in tool_input.items() if k != MAILSEND_CARD_KEY}
+        tool_input = {k: v for k, v in tool_input.items() if k != outbound.MAILSEND_CARD_KEY}
         if not plan_call:
             mail_kind, mail_info = await asyncio.to_thread(
-                _mailsend_check, str(tool_input.get("command", "")), cwd)
-        if mail_kind == "deny":
-            aid = uuid.uuid4().hex[:12]
-            log.info("approve deny aid=%s tool=Bash (mailsend: %s)", aid, mail_info)
-            await asyncio.to_thread(
-                _audit,
-                audit_path,
-                approval_id=aid,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                decision="deny:outbound",
-            )
-            return web.json_response({"decision": "deny", "reason": mail_info})
-        if mail_kind in ("card", "mention"):
-            outbound = True
-            if force_card:
+                outbound.mailsend_check, str(tool_input.get("command", "")), cwd)
+        if mail_kind in ("card", "mention", "deny"):
+            sending = True
+            if force_card and mail_kind != "deny":
                 # Письмо распознаётся только здесь: до «Делай» отправки нет и
                 # карточкой (ревью Codex 18.10).
                 return web.json_response({"decision": "deny", "reason": _(_TASK_THINK_DENY)})
+    # Модель «разрешено всё, кроме опасного» (решение Ивана 03.11.2026): без
+    # карточки любое действие, кроме пяти классов serious.py; опасное идёт
+    # карточкой мимо всех автоаппрувов ниже, кроме окна ⏩. Чужой текст, этап
+    # плана, перезапуск бота и общие данные решены выше и сюда не доходят.
+    # На обдумывании задачи (force_card) тоже: вид сервера заказчика и отправка
+    # мимо карточки отправки решают окно ⏩ и пояснение (ревью 03.11.2026).
+    danger_why: set[str] = set()
+    if not sending and not plan_text:
+        danger_why = await asyncio.to_thread(
+            serious.reasons, tool_name, tool_input, cwd,
+            customer_hosts=getattr(cfg, "approve_customer_hosts", ()),
+            telegram_port=getattr(cfg, "telegram_mcp_port", 8770))
+    customer = serious.customer_kind(danger_why)
+    # Отправка людям мимо карточки отправки (сервер Telegram на loopback,
+    # внешний сервис) и сервер заказчика из фонового рана: отказ сразу,
+    # карточка ждала бы без человека весь срок (решение Ивана 03.11.2026).
+    # Известное чтение у заказчика причины не даёт и сюда не попадает.
+    outward = serious.sends(danger_why)
+    if is_unattended and (outward or customer == "change"):
+        decision = "deny:outbound-unattended" if outward else "deny:customer-unattended"
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve deny aid=%s tool=%s target=%s (%s)", aid, tool_name, target_key, decision)
+        await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
+                                tool_input=tool_input, decision=decision, why=sorted(danger_why))
+        return web.json_response({"decision": "deny", "reason": _(outbound.UNATTENDED_HINT) if outward
+                                  else _(CUSTOMER_UNATTENDED_HINT)})
+    # Изменение на сервере заказчика: карточка показывает пояснение агента,
+    # без него Иван решать не должен. Короткое или пустое: отказ без карточки.
+    if customer == "change" and len(str(tool_input.get("description") or "").strip()) < CUSTOMER_DESCRIPTION_MIN:
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve deny aid=%s tool=%s target=%s (customer change without description)",
+                 aid, tool_name, target_key)
+        await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
+                                tool_input=tool_input, decision="deny:customer-description",
+                                why=sorted(danger_why))
+        return web.json_response({"decision": "deny", "reason": _(CUSTOMER_DESCRIPTION_HINT).format(
+            n=CUSTOMER_DESCRIPTION_MIN)})
+    # Отправка от имени Ивана: себе без карточки, отказ с причиной (пересылка,
+    # письмо не уйдёт, фоновый ран, путь файла) или карточка мимо всех
+    # автоаппрувов ниже (outbound.decide).
+    if sending:
+        verdict = await outbound.decide(tool_name, tool_input, cfg=cfg, unattended=is_unattended,
+                                        mail_kind=mail_kind, mail_info=mail_info)
+        if verdict.decision != "card":
+            aid = uuid.uuid4().hex[:12]
+            log.info("approve %s aid=%s tool=%s target=%s (%s)",
+                     verdict.decision, aid, tool_name, target_key, verdict.audit)
+            await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
+                                    tool_input=tool_input, decision=verdict.audit)
+            return web.json_response({"decision": verdict.decision, "reason": verdict.reason})
+    with_human = target is not None and not is_unattended
+    secret = await asyncio.to_thread(_touches_secret, tool_name, tool_input, cwd)
+    if (not sending and not force_card and not plan_text and not danger_why
+            # Фоновый ран секрет по-прежнему не трогает без карточки: человека рядом
+            # нет, а ключ в заголовке ушёл бы куда угодно (ревью Opus 03.11.2026).
+            # Живой чат, в том числе чат Домового, читает секрет без карточки:
+            # принятый риск (guard3, Н6, docs/audit-2026-11/guard3-decisions.md).
+            and not (is_unattended and secret)
+            and (with_human or _unattended_auto_allowed(is_unattended, permission_mode))
+            # Запись в whitelist идёт своей веткой ниже, с заметкой «✍️» в футере хода.
+            and not (with_human and _whitelist_hit(tool_name, tool_input, cfg))
+            # Запись в память идёт своей веткой ниже, с уведомлением «💾 подаю в память».
+            and not (tool_name == "Bash" and not is_unattended and memory_write_auto_allowed(
+                str(tool_input.get("command", "")), cfg.bash_auto_allow_re,
+                cfg.state_dir / MEMORY_DRAFTS_DIRNAME))):
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve auto-allow aid=%s tool=%s target=%s (default)", aid, tool_name, target_key)
+        await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
+                                tool_input=tool_input, decision="allow:default")
+        return web.json_response({"decision": "allow", "reason": "default"})
+    straight = bool(danger_why)
     # Чат с автоаппрувом по умолчанию (APPROVE_AUTO_CHAT_KEYS): без карточек
     # вообще, включая unattended-раны. Только для зарегистрированной сессии
     # (target известен): primary-fallback чужой сессии сюда не попадает.
-    # Чтение и запись секретов идут дальше, на карточку, и у фонового рана
-    # ниже тоже (находка Codex 15.10).
-    secret = await asyncio.to_thread(_touches_secret, tool_name, tool_input, cwd)
-    if not force_card and not outbound and not secret and _chat_auto_allowed(target, target_key, cfg.approve_auto_chat_keys):
+    # Живой ран такого чата с секретом сюда не доходит: allow:default выше
+    # пускает чтение секрета в любом живом чате (решение Ивана по guard3, Н6,
+    # docs/audit-2026-11/guard3-decisions.md); вынести его можно только
+    # отправкой людям или в сеть, а это причины serious.py. Здесь остаётся
+    # фоновый ран этого чата: секрет у него идёт дальше, на карточку.
+    if not force_card and not sending and not secret and not straight and _chat_auto_allowed(
+            target, target_key, cfg.approve_auto_chat_keys):
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (chat-auto)", aid, tool_name, target_key)
         await asyncio.to_thread(
@@ -3488,7 +3367,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # не теме (bot.py ставит и снимает метку по sid). Секреты, отправка от
     # имени Ивана и перезапуск бота идут своими путями выше и ниже (ревью
     # Codex 15.10: опасный шаг получает свою карточку, остальное идёт).
-    if not outbound and not secret and target is not None and session_id and session_id in exec_sids:
+    if not sending and not secret and not straight and target is not None and session_id and session_id in exec_sids:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (task-exec)", aid, tool_name, target_key)
         await asyncio.to_thread(
@@ -3505,12 +3384,13 @@ async def handle_approve(request: web.Request) -> web.Response:
     # Отправка от имени Ивана, секреты и действия с метками _plan_card_tags идут
     # дальше, на карточку; запрос нового плана тоже (ревью Codex 29.10).
     grant = (runs.plan_for(session_id)
-             if target is not None and not is_unattended and not force_card and not plan_text else None)
+             if target is not None and not is_unattended and not force_card and not plan_text
+             and not straight else None)
     if grant is not None and tool_name == "Bash" and memory_write_auto_allowed(
             str(tool_input.get("command", "")), cfg.bash_auto_allow_re, cfg.state_dir / MEMORY_DRAFTS_DIRNAME):
         # Запись в память идёт своей веткой ниже, с уведомлением «💾 подаю в память».
         grant = None
-    if grant is not None and not outbound and not secret:
+    if grant is not None and not sending and not secret:
         card_tags = await asyncio.to_thread(_plan_card_tags, tool_name, tool_input, cwd, grant.text)
         if not card_tags:
             aid = uuid.uuid4().hex[:12]
@@ -3526,7 +3406,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # _unattended_auto_allowed. Источники свои: /at пишет сам Иван, /event
     # принимается только с loopback и только JSON (_reject_browser_forgery), с
     # X-Approve-Token при секрете, скилл запускает код бота (SCHEDULED_ENV).
-    if not outbound and not secret and _unattended_auto_allowed(is_unattended, permission_mode):
+    if not sending and not secret and not straight and _unattended_auto_allowed(is_unattended, permission_mode):
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (unattended)", aid, tool_name, target_key)
         await asyncio.to_thread(
@@ -3541,11 +3421,13 @@ async def handle_approve(request: web.Request) -> web.Response:
 
     burst_eligible = (
         target is not None and not is_unattended and tool_name not in _BURST_DENY_TOOLS
-        and not outbound
+        and not sending
         # Скиллы бота (task_new заводит тему и запускает ран) до «Делай» только
         # карточкой: окно обдумывания для проверок, не для действий бота.
         and not (force_card and _calls_bot_skill(str(tool_input.get("command", ""))))
         and not plan_text
+        # Изменение на сервере заказчика и отправку людям окно не пропускает.
+        and customer != "change" and not outward
     )
     if burst_eligible and time.time() < burst_until:
         aid = uuid.uuid4().hex[:12]
@@ -3572,7 +3454,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # допускает запись аргументами внешне безобидных команд (`sort -o`,
     # `git branch -D`). Пока человек в чате — это осознанный размен на удобство;
     # для /at, /event и plan-ранов размена нет, там всё через карточку.
-    whitelist = () if is_unattended or force_card else cfg.approve_whitelist_paths
+    whitelist = () if is_unattended or force_card or straight else cfg.approve_whitelist_paths
     if whitelist:
         target_path = _target_path(tool_name, tool_input)
         if (
@@ -3616,7 +3498,8 @@ async def handle_approve(request: web.Request) -> web.Response:
     # через approve. Notification в чат намеренно НЕ шлём: цель именно убрать
     # шум; видимость сохраняется через audit decision="allow:bash-safe".
     # Сюда же вызовы скиллов бота (_SKILL_CALL_RE). Для plan-рана ничего из этого.
-    if tool_name == "Bash" and not is_unattended and not outbound and not force_card and not plan_text:
+    if tool_name == "Bash" and not is_unattended and not sending and not force_card and not plan_text \
+            and not straight:
         cmd = str(tool_input.get("command", ""))
         # Проверка раскрывает шаблоны и смотрит файлы: в отдельном потоке,
         # чтобы медленная файловая система не держала остальные запросы бота.
@@ -3686,7 +3569,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # MCP-чтение оставляем и для unattended: разбор внешнего события без
     # чтения бесполезен, а мутирующие MCP под дефолтный regex не подпадают.
     mcp_re = cfg.mcp_auto_allow_re
-    if tool_name.startswith("mcp__") and mcp_re is not None and not outbound and not force_card:
+    if tool_name.startswith("mcp__") and mcp_re is not None and not sending and not force_card and not straight:
         # Имя без префикса mcp__<server>__: сервер-часть содержит UUID/дефисы
         # и в regex ей делать нечего.
         short_tool = tool_name.split("__", 2)[-1]
@@ -3709,7 +3592,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # спамят. Видимость через audit decision="allow:webfetch". Адрес тот же,
     # что у curl без карточки (`_curl_url_ok`): публичное доменное имя по
     # http(s); localhost, IP-литералы и имена вида nip.io идут на карточку.
-    if tool_name == "WebFetch" and _curl_url_ok(str(tool_input.get("url", ""))):
+    if tool_name == "WebFetch" and not straight and _curl_url_ok(str(tool_input.get("url", ""))):
         aid = uuid.uuid4().hex[:12]
         url = str(tool_input.get("url", "?"))
         log.info("approve auto-allow aid=%s tool=WebFetch url=%s (always)", aid, url)
@@ -3741,9 +3624,9 @@ async def handle_approve(request: web.Request) -> web.Response:
 
     card_input = tool_input
     if mail_kind == "card":
-        card_input = {**tool_input, MAILSEND_CARD_KEY: mail_info}
+        card_input = {**tool_input, outbound.MAILSEND_CARD_KEY: mail_info}
     elif mail_kind == "mention":
-        card_input = {**tool_input, MAILSEND_CARD_KEY: {"warning": True}}
+        card_input = {**tool_input, outbound.MAILSEND_CARD_KEY: {"warning": True}}
     if plan_text:
         card_input = {**tool_input, PLAN_CARD_KEY: {"text": plan_text}}
     pending = registry.create(
@@ -3756,6 +3639,8 @@ async def handle_approve(request: web.Request) -> web.Response:
         origin_key=origin_key,
         run_id=run_id,
     )
+    pending.customer = customer
+    pending.sends = outward
     log.info("approve request aid=%s tool=%s sid=%s", pending.approval_id, tool_name, (session_id or "?")[:8])
     # 2-3 попытки: секундный лаг Telegram/502 не должен молча превращаться в
     # deny — Claude обойдёт «отклонённый» шаг, а пользователь этого не увидит.
@@ -3766,7 +3651,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # такие). Поэтому ждём нажатия, как после удачной отправки. Карточке
     # отправки от имени Ивана нужен номер её сообщения (нажатие сверяется с
     # ним), ей прежний повтор.
-    needs_message_id = (_is_outbound_send(tool_name) or MAILSEND_CARD_KEY in card_input
+    needs_message_id = (outbound.is_send(tool_name) or outbound.MAILSEND_CARD_KEY in card_input
                         or PLAN_CARD_KEY in card_input)
     send_started = time.monotonic()
     # getattr: в тестах cfg без срока, карточка тогда его не называет.
@@ -3831,7 +3716,9 @@ async def handle_approve(request: web.Request) -> web.Response:
         log.info("approve timeout aid=%s", pending.approval_id)
         await _mark_card_timeout(application, pending, target_chat_id, target_thread_id,
                                  cfg.approve_timeout_sec)
-        return web.json_response({"decision": "deny", "reason": "user timeout"})
+        # Причина агенту словами: когда повторять (проект 03.11.2026, п. 4).
+        return web.json_response({"decision": "deny", "reason": _(CARD_TIMEOUT_HINT).format(
+            mins=max(1, round(cfg.approve_timeout_sec / 60)))})
 
     # ✅ на карточке письма: билет на ровно это письмо (хеш снимка), его
     # гасит mailsend. Билет не записался, значит и разрешать нечего.
@@ -3860,8 +3747,15 @@ async def handle_approve(request: web.Request) -> web.Response:
         tool_input=tool_input,
         decision="allow:plan-card" if plan_granted else decision,
         plan=plan_granted,
+        why=sorted(danger_why),
     )
     log.info("approve resolved aid=%s decision=%s", pending.approval_id, decision)
+    if decision == CARD_CHANGED:
+        decision, reason = "deny", _(CARD_CHANGED_HINT)
+    if decision == "deny" and not reason:
+        # ❌ Ивана на карточке: агенту не повторять вызов. Снятие карточки
+        # /cancel и концом рана приходит как deny:<причина> и сюда не попадает.
+        reason = _(CARD_DENIED_HINT)
     if reason:
         return web.json_response({"decision": decision, "reason": reason})
     return web.json_response({"decision": decision})

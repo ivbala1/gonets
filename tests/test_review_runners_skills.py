@@ -73,10 +73,14 @@ def test_b19_allowlist_only_untrusted():
         with patch.object(runner, 'untrusted_settings_path', return_value=Path('/tmp/u.json')):
             _, args = await run_fake(fake_proc(), untrusted_sids=set())
         assert '--tools' not in args
-        assert args[args.index('--allowedTools') + 1:args.index('--allowedTools') + 3] == ('Read', 'ToolSearch')
+        assert args[args.index('--allowedTools') + 1:args.index('--allowedTools') + 5] == (
+            'Read', 'ToolSearch', 'Grep', 'Glob')
         assert args[args.index('--settings') + 1] == '/tmp/u.json'
         _, ordinary = await run_fake(fake_proc())
-        assert '--allowedTools' not in ordinary and '--tools' not in ordinary
+        # Обычному рану только Grep и Glob: без них их нет в наборе (03.11.2026).
+        i = ordinary.index('--allowedTools')
+        assert ordinary[i + 1:i + 3] == ('Grep', 'Glob') and ordinary[i + 3].startswith('-')
+        assert '--tools' not in ordinary
     asyncio.run(go())
 
 

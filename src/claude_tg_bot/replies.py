@@ -23,6 +23,7 @@ from telegram import MessageEntity, ReplyParameters, Update
 from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
+from . import reactions
 from .claude_runner import ClaudeResult
 from .config import Config
 from .i18n import _
@@ -93,15 +94,16 @@ async def _send_once(send: Callable[[], Awaitable[Any]]) -> Any:
         return None
 
 
-async def send_reply_text(cfg: Config, update: Update, text: str) -> None:
+async def send_reply_text(cfg: Config, update: Update, text: str, *, reply_markup=None) -> None:
     """Длинный текст — как файл, короткий — чанками. Splitter по \\n, не посреди слова."""
-    await send_text_to(cfg, update.message, text)
+    await send_text_to(cfg, update.message, text, reply_markup=reply_markup)
 
 
-async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
+async def send_text_to(cfg: Config, msg, text: str, head: str = "", *, reply_markup=None) -> None:
     """То же, что send_reply_text, ответом на любое сообщение (кнопка под голосовым).
     head: первая строка каждого куска и начало подписи файла (ярлык дела,
-    по нему свайп на любой кусок находит дело, опыт В1)."""
+    по нему свайп на любой кусок находит дело, опыт В1). reply_markup: кнопки
+    под последним куском."""
     if not text.strip():
         return
     if len(text) >= cfg.large_reply_as_file_threshold:
@@ -112,7 +114,8 @@ async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
             buf.name = "claude-reply.txt"
             caption = _("{count} chars").format(count=len(text))
             return msg.reply_document(document=buf, filename="claude-reply.txt",
-                                      caption=f"{head}\n{caption}" if head else caption)
+                                      caption=f"{head}\n{caption}" if head else caption,
+                                      **({"reply_markup": reply_markup} if reply_markup else {}))
 
         await _send_once(doc)
         return
@@ -123,30 +126,39 @@ async def send_text_to(cfg: Config, msg, text: str, head: str = "") -> None:
     quote = _quote_of(msg)
     # +2: перевод строки и второе слово UTF-16 у 🧵 (Telegram считает так).
     limit = cfg.telegram_text_limit - (len(head) + 2 if head else 0)
-    for chunk in split_for_telegram(text, limit):
+    chunks = list(split_for_telegram(text, limit))
+    for i, chunk in enumerate(chunks):
         if head:
             chunk = f"{head}\n{chunk}"
         plain, entities = render_markup(chunk)
+        markup = {"reply_markup": reply_markup} if reply_markup and i == len(chunks) - 1 else {}
         extra = {"reply_parameters": quote} if quote is not None else {}
         quote = None
         try:
             if not entities:
-                await _send_once(lambda chunk=chunk, extra=extra: msg.reply_text(chunk, **extra))
+                _noted(plain, await _send_once(
+                    lambda chunk=chunk, extra=extra: msg.reply_text(chunk, **extra, **markup)))
                 continue
             try:
-                await _send_once(lambda plain=plain, entities=entities, extra=extra:
-                                 msg.reply_text(plain, entities=entities, **extra))
+                _noted(plain, await _send_once(lambda plain=plain, entities=entities, extra=extra:
+                                               msg.reply_text(plain, entities=entities, **extra, **markup)))
             except BadRequest:
                 if extra:
                     raise
                 # Сущности не приняты: ответ важнее шрифтов.
                 log.exception("markup entities rejected, sending raw")
-                await _send_once(lambda chunk=chunk: msg.reply_text(chunk))
+                _noted(plain, await _send_once(lambda chunk=chunk: msg.reply_text(chunk, **markup)))
         except BadRequest:
             if not extra:
                 raise
             log.warning("quoted reply rejected, sending without quote", exc_info=True)
-            await _send_once(lambda chunk=chunk: msg.reply_text(chunk))
+            _noted(plain, await _send_once(lambda chunk=chunk: msg.reply_text(chunk, **markup)))
+
+
+def _noted(text: str, sent: Any) -> None:
+    """Ответ модели в журнал для реакций. Только здесь и в notify, а не во всех
+    отправках бота: служебные сообщения несут коды входа (auth.py)."""
+    reactions.remember(getattr(sent, "chat_id", None), getattr(sent, "message_id", None), text)
 
 
 def _quote_of(msg) -> ReplyParameters | None:

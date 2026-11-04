@@ -444,13 +444,14 @@ class RoundSixTests(unittest.TestCase):
             for cmd in ("grep -d rec token .", "grep -d recu token .", "grep -drecur token .",
                         "grep --directories=rec token .", "grep --dir=recurs token .",
                         "grep --rec token .", "grep --recursive token .", "grep -Rn token .",
-                        "grep -nr token src/bot.py", "grep --der token .",
+                        "grep -nr token src/bot.py .", "grep --der token .",
                         "grep --dereference-r token .", "grep --dereference-recursive token .",
                         "egrep -r token .", "fgrep --recursive token ."):
                 with self.subTest(cmd=cmd):
                     self.search_card(cmd, d)
             for cmd in ("grep -d re token .", "grep -d read token .", "grep -d skip token .",
-                        "grep -n token src/bot.py", "grep -c token src"):
+                        "grep -n token src/bot.py", "grep -c token src",
+                        "grep -nr token src/bot.py"):
                 with self.subTest(cmd=cmd):
                     self.ok(cmd, d)
 
@@ -619,7 +620,7 @@ class HookTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "settings.json"
             path.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
-                {"type": "command", "command": f"python -m {HOOK_APPROVE_MODULE}",
+                {"type": "command", "command": f"python -P -m {HOOK_APPROVE_MODULE}",
                  "timeout": hook_timeout}]}]}}))
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -641,7 +642,7 @@ class HookTimeoutTests(unittest.TestCase):
         from claude_tg_bot.config import HOOK_APPROVE_MODULE, load_config
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "settings.json"
-            hooks = [{"type": "command", "command": f"python -m {HOOK_APPROVE_MODULE}", "timeout": t}
+            hooks = [{"type": "command", "command": f"python -P -m {HOOK_APPROVE_MODULE}", "timeout": t}
                      for t in (960, 600, True)]
             path.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": hooks}]}}))
             from claude_tg_bot import config as cfgmod
@@ -657,7 +658,7 @@ class HookTimeoutTests(unittest.TestCase):
         path = Path(d) / "settings.json"
         path.write_text(json.dumps({"hooks": {"PreToolUse": [{
             "matcher": "Bash|Monitor|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
-            "hooks": [{"type": "command", "command": f"python -m {HOOK_APPROVE_MODULE}",
+            "hooks": [{"type": "command", "command": f"python -P -m {HOOK_APPROVE_MODULE}",
                        "timeout": timeout, "onFailure": "block"}]}]}}))
         return path
 
@@ -707,7 +708,7 @@ class ClaudeVersionTests(unittest.TestCase):
         path = Path(d) / "settings.json"
         path.write_text(json.dumps({"hooks": {"PreToolUse": [{
             "matcher": "Bash|Monitor|Write|Edit|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
-            "hooks": [{"type": "command", "command": f"python -m {HOOK_APPROVE_MODULE}",
+            "hooks": [{"type": "command", "command": f"python -P -m {HOOK_APPROVE_MODULE}",
                        "timeout": 960, "onFailure": "block"}]}]}}))
         return {"TELEGRAM_BOT_TOKEN": "1:test", "TELEGRAM_ALLOWED_USER_IDS": "1",
                 "CLAUDE_BIN": str(claude), "CLAUDE_HOOK_SETTINGS": str(path)}

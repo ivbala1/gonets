@@ -24,6 +24,7 @@ from .config import agent_env
 from .i18n import _
 # Ран по чужому тексту: списки замков и проверка в модуле untrusted.
 from .untrusted import (  # noqa: F401  (UNTRUSTED_READ_TOOLS: для тестов и справки)
+    SEARCH_TOOLS,
     UNTRUSTED_ALLOWED_TOOLS,
     UNTRUSTED_ASK_TOOLS,
     UNTRUSTED_READ_TOOLS,
@@ -638,8 +639,9 @@ def untrusted_settings_path(hook_settings: Path) -> Path:
     perms = data.setdefault("permissions", {})
     perms["ask"] = list(dict.fromkeys([*(perms.get("ask") or []), *UNTRUSTED_ASK_TOOLS]))
     # Сбой самой проверки (не запустилась, упала до ответа) это код 2, то
-    # есть отказ, а не пропуск.
-    guard = f"{shlex.quote(sys.executable)} -m claude_tg_bot.untrusted || exit 2"
+    # есть отказ, а не пропуск. `-P`: пакет `claude_tg_bot` в каталоге сессии
+    # не подменит проверку, как у хука бота (guard3, Н2, ревью PR 10).
+    guard = f"{shlex.quote(sys.executable)} -P -m claude_tg_bot.untrusted || exit 2"
     pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
     pre.append({"matcher": "*", "hooks": [{"type": "command", "command": guard, "timeout": 30}]})
     # Таймаут или сбой хука без onFailure пропускает действие (проверено на
@@ -811,6 +813,10 @@ async def run_claude(
         # UNTRUSTED_ALLOWED_TOOLS). Новые встроенные инструменты ловит
         # untrusted_unknown_tools по событию init.
         common.extend(["--allowedTools", *UNTRUSTED_ALLOWED_TOOLS])
+    else:
+        # Без этого флага нативный Claude Code не даёт агенту Grep и Glob
+        # (SEARCH_TOOLS в untrusted.py).
+        common.extend(["--allowedTools", *SEARCH_TOOLS])
     if effort:
         # Передаём всегда, а не полагаемся на settings.json/env: флаг (CLI-arg)
         # детерминированно бьёт обе нижние ступени precedence, поэтому effort

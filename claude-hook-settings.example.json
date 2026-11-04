@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "@REPO@/.venv/bin/python -m claude_tg_bot.hook_approve",
+            "command": "@REPO@/.venv/bin/python -P -m claude_tg_bot.hook_approve",
             "timeout": 960,
             "onFailure": "block"
           }

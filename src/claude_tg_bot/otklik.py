@@ -241,14 +241,28 @@ def approved_prompt(rec: dict[str, Any], base: Path) -> str:
 
 # ---- Переходы состояния: только под locked() ----
 
+def pick_ok(rec: dict[str, Any] | None, sha: str, gen: int, action: str, chat_id: int, message_id: int) -> bool:
+    """Кнопка действует: хеш, поколение, сообщение и статус записи совпадают."""
+    return not (rec is None or rec.get("sha") != sha or rec.get("sha") != record_sha(rec)
+                or gen_of(rec) != gen or rec.get("status") not in PICK_FROM[action]
+                or rec.get("message_id") != message_id or rec.get("chat_id") != chat_id)
+
+
+def shown_text(rec: dict[str, Any]) -> str:
+    """Текст сообщения отклика, как его вернул Telegram при показе этого
+    состояния; не записан, значит текст по записи (render)."""
+    text = rec.get("shown_text")
+    if isinstance(text, str) and text and rec.get("shown") == [rec.get("status"), gen_of(rec)]:
+        return text
+    return render(rec)
+
+
 def pick(base: Path, oid: str, sha: str, gen: int, action: str,
          chat_id: int, message_id: int) -> dict[str, Any]:
     """Нажатие кнопки: сверка хеша, поколения, сообщения и статуса, затем переход."""
     with locked(base):
         rec = load(base, oid)
-        if (rec is None or rec.get("sha") != sha or rec.get("sha") != record_sha(rec)
-                or gen_of(rec) != gen or rec.get("status") not in PICK_FROM[action]
-                or rec.get("message_id") != message_id or rec.get("chat_id") != chat_id):
+        if not pick_ok(rec, sha, gen, action, chat_id, message_id):
             raise Refused(_("Кнопка устарела: этот отклик уже решён или заменён"))
         if action in ("c", "r"):
             rec.update(status="pending", gen=gen_of(rec) + 1, attempt=None)
@@ -412,14 +426,20 @@ def recover(base: Path) -> list[dict[str, Any]]:
     return changed
 
 
-def mark_shown(base: Path, oid: str, status: str, gen: int) -> bool:
+def mark_shown(base: Path, oid: str, status: str, gen: int, text: str | None = None) -> bool:
     """Сообщение в чате показывает это состояние: синхронизация его не тронет.
+    text: текст сообщения из ответа Telegram, эталон сверки на ✅ (shown_text);
+    без него прежний текст остаётся, только если состояние то же.
     False: запись успела смениться, показанное уже устарело, отметка снята."""
     with locked(base):
         rec = load(base, oid)
         if rec is None:
             return True
         current = rec.get("status") == status and gen_of(rec) == gen
+        if text and current:
+            rec["shown_text"] = text
+        elif not current or rec.get("shown") != [status, gen]:
+            rec.pop("shown_text", None)
         rec["shown"] = [status, gen] if current else None
         save(base, rec)
         return current
@@ -490,6 +510,13 @@ def _bot_api(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     return r.json()
 
 
+def _result_text(res: Any) -> str | None:
+    """Текст сообщения из ответа Bot API (`result.text`)."""
+    result = res.get("result") if isinstance(res, dict) else None
+    text = result.get("text") if isinstance(result, dict) else None
+    return text if isinstance(text, str) and text else None
+
+
 def _markup(rec: dict[str, Any]) -> dict[str, Any]:
     return {"inline_keyboard": [[{"text": b["text"], "callback_data": b["data"]} for b in row]
                                 for row in buttons(rec)]}
@@ -500,13 +527,13 @@ def _show_in_chat(rec: dict[str, Any], base: Path | None = None) -> bool:
     Показанное отмечается в записи; не прошло, бот перерисует при старте."""
     if not rec.get("message_id") or rec.get("chat_id") is None:
         return True
-    ok = _bot_api("editMessageText", {
+    res = _bot_api("editMessageText", {
         "chat_id": rec["chat_id"], "message_id": rec["message_id"], "text": render(rec),
         "reply_markup": _markup(rec), "link_preview_options": {"is_disabled": True},
-    }) is not None
-    if ok and base is not None:
-        mark_shown(base, rec["id"], rec["status"], gen_of(rec))
-    return ok
+    })
+    if res is not None and base is not None:
+        mark_shown(base, rec["id"], rec["status"], gen_of(rec), _result_text(res))
+    return res is not None
 
 
 def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
@@ -568,13 +595,14 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
         rec["status"] = "pending"
         save(base, rec)
     payload = {"chat_id": rec["chat_id"], "message_id": rec["message_id"], "reply_markup": _markup(rec)}
-    if _bot_api("editMessageReplyMarkup", payload) is None and _bot_api("editMessageReplyMarkup", payload) is None:
+    shown = _bot_api("editMessageReplyMarkup", payload) or _bot_api("editMessageReplyMarkup", payload)
+    if shown is None:
         # Код 0: запись есть, повтор `new` дал бы второе сообщение. Кнопки
         # дорисует бот после рана (синхронизация по отметке показа).
         print(_("otklik {id}: сообщение ушло, кнопки не прикрепились, бот вернёт их после рана").format(
             id=rec['id']), file=sys.stderr)
     else:
-        mark_shown(base, rec["id"], "pending", gen_of(rec))
+        mark_shown(base, rec["id"], "pending", gen_of(rec), _result_text(shown) or _result_text(res))
     print(f"otklik {rec['id']} sent, message_id={rec['message_id']}")
     return 0
 

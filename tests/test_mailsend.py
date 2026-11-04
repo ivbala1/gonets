@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot import approval, mailsend  # noqa: E402
+from claude_tg_bot import approval, mailsend, outbound  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
 from tests.texts import msg_re  # noqa: E402
 
@@ -61,13 +61,13 @@ class CommandClassifyTests(_Env):
                     "--subject S --body-file body.txt",
                     self.cmd().replace(" --body-file", " \\\n  --body-file")):
             with self.subTest(cmd=cmd):
-                kind, info = approval._mailsend_check(cmd, "/home/user/src")
+                kind, info = outbound.mailsend_check(cmd, "/home/user/src")
                 self.assertEqual(kind, "card")
                 self.assertIn("Резюме", info["body"])
 
     def test_dry_run_and_help_skip_card(self) -> None:
-        self.assertEqual(approval._mailsend_check(self.cmd(" --dry-run"), None)[0], "dry")
-        self.assertEqual(approval._mailsend_check(f"{PY} --help", None)[0], "dry")
+        self.assertEqual(outbound.mailsend_check(self.cmd(" --dry-run"), None)[0], "dry")
+        self.assertEqual(outbound.mailsend_check(f"{PY} --help", None)[0], "dry")
 
     def test_tricky_forms_give_command_card(self) -> None:
         for cmd in (f'bash -c "{self.cmd()}"', f"x=$({self.cmd()})", f"`{self.cmd()}`",
@@ -75,12 +75,12 @@ class CommandClassifyTests(_Env):
                     f"bash <<'EOF'\n{self.cmd()}\nEOF", f"FOO=1 {self.cmd()}",
                     f"timeout 60 {self.cmd()}", "python -c 'import claude_tg_bot.mailsend'"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(approval._mailsend_check(cmd, "/x")[0], "mention")
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
 
     def test_file_names_are_not_mentions(self) -> None:
         for cmd in ("cat src/claude_tg_bot/mailsend.py", ".venv/bin/python -m pytest tests/test_mailsend.py"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(approval._mailsend_check(cmd, "/x")[0], "")
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "")
 
     def test_run_in_other_forms_gives_command_card(self) -> None:
         for cmd in (f"python3 src/claude_tg_bot/mailsend.py --to a@b.c",
@@ -89,7 +89,7 @@ class CommandClassifyTests(_Env):
                     "python3 - <<'EOF'\nfrom claude_tg_bot import mailsend\nmailsend.main()\nEOF",
                     f"env A=1 {self.cmd()}", f"sh -c 'git status; {self.cmd()}'"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(approval._mailsend_check(cmd, "/x")[0], "mention")
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
 
     def test_mentions_in_other_commands_are_not_mailsend(self) -> None:
         # Сообщение коммита, шаблон поиска, текст: письмо так не уходит.
@@ -102,7 +102,19 @@ class CommandClassifyTests(_Env):
                     "cat > /tmp/x.py <<'EOF'\nfrom claude_tg_bot import mailsend\nEOF",
                     ".venv/bin/python -m pytest -k mailsend"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(approval._mailsend_check(cmd, "/x"), ("", None))
+                self.assertEqual(outbound.mailsend_check(cmd, "/x"), ("", None))
+
+    def test_rtk_prefix_and_quoted_import(self) -> None:
+        # Разбор по outbound.executed_text (третье ревью 03.11.2026): `rtk git
+        # commit` это git, его сообщение не исполняется; `rtk python` исполняет.
+        for cmd in ("rtk git commit -m 'fix mailsend: python -m claude_tg_bot.mailsend'",
+                    "rtk proxy git commit -m 'python -m claude_tg_bot.mailsend'"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(outbound.mailsend_check(cmd, "/x"), ("", None))
+        for cmd in (f"rtk {self.cmd()}", "rtk python -m claude_tg_bot.mailsend --to a@b.c",
+                    "python3 -c \"import importlib; importlib.import_module('claude_tg_bot.mailsend').main()\""):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
 
     def test_bad_letter_denied(self) -> None:
         for cmd in (f"{PY} --to hr@example.com --subject S --body-file {self.body} "
@@ -111,14 +123,14 @@ class CommandClassifyTests(_Env):
                     f"{PY} --to 'a@b.c, d@e.f' --subject S --body-file {self.body}",
                     f"{PY} --to hr@example.com --subject S"):
             with self.subTest(cmd=cmd):
-                kind, reason = approval._mailsend_check(cmd, "/x")
+                kind, reason = outbound.mailsend_check(cmd, "/x")
                 self.assertEqual(kind, "deny")
                 self.assertTrue(reason.startswith("mailsend:"))
 
     def test_symlink_out_of_allowed_dir_denied(self) -> None:
         link = self.allowed / "link.pdf"
         link.symlink_to(self.outside / "secret.pdf")
-        kind, _ = approval._mailsend_check(
+        kind, _ = outbound.mailsend_check(
             f"{PY} --to a@b.c --subject S --body-file {self.body} --attach {link}", None)
         self.assertEqual(kind, "deny")
 
@@ -155,15 +167,22 @@ class HandleApproveTests(_Env):
             resp = asyncio.run(approval.handle_approve(request))
         return json.loads(resp.text), card
 
-    def test_send_goes_to_card_in_auto_chat_burst_and_unattended(self) -> None:
-        for unattended in (False, True):
-            with self.subTest(unattended=unattended):
-                out, card = self._decide(self.cmd(), unattended=unattended)
+    def test_send_goes_to_card_in_auto_chat_and_burst(self) -> None:
+        out, card = self._decide(self.cmd())
+        self.assertEqual(out["decision"], "deny")
+        card.assert_called()
+        shown = card.call_args.args[2].tool_input[outbound.MAILSEND_CARD_KEY]
+        self.assertEqual(shown["to"], ["hr@example.com"])
+        self.assertIn("Резюме <во> вложении.", shown["body"])
+
+    def test_unattended_send_refused_without_card(self) -> None:
+        # Фоновый ран письмо человеку не шлёт: черновик в отчёт (решение Ивана 03.11.2026).
+        for cmd in (self.cmd(), f'bash -c "{self.cmd()}"'):
+            with self.subTest(cmd=cmd[:40]):
+                out, card = self._decide(cmd, unattended=True)
                 self.assertEqual(out["decision"], "deny")
-                card.assert_called()
-                shown = card.call_args.args[2].tool_input[approval.MAILSEND_CARD_KEY]
-                self.assertEqual(shown["to"], ["hr@example.com"])
-                self.assertIn("Резюме <во> вложении.", shown["body"])
+                self.assertIn("черновик в отчёт", out["reason"])
+                card.assert_not_called()
 
     def test_dry_run_passes_without_card(self) -> None:
         out, card = self._decide(self.cmd(" --dry-run"))
@@ -174,7 +193,7 @@ class HandleApproveTests(_Env):
         out, card = self._decide(f'bash -c "{self.cmd()}"')
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
-        self.assertTrue(card.call_args.args[2].tool_input[approval.MAILSEND_CARD_KEY]["warning"])
+        self.assertTrue(card.call_args.args[2].tool_input[outbound.MAILSEND_CARD_KEY]["warning"])
 
     def test_commit_mentioning_mailsend_keeps_auto_approve(self) -> None:
         out, card = self._decide('git commit -m "fix mailsend approval"')
@@ -189,11 +208,11 @@ class HandleApproveTests(_Env):
         card.assert_not_called()
 
     def test_agent_cannot_supply_snapshot(self) -> None:
-        fake = {approval.MAILSEND_CARD_KEY: {"to": ["x@y.z"], "body": "подмена", "digest": "0" * 64}}
+        fake = {outbound.MAILSEND_CARD_KEY: {"to": ["x@y.z"], "body": "подмена", "digest": "0" * 64}}
         out, card = self._decide("ls", extra=fake)
         self.assertEqual(out["decision"], "allow")  # обычная команда, чат с автоаппрувом
         out, card = self._decide(self.cmd(), extra=fake)
-        shown = card.call_args.args[2].tool_input[approval.MAILSEND_CARD_KEY]
+        shown = card.call_args.args[2].tool_input[outbound.MAILSEND_CARD_KEY]
         self.assertNotIn("подмена", shown["body"])
 
     def test_approve_writes_ticket_deny_does_not(self) -> None:
@@ -202,7 +221,7 @@ class HandleApproveTests(_Env):
         self.assertEqual(list(mailsend.ticket_dir(self.state).glob("*.json")), [])
         out, card = self._decide(self.cmd(), press="allow")
         self.assertEqual(out["decision"], "allow")
-        digest = card.call_args.args[2].tool_input[approval.MAILSEND_CARD_KEY]["digest"]
+        digest = card.call_args.args[2].tool_input[outbound.MAILSEND_CARD_KEY]["digest"]
         self.assertTrue((mailsend.ticket_dir(self.state) / f"{digest}.json").is_file())
 
 
@@ -210,7 +229,7 @@ class SendAfterCardTests(_Env):
     """Билет карточки и отправка: то же письмо уходит один раз, изменённое нет."""
 
     def _approve(self) -> None:
-        kind, info = approval._mailsend_check(self.cmd(), None)
+        kind, info = outbound.mailsend_check(self.cmd(), None)
         self.assertEqual(kind, "card")
         mailsend.write_ticket(self.state, info["digest"], "s3")
 
@@ -265,7 +284,7 @@ class SendAfterCardTests(_Env):
                 smtp.send_message.assert_not_called()
 
     def test_forged_or_stale_ticket_refused(self) -> None:
-        kind, info = approval._mailsend_check(self.cmd(), None)
+        kind, info = outbound.mailsend_check(self.cmd(), None)
         mailsend.write_ticket(self.state, info["digest"], "другой секрет")
         self.assertEqual(_("билет одобрения не от бота"), mailsend.take_ticket(self.state, info["digest"], "s3"))
         mailsend.write_ticket(self.state, info["digest"], "s3")
@@ -287,9 +306,9 @@ class MailCardTextTests(_Env):
     def _input(self, body: str | None = None) -> dict:
         if body is not None:
             self.body.write_text(body, encoding="utf-8")
-        kind, info = approval._mailsend_check(self.cmd(), None)
+        kind, info = outbound.mailsend_check(self.cmd(), None)
         self.assertEqual(kind, "card")
-        return {"command": self.cmd(), "description": "", approval.MAILSEND_CARD_KEY: info}
+        return {"command": self.cmd(), "description": "", outbound.MAILSEND_CARD_KEY: info}
 
     def test_card_shows_recipient_subject_body_and_sizes(self) -> None:
         text = approval._format_tool_call("Bash", self._input(), "sid")

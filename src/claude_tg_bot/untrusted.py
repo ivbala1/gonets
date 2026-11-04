@@ -15,9 +15,9 @@
 - для перечисленных в UNTRUSTED_ASK_TOOLS ещё режим dontAsk с правилами
   permissions.ask: отказ даже при allow обоих хуков.
 
-permissions.deny и --tools меняют набор и ломают кэш; Grep и Glob в
---allowedTools добавляют в набор инструменты, которых у обычного рана нет
-(всё проверено на Opus 19.10.2026).
+permissions.deny и --tools меняют набор и ломают кэш (проверено на Opus
+19.10.2026). Grep и Glob в --allowedTools добавляют их в набор, поэтому с
+03.11.2026 бот называет их всем ранам одинаково (SEARCH_TOOLS ниже).
 
 Как хук: python -m claude_tg_bot.untrusted, JSON PreToolUse на stdin.
 """
@@ -35,7 +35,14 @@ from .i18n import _
 
 _MCP_RE_ENV = "APPROVE_MCP_AUTO_ALLOW_REGEX"
 
-UNTRUSTED_ALLOWED_TOOLS = ("Read", "ToolSearch")
+# Нативный Claude Code (видно с 2.1.306, 21.10.2026) убирает Grep и Glob из
+# набора, если их не назвать в --tools или --allowedTools, а поиск отдаёт
+# встроенному ugrep в Bash; Bash grep -r у бота идёт карточкой. Бот называет
+# их всем ранам одинаково, набор и кэш у обычного рана и рана по чужому тексту
+# совпадают (cc9a712). Запреты Read() в настройках бота на Grep действуют
+# (проба 03.11.2026 на 2.1.317: .env в выдаче нет).
+SEARCH_TOOLS = ("Grep", "Glob")
+UNTRUSTED_ALLOWED_TOOLS = ("Read", "ToolSearch", *SEARCH_TOOLS)
 # Встроенные инструменты, которые только читают.
 UNTRUSTED_READ_TOOLS = (
     "Read", "ToolSearch", "Grep", "Glob", "ListMcpResourcesTool", "ReadMcpResourceTool",

@@ -238,7 +238,7 @@ class WorkshopOtklikFreshTests(unittest.TestCase):
     """Разбор 22.10.2026, решение Ивана: ✅ в мастерской свежей сессией, модель та же."""
 
     def _press(self, source: str, at_jobs=None):
-        from claude_tg_bot import otklik
+        from claude_tg_bot import otklik, tg_otklik
         with tempfile.TemporaryDirectory() as d:
             base = otklik.otklik_dir(Path(d))
             rec = otklik.new_record("Acme", "почта", "Hello")
@@ -246,7 +246,8 @@ class WorkshopOtklikFreshTests(unittest.TestCase):
             otklik.save(base, rec)
             cfg = SimpleNamespace(allowed_user_ids={7}, state_dir=Path(d), workshop_chat_key=WS)
             query = SimpleNamespace(data=f"otk:{rec['id']}:{rec['sha']}:0:o",
-                                    message=SimpleNamespace(message_id=10, chat_id=1),
+                                    message=SimpleNamespace(message_id=10, chat_id=1, text=otklik.render(rec),
+                                                            reply_markup=tg_otklik._otklik_markup(rec)),
                                     answer=AsyncMock(), edit_message_text=AsyncMock(),
                                     edit_message_reply_markup=AsyncMock())
             update = SimpleNamespace(callback_query=query, update_id=1, effective_user=SimpleNamespace(id=7))

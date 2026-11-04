@@ -58,7 +58,9 @@ has to ask before it deletes, pushes or sends anything.
   not cover all dangerous tools, if the approval hook lacks
   `"onFailure": "block"` (without it Claude Code lets the call through when
   the hook crashes, cannot start or times out), if the approval hook is not
-  exactly `<python> -m claude_tg_bot.hook_approve` or carries keys such as
+  exactly `<python> -P -m claude_tg_bot.hook_approve` (`-P` keeps the session
+  directory out of `sys.path`, so a `claude_tg_bot` package written there
+  cannot stand in for the hook) or carries keys such as
   `async`, `once` or `if`, if `claude --version` is older than 2.1.295, or if
   the approval server is bound to a non-loopback address without a shared
   secret.

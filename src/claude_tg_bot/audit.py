@@ -22,7 +22,10 @@ SNIPPET_LIMIT = 500
 
 
 def _snippet(tool_input: dict[str, Any]) -> str:
-    if "command" in tool_input:
+    if "chat_id" in tool_input:
+        # Отправка MCP: адресат нужен замеру карточек (себе или нет), а не только путь файла.
+        s = json.dumps(tool_input, ensure_ascii=False)
+    elif "command" in tool_input:
         s = str(tool_input.get("command", ""))
     elif "file_path" in tool_input:
         s = str(tool_input.get("file_path", ""))
@@ -43,6 +46,7 @@ def write_event(
     session_id: str = "",
     run_id: str = "",
     plan: str = "",
+    why: list[str] | None = None,
 ) -> None:
     event = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -54,6 +58,9 @@ def write_event(
     for key, value in (("sid", session_id), ("run", run_id), ("plan", plan)):
         if value:
             event[key] = value
+    if why:
+        # Почему карточка: причины serious.py (замер tools/replay_reads.py).
+        event["why"] = why
     line = json.dumps(event, ensure_ascii=False)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
