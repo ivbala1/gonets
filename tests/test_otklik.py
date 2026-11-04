@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot import bot, otklik  # noqa: E402
+from claude_tg_bot import bot, otklik, tg_otklik  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
 from tests.texts import msg_re  # noqa: E402
 
@@ -386,7 +386,7 @@ class OtklikPickTests(unittest.TestCase):
     def _press(self, action: str, *, sha: str | None = None, message_id: int = 10,
                tamper_text: bool = False, twice: bool = False, fail: bool = False,
                status: str = "pending", gen: int | None = None, data: str | None = None,
-               dispatch_effect=None):
+               dispatch_effect=None, shown: str | None = None, markup=None, entities=()):
         with tempfile.TemporaryDirectory() as d:
             base = otklik.otklik_dir(Path(d))
             rec = otklik.new_record("Acme", "почта hr@example.com", "Hello")
@@ -402,7 +402,13 @@ class OtklikPickTests(unittest.TestCase):
 
             async def go() -> None:
                 for _ in range(2 if twice else 1):
-                    msg = SimpleNamespace(message_id=message_id, chat_id=1)
+                    # Текст и кнопки сообщения такие, как их нарисовал бот по записи.
+                    cur = otklik.load(base, rec["id"]) or rec
+                    # shown и markup: значение или функция от записи.
+                    text = shown(cur) if callable(shown) else shown if shown is not None else otklik.render(cur)
+                    msg = SimpleNamespace(message_id=message_id, chat_id=1, text=text,
+                                          reply_markup=markup(cur) if markup else tg_otklik._otklik_markup(cur),
+                                          entities=entities)
                     g = otklik.gen_of(rec) if gen is None else gen
                     head = f"otk:{rec['id']}:{sha or rec['sha']}"
                     # old: кнопка до 22.10.2026, без поколения.
@@ -412,6 +418,7 @@ class OtklikPickTests(unittest.TestCase):
                         edit_message_reply_markup=AsyncMock())
                     update = SimpleNamespace(callback_query=query, update_id=1,
                                              effective_user=SimpleNamespace(id=7))
+                    self.query = query
                     ctx = SimpleNamespace(application=SimpleNamespace(bot_data={"cfg": cfg}), bot=self.bot)
                     with patch.object(bot, "_dispatch_to_claude", dispatch), \
                             patch.object(bot, "Update", lambda **kw: kw):
@@ -419,6 +426,69 @@ class OtklikPickTests(unittest.TestCase):
             asyncio.run(go())
             self.base = base
             return otklik.load(base, rec["id"]), dispatch
+
+    def test_rewritten_message_not_approved(self) -> None:
+        # Агент знает ключ бота и мог переписать сообщение отклика: ✅ не
+        # принимается, сообщение перерисовано по записи (проект 03.11.2026, п. 4).
+        rec, dispatch = self._press("o", shown="📨 Acme\nКуда: почта hr@example.com\n\nДругой текст")
+        dispatch.assert_not_awaited()
+        self.assertEqual(rec["status"], "pending")
+        self.assertEqual(self.bot.edit_message_text.await_args.args[0], otklik.render(rec))
+
+    def test_swapped_button_labels_not_approved(self) -> None:
+        # Подписи кнопок переписаны через Bot API: «✅» с данными ✏️ и наоборот.
+        # Текст тот же, но клавиатура не та, что рисовал бот (ревью 03.11.2026).
+        def swapped(rec: dict) -> SimpleNamespace:
+            rows = otklik.buttons(rec)
+            labels = [b["text"] for b in rows[0]][::-1]
+            return SimpleNamespace(inline_keyboard=[[SimpleNamespace(text=t, callback_data=b["data"])
+                                                     for t, b in zip(labels, rows[0])]])
+        rec, dispatch = self._press("o", markup=swapped)
+        dispatch.assert_not_awaited()
+        self.assertEqual(rec["status"], "pending")
+        self.assertIn("не совпадает с откликом", self.query.answer.await_args.args[0])
+
+    def test_spoiler_on_message_not_approved(self) -> None:
+        # Спойлер скрыл бы канал на том же тексте; сам бот разметки не ставит.
+        spoiler = SimpleNamespace(type="spoiler", offset=0, length=5)
+        rec, dispatch = self._press("o", entities=(spoiler,))
+        dispatch.assert_not_awaited()
+        self.assertEqual(rec["status"], "pending")
+        # Адрес почты Telegram находит сам: такая сущность не мешает.
+        email = SimpleNamespace(type="email", offset=20, length=14)
+        rec, dispatch = self._press("o", entities=(email,))
+        dispatch.assert_awaited_once()
+
+    def test_whitespace_normalized_text_approved(self) -> None:
+        # Telegram убирает `\r` и пробелы по краям: это не правка агента.
+        rec, dispatch = self._press("o", shown=lambda cur: "  " + otklik.render(cur).replace("\n", "\r\n") + " \n")
+        dispatch.assert_awaited_once()
+
+    def test_stale_button_on_rewritten_message_says_stale(self) -> None:
+        # Старое поколение кнопки: «устарела», а не «перерисовал», даже если
+        # текст сообщения не тот.
+        rec, dispatch = self._press("o", gen=5, shown="что угодно")
+        dispatch.assert_not_awaited()
+        self.assertIn("Кнопка устарела", self.query.answer.await_args.args[0])
+
+    def test_telegram_text_from_show_is_reference(self) -> None:
+        # Текст из ответа Telegram при показе записывается и служит эталоном.
+        with tempfile.TemporaryDirectory() as d:
+            base = otklik.otklik_dir(Path(d))
+            rec = otklik.new_record("Acme", "почта", "Hello")
+            rec.update(chat_id=1, message_id=10, status="pending")
+            otklik.save(base, rec)
+            tg = SimpleNamespace(edit_message_text=AsyncMock(return_value=SimpleNamespace(text="как в Telegram")))
+            asyncio.run(tg_otklik._otklik_show(tg, rec, base))
+            cur = otklik.load(base, rec["id"])
+            self.assertEqual(otklik.shown_text(cur), "как в Telegram")
+            msg = SimpleNamespace(text="как  в\nTelegram", reply_markup=tg_otklik._otklik_markup(cur))
+            self.assertTrue(tg_otklik._otklik_matches(cur, msg))
+            msg.text = otklik.render(cur)
+            self.assertFalse(tg_otklik._otklik_matches(cur, msg))
+            # Состояние сменилось: эталон снова по записи.
+            cur["status"] = "edit"
+            self.assertEqual(otklik.shown_text(cur), otklik.render(cur))
 
     def test_ok_wakes_agent_with_exact_record(self) -> None:
         rec, dispatch = self._press("o")
@@ -470,7 +540,9 @@ class OtklikPickTests(unittest.TestCase):
             otklik.save(base, rec)
             cfg = SimpleNamespace(allowed_user_ids={7}, state_dir=Path(d))
             query = SimpleNamespace(
-                data=f"otk:{rec['id']}:{rec['sha']}:0:o", message=SimpleNamespace(message_id=10, chat_id=1),
+                data=f"otk:{rec['id']}:{rec['sha']}:0:o",
+                message=SimpleNamespace(message_id=10, chat_id=1, text=otklik.render(rec),
+                                        reply_markup=tg_otklik._otklik_markup(rec)),
                 answer=AsyncMock(), edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
             update = SimpleNamespace(callback_query=query, update_id=1, effective_user=SimpleNamespace(id=7))
             ctx = SimpleNamespace(application=SimpleNamespace(bot_data={"cfg": cfg}),
@@ -558,7 +630,8 @@ class OtklikPickTests(unittest.TestCase):
 
             query = SimpleNamespace(
                 data=f"otk:{rec['id']}:{rec['sha']}:0:o",
-                message=SimpleNamespace(message_id=10, chat_id=1),
+                message=SimpleNamespace(message_id=10, chat_id=1, text=otklik.render(rec),
+                                        reply_markup=tg_otklik._otklik_markup(rec)),
                 answer=AsyncMock(), edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
             update = SimpleNamespace(callback_query=query, update_id=1, effective_user=SimpleNamespace(id=7))
             ctx = SimpleNamespace(application=SimpleNamespace(bot_data={"cfg": cfg}),

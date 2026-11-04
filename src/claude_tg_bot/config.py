@@ -252,7 +252,9 @@ def _approve_hooks(pre_tool: object) -> list[dict]:
 
 def _approve_hook_problem(hook: dict) -> str:
     """Чем хук, который зовёт hook_approve, не годится; пусто, если он ровно
-    `<python> -m claude_tg_bot.hook_approve` без лишних ключей."""
+    `<python> -P -m claude_tg_bot.hook_approve` (или `-I`) без лишних ключей.
+    Без `-P` Python ставит первым в sys.path текущий каталог сессии, и пакет
+    `claude_tg_bot`, записанный туда агентом, подменил бы хук (guard3, Н2)."""
     extra = sorted(set(hook) - APPROVE_HOOK_KEYS)
     if extra:
         return f"лишние ключи {extra}, допустимы {sorted(APPROVE_HOOK_KEYS)}"
@@ -263,9 +265,9 @@ def _approve_hook_problem(hook: dict) -> str:
         argv = shlex.split(command)
     except ValueError as e:
         return f"команда {command!r} не разбирается: {e}"
-    if (len(argv) != 3 or argv[1:] != ["-m", HOOK_APPROVE_MODULE]
+    if (len(argv) != 4 or argv[1] not in ("-P", "-I") or argv[2:] != ["-m", HOOK_APPROVE_MODULE]
             or not _PYTHON_NAME_RE.fullmatch(os.path.basename(argv[0]))):
-        return f"команда {command!r}, нужно ровно '<python> -m {HOOK_APPROVE_MODULE}'"
+        return f"команда {command!r}, нужно ровно '<python> -P -m {HOOK_APPROVE_MODULE}'"
     return ""
 
 
@@ -556,9 +558,18 @@ class Config:
     hangs_chat_keys: frozenset[str] = frozenset()
     workshop_chat_key: str = ""
     # Карточка плана: одно «✅ Делай план» пускает остальные шаги запуска, кроме
-    # исключений (approval._plan_card_tags). PLAN_CARDS=0 выключает (шаг 2 карточек,
-    # решение Ивана 29.10.2026).
+    # исключений (approval._plan_card_tags). С 03.11.2026 по умолчанию выключена:
+    # без карточки и так идёт всё, кроме опасного (serious.py); PLAN_CARDS=1 включает.
     plan_cards: bool = False
+    # Серверы заказчиков (шаблоны fnmatch по имени или адресу из ~/.ssh/config):
+    # изменения на них идут карточкой (serious.py). Адреса в .env, не в коде.
+    approve_customer_hosts: tuple[str, ...] = ()
+    # Юнит сервера Telegram: из него корни файлов для проверки пути send_file
+    # до карточки (outbound.path_refusal). None: проверки нет.
+    telegram_mcp_unit: Path | None = None
+    # Порт сервера Telegram на loopback: Bash, который туда ходит, идёт карточкой
+    # (serious.py, отправка мимо проверки). 0: проверки нет.
+    telegram_mcp_port: int = 8770
     workshop_model: str = "opus"
     workshop_effort: str = "high"
     workshop_scope: str = ""
@@ -930,7 +941,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
                 )
     codex_prefix = os.environ.get("CODEX_PREFIX", "gpt:").strip() or "gpt:"
     workshop_chat_key = os.environ.get("WORKSHOP_CHAT_KEY", "").strip()
-    plan_cards = os.environ.get("PLAN_CARDS", "1").strip().lower() in ("1", "true", "yes", "on")
+    plan_cards = os.environ.get("PLAN_CARDS", "0").strip().lower() in ("1", "true", "yes", "on")
     if workshop_chat_key and not re.fullmatch(r"-?\d+:\d+", workshop_chat_key):
         print(f"[config] WARNING: WORKSHOP_CHAT_KEY={workshop_chat_key!r} не вида <chat>:<thread>, мастерская выключена",
               file=sys.stderr)
@@ -1005,6 +1016,11 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         approve_guarded_data_hint=guarded_hint,
         workshop_chat_key=workshop_chat_key,
         plan_cards=plan_cards,
+        approve_customer_hosts=tuple(
+            h.strip() for h in os.environ.get("APPROVE_CUSTOMER_HOSTS", "").split(",") if h.strip()),
+        telegram_mcp_unit=Path(unit).expanduser() if (unit := os.environ.get(
+            "TELEGRAM_MCP_UNIT", "~/.config/systemd/user/telegram-mcp.service").strip()) else None,
+        telegram_mcp_port=_int_env("TELEGRAM_MCP_PORT", 8770),
         agent_role_chat_keys=frozenset(
             k.strip() for k in os.environ.get("AGENT_ROLE_CHAT_KEYS", "").split(",") if k.strip()),
         hangs_file=Path(os.environ["HANGS_FILE"].strip()).expanduser()

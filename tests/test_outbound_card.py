@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot import approval, bot  # noqa: E402
+from claude_tg_bot import approval, bot, outbound  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
 
 
@@ -62,10 +62,12 @@ class OutboundCardTests(unittest.TestCase):
                 card.assert_called()
 
     def test_send_not_allowed_in_unattended_run(self) -> None:
+        # Фоновый ран человеку не отправляет: отказ без карточки (решение Ивана 03.11.2026).
         out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"},
                                  unattended=True)
         self.assertEqual(out["decision"], "deny")
-        card.assert_called()
+        self.assertIn("черновик в отчёт", out["reason"])
+        card.assert_not_called()
 
     def test_send_not_allowed_in_burst_window(self) -> None:
         out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"},
@@ -93,8 +95,9 @@ class OutboundCardTests(unittest.TestCase):
                 card.assert_not_called()
 
     def test_reading_and_drafts_still_auto(self) -> None:
-        for tool in ("mcp__telegram__get_messages", "mcp__claude_ai_Gmail__create_draft",
-                     "mcp__slack__send_message"):
+        # mcp__slack__send_message с 03.11.2026 карточкой: отправка людям через
+        # внешний сервис (serious.py), какой бы ни был сервер.
+        for tool in ("mcp__telegram__get_messages", "mcp__claude_ai_Gmail__create_draft"):
             with self.subTest(tool=tool):
                 out, card = self._decide(tool, {})
                 self.assertEqual(out["decision"], "allow")
@@ -145,11 +148,11 @@ class OutboundCardTextTests(unittest.TestCase):
         self.assertNotIn("QUJD", text)
 
     def test_outbound_detection(self) -> None:
-        self.assertTrue(approval._is_outbound_send("mcp__telegram__send_message"))
-        self.assertTrue(approval._is_outbound_send("mcp__claude_ai_Gmail__reply"))
-        self.assertFalse(approval._is_outbound_send("mcp__telegram__get_messages"))
-        self.assertFalse(approval._is_outbound_send("mcp__claude_ai_Gmail__create_draft"))
-        self.assertFalse(approval._is_outbound_send("mcp__other__send_message"))
+        self.assertTrue(outbound.is_send("mcp__telegram__send_message"))
+        self.assertTrue(outbound.is_send("mcp__claude_ai_Gmail__reply"))
+        self.assertFalse(outbound.is_send("mcp__telegram__get_messages"))
+        self.assertFalse(outbound.is_send("mcp__claude_ai_Gmail__create_draft"))
+        self.assertFalse(outbound.is_send("mcp__other__send_message"))
 
 
 class OutboundCallbackTests(unittest.TestCase):
@@ -164,9 +167,13 @@ class OutboundCallbackTests(unittest.TestCase):
                 tool_input={"chat_id": "@x", "message": "hi"},
                 session_id="sid", target_chat_id=1, target_thread_id=None)
             pending.telegram_message_id = 10
+            pending.card_text = "card"
+            # Клавиатура, которую нарисовал бот: на ✅ сверяется с сообщением.
+            kb = SimpleNamespace(inline_keyboard=[[SimpleNamespace(text="✅ Approve", callback_data="x")]])
+            pending.card_keyboard = approval.keyboard_rows(kb)
             cfg = SimpleNamespace(allowed_user_ids={7}, primary_chat_id=1)
             msg = SimpleNamespace(message_id=message_id, chat_id=1, is_topic_message=False,
-                                  reply_text=AsyncMock(), text="card", text_html="card")
+                                  reply_text=AsyncMock(), text="card", text_html="card", reply_markup=kb)
             query = SimpleNamespace(data=f"appr:{pending.approval_id}:{decision}", message=msg,
                                     answer=AsyncMock(), edit_message_reply_markup=AsyncMock(),
                                     edit_message_text=AsyncMock())
@@ -239,9 +246,9 @@ class CardTimeoutTests(unittest.TestCase):
         return json.loads(resp.text), card
 
     def test_timed_out_card_is_not_resent_and_waits_for_press(self) -> None:
-        out, card = self._decide("Bash", {"command": "ssh immich docker ps"})
+        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"})
         self.assertEqual(card.await_count, 1)
-        self.assertEqual(out["reason"], "user timeout")
+        self.assertEqual(out["reason"], "Иван не ответил на карточку за 1 мин: повтори, только если он попросит")
 
     def test_outbound_card_still_retried(self) -> None:
         out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})
@@ -249,14 +256,14 @@ class CardTimeoutTests(unittest.TestCase):
         self.assertEqual(out["reason"], "telegram send failed")
 
     def test_press_on_card_without_number_decides(self) -> None:
-        out, card = self._decide("Bash", {"command": "ssh immich docker ps"}, press="allow")
+        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"}, press="allow")
         self.assertEqual(card.await_count, 1)
         self.assertEqual(out["decision"], "allow")
 
     def test_connect_timeout_is_retried(self) -> None:
         # запрос не ушёл: прежний повтор и отказ
         import httpx
-        out, card = self._decide("Bash", {"command": "ssh immich docker ps"},
+        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"},
                                  cause=httpx.ConnectTimeout("connect"))
         self.assertEqual(card.await_count, 3)
         self.assertEqual(out["reason"], "telegram send failed")

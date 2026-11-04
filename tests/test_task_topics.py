@@ -1210,8 +1210,8 @@ class ExecRightsTests(unittest.TestCase):
             self.assertEqual(out["decision"], "allow", inp)
             card.assert_not_called()
 
-    def test_secret_and_send_still_card(self) -> None:
-        for tool, inp in (("Bash", {"command": "cat ~/.env"}),
+    def test_danger_and_send_still_card(self) -> None:
+        for tool, inp in (("Bash", {"command": "rm -rf /srv/data"}),
                           ("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})):
             out, card = self.decide(tool, inp)
             self.assertEqual(out["decision"], "deny", tool)
@@ -1223,7 +1223,7 @@ class ExecRightsTests(unittest.TestCase):
         card.assert_not_called()
 
     def test_same_session_outside_exec_cards(self) -> None:
-        out, card = self.decide("Bash", {"command": "docker compose up -d"}, exec_sids=frozenset())
+        out, card = self.decide("Bash", {"command": "rm -rf /srv/data"}, exec_sids=frozenset())
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
 

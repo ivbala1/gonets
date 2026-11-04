@@ -10,6 +10,7 @@ OpenAI SDK — optional-extra (`pip install -e '.[voice]'`). Если пакет
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,64 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# Ответ 429 с этими кодами значит пустой баланс или достигнутый лимит
+# расходов проекта: повтор бесполезен, нужен платёж или новый лимит (случай
+# 02.11.2026: голос не распознался дважды подряд).
+QUOTA_CODES = frozenset({"insufficient_quota", "credit_balance_exhausted"})
+BILLING_URL = "platform.openai.com/settings/organization/billing"
+
+
+def _is_quota_code(value: Any) -> bool:
+    """Только строка: список или словарь в чужом теле не роняет разбор."""
+    return isinstance(value, str) and value in QUOTA_CODES
+
+
+def _quota_in_body(body: Any) -> bool:
+    """Тело ошибки OpenAI: {"error": {"code", "type"}} или сразу объект error
+    (так его кладёт SDK в APIStatusError.body)."""
+    if not isinstance(body, dict):
+        return False
+    inner = body.get("error")
+    for obj in (body, inner if isinstance(inner, dict) else {}):
+        if _is_quota_code(obj.get("code")) or _is_quota_code(obj.get("type")):
+            return True
+    return False
+
+
+def quota_exhausted(err: BaseException) -> bool:
+    """Исключение SDK о пустом балансе: 429 и код из QUOTA_CODES. Без импорта
+    openai: пакет необязательный."""
+    if getattr(err, "status_code", None) != 429:
+        return False
+    if _is_quota_code(getattr(err, "code", None)) or _is_quota_code(getattr(err, "type", None)):
+        return True
+    return _quota_in_body(getattr(err, "body", None))
+
+
+def _response_quota_exhausted(response: Any) -> bool:
+    """httpx-ответ 429 о пустом балансе. Тело ещё не прочитано: не знаем."""
+    if getattr(response, "status_code", None) != 429:
+        return False
+    try:
+        return _quota_in_body(json.loads(response.content))
+    except Exception:
+        return False
+
+
+def _no_quota_retry(base: type) -> type:
+    """Клиент, который не повторяет запрос при пустом балансе. Остальные
+    повторы SDK (429 по частоте, 5xx, обрывы) остаются как были."""
+
+    class NoQuotaRetryClient(base):  # type: ignore[misc, valid-type]
+        def _should_retry(self, response: Any) -> bool:
+            if _response_quota_exhausted(response):
+                log.warning("OpenAI quota exhausted (429), not retrying")
+                return False
+            return super()._should_retry(response)
+
+    return NoQuotaRetryClient
+
+
 def make_client(cfg: Config) -> Any | None:
     if not cfg.openai_api_key:
         return None
@@ -30,7 +89,7 @@ def make_client(cfg: Config) -> Any | None:
     except ImportError:
         log.warning("openai SDK not installed; voice disabled. `pip install -e '.[voice]'`")
         return None
-    return AsyncOpenAI(api_key=cfg.openai_api_key)
+    return _no_quota_retry(AsyncOpenAI)(api_key=cfg.openai_api_key)
 
 
 async def transcribe(client: "AsyncOpenAI", cfg: Config, audio_path: Path) -> str:

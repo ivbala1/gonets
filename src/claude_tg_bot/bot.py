@@ -27,6 +27,7 @@ from telegram.ext import (
     Application,
     ApplicationHandlerStop,
     CallbackQueryHandler,
+    MessageReactionHandler,
     CommandHandler,
     ContextTypes,
     ExtBot,
@@ -37,13 +38,13 @@ from telegram.request import HTTPXRequest
 
 from .approval import (
     AUDIT_LOG_NAME,
-    MAILSEND_CARD_KEY,
+    CARD_CHANGED,
     PLAN_CARD_KEY,
     RUN_NOTES,
     _SKILL_PYTHON,
     ApprovalRegistry,
-    _is_outbound_send,
     build_aiohttp_app,
+    card_matches,
     full_view_text,
 )
 from .auth import LoginManager
@@ -60,7 +61,7 @@ from .burst import (
 from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_tree, run_claude
 from .overrides import PersistentDict
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, deals, handoff, hangs, inflight, limits, restart, tasks, transcripts
+from . import bigfile, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, tasks, transcripts
 from .skills.news_digest import core as news
 from .replies import (
     extract_ask_marker,
@@ -83,7 +84,7 @@ from .replies import (
     with_counter,
 )
 from .dashes import soften_dashes
-from .voice import synthesize, transcribe
+from .voice import BILLING_URL, quota_exhausted, synthesize, transcribe
 from .i18n import _, N_
 from .compose import (  # noqa: F401  перенесено из bot.py
     ComposeBuffer, Reservation, _compose_add, _compose_buffers, _compose_cancelled,
@@ -114,6 +115,10 @@ from .tg_tasks import (  # noqa: F401  перенесено из bot.py
 )
 from .tg_at import (  # noqa: F401  перенесено из bot.py
     _at_fire, _at_fire_dispatch, _at_fire_running, on_at, _parse_at_when, _schedule_at_job,
+)
+from .tg_quick import (  # noqa: F401  реакции, геометка, проверка Кодексом
+    codex_check_markup, drop_reaction_notes, on_codex_check, on_location, on_reaction, reaction_note_text,
+    reaction_notes,
 )
 from .tg_warm import (  # noqa: F401  перенесено из bot.py
     _warm_after_run, _warm_cancel, WARM_EARLY_SEC, _warm_forget, _warm_prompt, WARM_RUNTIME_SEC,
@@ -2525,12 +2530,21 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
                                                read_timeout=5)
             try:
                 audio = await jobs[i]
-            except Exception:
+            except Exception as e:
                 log.exception("TTS failed")
+                quota = quota_exhausted(e)
+                note = (_("⚠️ Озвучки не будет: кончились деньги на OpenAI или достигнут лимит расходов "
+                          "проекта: пополнить или поднять лимит {url} (дальше текстом)").format(url=BILLING_URL)
+                        if quota else _("⚠️ TTS не сработал (пришлю только текст)"))
                 if not sent:
                     # Текст отправит общая ветка (ревью 12.10.2026).
-                    await msg.reply_text(_("⚠️ TTS не сработал (пришлю только текст)"))
+                    await msg.reply_text(note)
                     return False
+                if quota:
+                    # О балансе и посреди серии: иначе Иван не узнает, почему
+                    # голос оборвался. Сбой записки не отнимает остаток текста.
+                    with contextlib.suppress(Exception):
+                        await msg.reply_text(note)
                 break
             try:
                 await send_voice_caption(msg, audio, caption,
@@ -3123,6 +3137,21 @@ async def _dispatch_to_claude_impl(
                         with contextlib.suppress(OSError, ValueError):
                             with deals.locked(deals.deals_dir(cfg.state_dir)) as data:
                                 deals.drop_notes(data, notes_taken)
+            reacted = reaction_notes(ctx, chat_id) if (
+                side is None and not unattended and not untrusted and task is None and thread_id is None
+                and permission_mode != "plan") else {}
+            if reacted:
+                # Реакции Ивана уходят этим ходом и снимаются его стартом, отказ
+                # до старта их не теряет (как итоги дел выше).
+                prompt_text = reaction_note_text(reacted) + prompt_text
+                reacted_base = run_start_cb
+
+                def run_start_cb() -> None:
+                    if reacted_base is not None:
+                        reacted_base()
+                    if (prestart is not None and prestart.cancelled) or (pack is not None and pack.cancelled):
+                        return
+                    drop_reaction_notes(ctx, reacted)
             if prestart is not None:
                 prestart_base = run_start_cb
 
@@ -3484,7 +3513,12 @@ async def _dispatch_to_claude_impl(
             # Ярлык на каждом куске: свайп на любой из них продолжает дело.
             await send_text_to(cfg, msg, full_reply, head=deal["head"])
         elif not voiced:
-            await send_reply_text(cfg, update, full_reply)
+            # Под ответом Claude человеку; ход с вопросом кнопками их не смешивает.
+            check = (codex_check_markup(ctx, prompt_text, reply)
+                     if (cfg.codex_bin and not unattended and not untrusted and not workshop and task is None
+                         and ask is None and not result.is_error and not codex_fallback and not forced_codex)
+                     else None)
+            await send_reply_text(cfg, update, full_reply, **({"reply_markup": check} if check else {}))
     finally:
         if loud_token is not None:
             _SILENT_RUN.reset(loud_token)
@@ -4174,11 +4208,16 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 return
         try:
             heard = await transcribe(openai_client, cfg, tmp)
-        except Exception:
+        except Exception as e:
             log.exception("STT failed")
             _compose_release(ctx, chat_key, slot)
             _gather_release(gslot)
-            await msg.reply_text(_("⚠️ не удалось распознать голос"))
+            if quota_exhausted(e):
+                await msg.reply_text(_("⚠️ Голос не распознан: кончились деньги на OpenAI или достигнут "
+                                       "лимит расходов проекта: пополнить или поднять лимит {url}").format(
+                                           url=BILLING_URL))
+            else:
+                await msg.reply_text(_("⚠️ не удалось распознать голос"))
             return
     finally:
         try:
@@ -4282,8 +4321,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # откроет). Ревью Codex 12.10.2026.
     # Карточка плана так же: её ✅ выдаёт права на весь запуск (ревью Codex 29.10).
     pending_now = registry.get(approval_id)
-    if pending_now is not None and (_is_outbound_send(pending_now.tool_name)
-                                    or MAILSEND_CARD_KEY in pending_now.tool_input
+    if pending_now is not None and (outbound.is_send(pending_now.tool_name)
+                                    or outbound.MAILSEND_CARD_KEY in pending_now.tool_input
                                     or PLAN_CARD_KEY in pending_now.tool_input):
         msg = query.message
         expected_chat = (pending_now.target_chat_id if pending_now.target_chat_id is not None
@@ -4295,6 +4334,34 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if burst_duration is not None:
             log.warning("approve: aid=%s окно ⏩ для отправки не открывается", approval_id)
             return
+    # Изменение на сервере заказчика и отправка людям мимо карточки отправки:
+    # кнопок окна на карточке нет, окно не открывается.
+    if (pending_now is not None and (pending_now.customer == "change" or getattr(pending_now, "sends", False))
+            and burst_duration is not None):
+        log.warning("approve: aid=%s окно ⏩ для изменения у заказчика или отправки не открывается", approval_id)
+        return
+    # ✅ только по карточке, которую нарисовал бот: текст, кнопки и сущности
+    # текста. Агент знает ключ бота и мог переписать карточку или подписи
+    # кнопок через Bot API (проект 03.11.2026, п. 4). ❌ не сверяется.
+    if (pending_now is not None and (decision == "allow" or burst_duration is not None)
+            and not card_matches(pending_now, query.message)):
+        log.warning("approve: aid=%s карточка в Telegram не та, что отправил бот", approval_id)
+        registry.resolve(approval_id, CARD_CHANGED)
+        line = _("⚠️ карточка изменена не ботом (текст или кнопки): ✅ не принят, вызов отклонён")
+        card = pending_now.card_html
+        if card and len(card) + len(line) + 2 <= TELEGRAM_MESSAGE_LIMIT:
+            # Карточка снова с текстом, который отправил бот.
+            try:
+                await query.edit_message_text(f"{card}\n\n{line}", parse_mode="HTML", reply_markup=None)
+                return
+            except Exception:
+                log.warning("approval card restore failed aid=%s, reply instead", approval_id, exc_info=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(line)
+        except Exception:
+            log.exception("failed to report changed approval card")
+        return
     decision_for_hook = "allow" if burst_duration is not None else decision
     resolved = registry.resolve(approval_id, decision_for_hook)
     if resolved is None:
@@ -4368,7 +4435,7 @@ def _is_card_of(msg, pending, expected_chat: int) -> bool:
     самого сообщения его кнопка. callback_data Telegram не сверяет с кнопками
     сообщения, а клавиатуру сообщения подставить нельзя (ревью Codex 29.10).
     Карточке отправки от имени Ивана и плана номер не подбирается никогда."""
-    if (_is_outbound_send(pending.tool_name) or MAILSEND_CARD_KEY in pending.tool_input
+    if (outbound.is_send(pending.tool_name) or outbound.MAILSEND_CARD_KEY in pending.tool_input
             or PLAN_CARD_KEY in pending.tool_input):
         return False
     # Тема как в _chat_key: у General message_thread_id бывает, но это не тема.
@@ -4531,6 +4598,7 @@ class _SilentAwareBot(ExtBot):
 # и каждая новая отправка получала ложный сбой (случаи 22-31.10.2026). Дольше
 # ждать незачем: неподтверждённое уже не считается сбоем (replies.is_unconfirmed).
 TELEGRAM_READ_TIMEOUT = 30
+ALLOWED_UPDATES = [Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY, Update.MESSAGE_REACTION]
 # Предел текста одного сообщения Telegram.
 TELEGRAM_MESSAGE_LIMIT = 4096
 
@@ -4551,6 +4619,7 @@ def build_app(cfg: Config) -> Application:
     )
     # Снимок лимита подписки Claude пишут раны (limits.py), читают резерв и прогрев.
     limits.configure(cfg.state_dir)
+    reactions.configure(cfg.state_dir)
     app.bot_data["cfg"] = cfg
     app.bot_data["login_manager"] = LoginManager(app.bot, cfg.claude_bin, cfg.codex_bin, cfg.claude_cwd)
     app.add_handler(MessageHandler(filters.ALL, on_auth_update), group=-10)
@@ -4607,6 +4676,9 @@ def build_app(cfg: Config) -> Application:
     app.bot_data["effort_by_target"] = PersistentDict(cfg.state_dir / "effort_overrides.json")
     # Расход по дням для /status и вечернего итога Домового (решение Ивана 22.10.2026).
     app.bot_data["cost_by_day"] = PersistentDict(cfg.state_dir / "cost_by_day.json")
+    # Реакции Ивана до следующего хода лички и вопросы под кнопкой проверки Кодексом.
+    app.bot_data["reaction_notes"] = PersistentDict(cfg.state_dir / "reaction_notes.json")
+    app.bot_data["codex_checks"] = PersistentDict(cfg.state_dir / "codex_checks.json")
     app.bot_data["burst_until_by_target"] = {}
     app.bot_data["burst_expiry_tasks"] = {}
     # ~EDITED: правка отправленного сообщения не должна ни ронять обработчики
@@ -4661,6 +4733,9 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_model_pick, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(on_model_pin, pattern=r"^modelpin:"))
     app.add_handler(CallbackQueryHandler(on_keys_pick, pattern=r"^keys:"))
+    app.add_handler(CallbackQueryHandler(on_codex_check, pattern=r"^cdx:"))
+    app.add_handler(MessageReactionHandler(on_reaction))
+    app.add_handler(MessageHandler(filters.LOCATION & not_edited, on_location))
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     # Любые остальные вложения-файлы (pdf/docx/zip/video/audio/video_note/animation) → on_file.
@@ -4693,5 +4768,6 @@ def run(cfg: Config) -> int:
     # (важно для approval-колбэков и страховочного сценария в РФ).
     # Трейдоф: возможна повторная обработка апдейта, если бот упал после
     # завершения работы, но до ACK Telegram.
-    app.run_polling(drop_pending_updates=False)
+    # Список явно: реакции Telegram шлёт только по просьбе.
+    app.run_polling(drop_pending_updates=False, allowed_updates=ALLOWED_UPDATES)
     return int(app.bot_data.get("exit_code", 0))

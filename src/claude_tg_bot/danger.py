@@ -62,17 +62,26 @@ class Verdict:
     # и присваивания перед командой как ("=", [присваивание]): по этому списку
     # approval пускает без карточки только знакомое чтение.
     programs: list[tuple[str, list[str]]] = field(default_factory=list)
+    # Слово программы каждого звена programs как в команде, без кавычек
+    # (`.venv/bin/pip`): по нему serious узнаёт окружение бота (ревью PR 10).
+    heads: list[str] = field(default_factory=list)
     tags: set[str] = field(default_factory=set)
     # Куда команда копирует данные: хост rsync и scp, бакет s3. Отправка на
     # названное в одобренном плане идёт без карточки (approval._plan_card_tags).
     remotes: set[str] = field(default_factory=set)
+    # Оранжевые причины «разбор не понял», а не «меняет»: подстановка,
+    # незнакомая программа, UNPARSED. Карточка пишет их «Не разобрал»,
+    # а не «Меняет» (Иван 03.11.2026: чтение подписано «Меняет»).
+    unknown: list[str] = field(default_factory=list)
 
-    def add(self, level: str, reason: str, tag: str = "") -> None:
+    def add(self, level: str, reason: str, tag: str = "", *, unknown: bool = False) -> None:
         if tag:
             self.tags.add(tag)
         bucket = self.red if level == RED else self.orange
         if reason not in bucket:
             bucket.append(reason)
+        if level == ORANGE and (unknown or tag == UNPARSED) and reason not in self.unknown:
+            self.unknown.append(reason)
 
     @property
     def level(self) -> str:
@@ -83,18 +92,48 @@ class Verdict:
         return YELLOW
 
 
+def has_continuation(command: str) -> bool:
+    """`\\` с переводом строки вне одинарных кавычек. Bash склеивает такие
+    строки (`cat .e\\<перевод>nv` читает `.env`, `find . -de\\<перевод>lete`
+    удаляет), но не в комментарии и не в heredoc с кавычками; разбор этого не
+    повторяет, значит команда не разобрана (ревью Codex и Opus 03.11.2026:
+    склейка своим кодом открыла обходы через `#` и heredoc). Форма редкая:
+    44 из 13 595 команд Bash с 01.10.2026, ручных карточек из них 2."""
+    if "\\\n" not in command:
+        return False
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == "\\" and i + 1 < len(command):
+            if command[i + 1] == "\n":
+                return True
+            i += 2
+            continue
+        elif ch in "'\"":
+            quote = ch if quote is None else (None if quote == ch else quote)
+        i += 1
+    return False
+
+
 def classify(tool_name: str, tool_input: dict, cwd: str | None = None) -> Verdict:
     v = Verdict()
     token = _CWD.set(cwd if cwd and cwd.startswith("/") else None)
     try:
         if tool_name == "Bash":
-            _classify_bash(str(tool_input.get("command", "")), v, depth=0)
-            v.secret = v.secret or (_mentions_secret(str(tool_input.get("command", "")))
-                                    and not _metadata_only(v, str(tool_input.get("command", ""))))
+            command = str(tool_input.get("command", ""))
+            if has_continuation(command):
+                v.add(ORANGE, _("перенос строки через \\ не разобран"), UNPARSED)
+            _classify_bash(command, v, depth=0)
+            v.secret = v.secret or (_mentions_secret(command) and not _metadata_only(v, command))
         elif tool_name == "Monitor":
             # Monitor запускает shell-команду в фоне, как Bash (ревью 11.10.2026).
             command = tool_input.get("command")
             if isinstance(command, str) and command.strip():
+                if has_continuation(command):
+                    v.add(ORANGE, _("перенос строки через \\ не разобран"), UNPARSED)
                 _classify_bash(command, v, depth=0)
                 v.secret = v.secret or _mentions_secret(command)
             else:
@@ -369,13 +408,13 @@ def _classify_bash(command: str, v: Verdict, depth: int) -> None:
         return
     text = _strip_heredocs(command, v, depth)
     if "`" in _quote_mask(text) or "`" in text:
-        v.add(ORANGE, _("есть команда в обратных кавычках"))
+        v.add(ORANGE, _("есть команда в обратных кавычках"), unknown=True)
         if re.search(r"\b(?:curl|wget)\b", text):
             # Подстановка исчезнет ниже, а её вывод уйдёт запросом (ревью Codex 29.10).
             v.add(RED, _("отправляет данные в сеть"), PUBLISH)
         text = text.replace("`", " ; ")
     if "$(" in text or "<(" in text or ">(" in text:
-        v.add(ORANGE, _("есть вложенная команда $(…), <(…) или >(…)"))
+        v.add(ORANGE, _("есть вложенная команда $(…), <(…) или >(…)"), unknown=True)
     text = _pipe_to_interpreter(text, v)
     # Шаблон скрытых имён вне кавычек может подставить .env. Внутри
     # программы jq или awk это обычный текст (ревью 11.10.2026).
@@ -846,11 +885,63 @@ def _searches_tree(parts: list[str], cwd: str | None = None) -> bool:
         return False
     short = [a for a in args if a.startswith("-") and not a.startswith("--")]
     longs = [a.split("=", 1)[0] for a in args if a.startswith("--")]
-    return any("r" in a or "R" in a for a in short) \
+    recursive = any("r" in a or "R" in a for a in short) \
         or any(long_flag(n, "--recursive") or long_flag(n, "--dereference-recursive")
                for n in longs) \
         or any(len(d) >= 3 and "recurse".startswith(d)
                for d in _option_values(args, "d", "--directories", _GREP_VALUES))
+    if not recursive:
+        return False
+    # `grep -rn x a.py b.md` по названным обычным файлам читает только их,
+    # как rg выше: агенты пишут -r по привычке (карточки 29.10 и 03.11.2026).
+    roots = _grep_simple_roots(args)
+    # Без файла, с каталогом, шаблоном, `-`, `~` (в кавычках bash его не
+    # раскроет, ревью Codex) или сложными флагами это обход; каталог агента
+    # не известен (`cd -`, хук без cwd) тоже: сверять не с чем (/code-review).
+    # Шаблон `[p]roj` bash раскроет в каталог, isfile видит слово (ревью Opus).
+    if not roots or any(r.startswith("~") or glob.has_magic(r) for r in roots) \
+            or (cwd is None and not all(os.path.isabs(r) for r in roots)):
+        return True
+    return not all(os.path.isfile(os.path.join(cwd or "/", r)) for r in roots)
+
+
+# Флаги grep -r без значения, при которых имена файлов разбираются надёжно.
+# Значения флагов (-f файл шаблонов, -A 3, сокращения длинных) сюда не входят:
+# со слитным `--file=ссылка-на-.env` grep открыл бы секрет (ревью Codex 03.11.2026).
+_GREP_SIMPLE_SHORT = frozenset("rRnilHhcvwxoEFsqL")
+_GREP_SIMPLE_LONG = frozenset({
+    "--recursive", "--dereference-recursive", "--line-number", "--ignore-case",
+    "--files-with-matches", "--files-without-match", "--count", "--with-filename",
+    "--no-filename", "--word-regexp", "--line-regexp", "--only-matching",
+    "--extended-regexp", "--fixed-strings", "--invert-match", "--no-messages", "--quiet",
+})
+
+
+def _grep_simple_roots(args: list[str]) -> list[str] | None:
+    """Файлы grep, если флаги только из простого списка, а шаблон позицией
+    или через отдельный `-e`; иначе None."""
+    pos: list[str] = []
+    explicit = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a == "-e" and i + 1 < len(args):
+            explicit = True
+            i += 2
+            continue
+        if a.startswith("--"):
+            if a not in _GREP_SIMPLE_LONG and a.split("=", 1)[0] not in ("--color", "--colour"):
+                return None
+        elif a.startswith("-") and a != "-":
+            if not set(a[1:]) <= _GREP_SIMPLE_SHORT:
+                return None
+        else:
+            pos.append(a)
+        i += 1
+    return pos if explicit else pos[1:]
 
 
 def _include_names_secret(pattern: str) -> bool:
@@ -1091,11 +1182,13 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
         if _ASSIGN_RE.match(head):
             _check_assignment(head, v)
             v.programs.append(("=", [head]))
+            v.heads.append("=")
             parts = parts[1:]
             continue
         if "/" in head:
             _check_program_path(head, v)
         v.programs.append((prog, parts[1:]))
+        v.heads.append(head)
         if prog in ("sudo", "doas"):
             v.add(RED, _("с правами администратора"))
             rest = parts[1:]
@@ -1256,7 +1349,8 @@ def _classify_segment(seg: list[str], v: Verdict, depth: int) -> None:
         if prog.startswith("mkfs"):
             v.add(RED, _("форматирует диск"), DISK)
         elif prog not in _READ_ONLY:
-            v.add(ORANGE, _("незнакомая команда {prog}: что делает, не знаю").format(prog=prog[:40]))
+            v.add(ORANGE, _("незнакомая команда {prog}: что делает, не знаю").format(prog=prog[:40]),
+                  unknown=True)
     finally:
         if token is not None:
             _CWD.reset(token)
@@ -1437,7 +1531,7 @@ def _h_sed(prog: str, args: list[str], v: Verdict, depth: int) -> None:
             long_flag(f, "--in-place") for f in flags):
         v.add(ORANGE, _("правит файлы на месте"))
     if _option_values(args, "f", "--file"):
-        v.add(ORANGE, _("скрипт sed из файла, не разобран"))
+        v.add(ORANGE, _("скрипт sed из файла, не разобран"), unknown=True)
     for a in args:
         if re.search(r"(^|[;}\s])[0-9,$]*\s*[we]\s|/[we]\s+\S", a):
             v.add(RED, _("скрипт sed пишет файл или запускает команду"))
@@ -2173,8 +2267,9 @@ def _h_remote(prog: str, args: list[str], v: Verdict, depth: int) -> None:
     for r in inner.red:
         v.add(RED, _("на сервере {host}: {r}").format(host=host, r=r))
     for r in inner.orange:
-        v.add(ORANGE, _("на сервере {host}: {r}").format(host=host, r=r))
-    v.add(ORANGE, _("команда на сервере {host}").format(host=host))
+        v.add(ORANGE, _("на сервере {host}: {r}").format(host=host, r=r), unknown=r in inner.unknown)
+    # Само «на сервере» не изменение: что меняет команда, скажут причины выше.
+    v.add(ORANGE, _("команда на сервере {host}").format(host=host), unknown=True)
 
 
 _CLOUD_READ = frozenset({"describe", "list", "get", "show", "ls", "wait", "help", "version",

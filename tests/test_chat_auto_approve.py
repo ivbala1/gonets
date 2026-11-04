@@ -75,17 +75,24 @@ class ChatAutoSecretTests(unittest.TestCase):
                 resp = asyncio.run(approval.handle_approve(request))
             return json.loads(resp.text), card
 
-    def test_secret_read_goes_to_card(self):
+    def test_secret_read_passes(self):
+        # С 03.11.2026 карточка только на опасное (serious.py, решение Ивана): 
+        # чтение секрета на машине без отправки идёт без карточки.
         for cmd in ("cat ~/.env", "cat /home/u/src/bot/.env", "grep TOKEN ~/.ssh/config",
                     "python3 - <<'EOF'\nprint(open('/home/u/.env').read())\nEOF",
                     "cat /proc/1/environ", "ls; cat .en*"):
             with self.subTest(cmd=cmd):
                 out, card = self._decide("Bash", {"command": cmd})
-                self.assertEqual(out["decision"], "deny")
-                card.assert_called()
+                self.assertEqual(out["decision"], "allow")
+                card.assert_not_called()
 
-    def test_secret_write_goes_to_card(self):
+    def test_secret_write_passes(self):
         out, card = self._decide("Write", {"file_path": "/home/u/.ssh/authorized_keys", "content": "x"})
+        self.assertEqual(out["decision"], "allow")
+        card.assert_not_called()
+
+    def test_dangerous_goes_to_card_in_auto_chat(self):
+        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"})
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
 
@@ -96,8 +103,8 @@ class ChatAutoSecretTests(unittest.TestCase):
                 self.assertEqual(out["decision"], "allow")
                 card.assert_not_called()
 
-    def test_unattended_secret_read_goes_to_card(self):
-        out, card = self._decide("Bash", {"command": "cat ~/.env"}, unattended=True)
+    def test_unattended_dangerous_goes_to_card(self):
+        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"}, unattended=True)
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
 

@@ -12,6 +12,7 @@ from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from . import otklik
+from .approval import AUTO_ENTITIES, entity_rows, keyboard_rows
 from .config import Config
 from .i18n import _
 
@@ -28,19 +29,35 @@ def _otklik_markup(rec: dict) -> InlineKeyboardMarkup | None:
 _OTKLIK_SHOW_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-async def _otklik_edit(bot: Any, rec: dict) -> bool:
+def _otklik_matches(rec: dict, msg: Any) -> bool:
+    """Сообщение отклика такое, каким его показал бот: текст как в ответе
+    Telegram при показе (иначе по записи) без различий в пробелах, те же
+    кнопки, сущности только те, что Telegram находит сам (без разметки)."""
+    shown = getattr(msg, "text", None)
+    if not isinstance(shown, str) or " ".join(shown.split()) != " ".join(otklik.shown_text(rec).split()):
+        return False
+    if keyboard_rows(getattr(msg, "reply_markup", None)) != keyboard_rows(_otklik_markup(rec)):
+        return False
+    return all(e[0] in AUTO_ENTITIES for e in entity_rows(getattr(msg, "entities", None)))
+
+
+async def _otklik_edit(bot: Any, rec: dict) -> str | None:
+    """Правка сообщения по записи. None: не прошла; иначе текст сообщения из
+    ответа Telegram (эталон сверки на ✅) или пусто, если его нет."""
     try:
-        await bot.edit_message_text(
+        msg = await bot.edit_message_text(
             otklik.render(rec), chat_id=rec["chat_id"], message_id=rec["message_id"],
             reply_markup=_otklik_markup(rec), link_preview_options=LinkPreviewOptions(is_disabled=True))
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             log.warning("otklik edit failed aid=%s: %s", rec.get("id"), e)
-            return False
+            return None
+        return ""
     except Exception:
         log.warning("otklik edit failed aid=%s", rec.get("id"), exc_info=True)
-        return False
-    return True
+        return None
+    text = getattr(msg, "text", None)
+    return text if isinstance(text, str) else ""
 
 
 async def _otklik_show(bot: Any, rec: dict, base: Path | None = None) -> None:
@@ -57,11 +74,12 @@ async def _otklik_show(bot: Any, rec: dict, base: Path | None = None) -> None:
     async with lock:
         for _try in range(3):
             cur = await asyncio.to_thread(otklik.load, base, rec["id"]) or rec
-            if not await _otklik_edit(bot, cur):
+            shown = await _otklik_edit(bot, cur)
+            if shown is None:
                 return
             try:
                 if await asyncio.to_thread(otklik.mark_shown, base, cur["id"], cur["status"],
-                                           otklik.gen_of(cur)):
+                                           otklik.gen_of(cur), shown or None):
                     return
             except Exception:
                 log.warning("otklik mark shown failed aid=%s", cur.get("id"), exc_info=True)
@@ -145,6 +163,18 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         if parsed is None or msg is None:
             raise otklik.Refused("bad callback")
         oid, sha, gen, action = parsed
+        if action == "o":
+            # ✅ только по сообщению, которое нарисовал бот: текст, кнопки и
+            # сущности. Агент знает ключ бота и мог переписать сообщение или
+            # подписи кнопок (проект 03.11.2026, п. 4). Старая кнопка сверку не
+            # проходит: её отклонит pick как устаревшую.
+            cur = await asyncio.to_thread(otklik.load, base, oid)
+            if otklik.pick_ok(cur, sha, gen, action, msg.chat_id, msg.message_id) and not _otklik_matches(cur, msg):
+                log.warning("otklik pick aid=%s: сообщение не то, что нарисовал бот", oid)
+                await _b._answer_quietly(query, _("Сообщение не совпадает с откликом (текст или кнопки): ✅ не "
+                                                  "принят. Перерисовал, проверь и нажми ещё раз"), show_alert=True)
+                await _otklik_show(ctx.bot, cur, base)
+                return
         rec = await asyncio.to_thread(otklik.pick, base, oid, sha, gen, action,
                                       msg.chat_id, msg.message_id)
     except otklik.Refused:

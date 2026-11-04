@@ -141,13 +141,15 @@ class RecursiveGrepTests(_Base):
             for cmd in ("grep -rn x src", "grep -rn x src notes", "grep -rn x src/*.py",
                         "grep -rli -e a -e b . --include=*.md",
                         "grep -r --exclude='.*' --exclude-dir='.*' --exclude-dir=keys x .",
-                        "grep -rn x missing", "grep -rn credentials src", "grep -rn x src/a.py",
-                        "rg -u x .", "rg -n foo src", "rg foo", "rg foo src/a.py src",
+                        "grep -rn x missing", "grep -rn credentials src", "grep -rn x src/a.py src",
+                        "grep -rn x", "grep -rn x -", "rg -u x .", "rg -n foo src", "rg foo", "rg foo src/a.py src",
                         "rg foo src/link", "rg foo src/missing.py", "rg foo -"):
                 with self.subTest(cmd=cmd):
                     self.assertFalse(_bash_auto_allowed(cmd, _ENV, cwd=d))
-            # Без рекурсии grep каталог не читает; rg по обычным файлам.
+            # Без рекурсии grep каталог не читает; grep -r и rg по обычным
+            # файлам читают только их (grep -r: решение Ивана 03.11.2026).
             for cmd in ("grep -n x src", "grep -n x src/a.py", "rg -n foo src/a.py",
+                        "grep -rn x src/a.py", "grep -rn -e x -- src/a.py",
                         "rg foo src/a.py notes/a.md", "rg -e foo -- src/b.py"):
                 with self.subTest(cmd=cmd):
                     self.assertTrue(_bash_auto_allowed(cmd, _ENV, cwd=d))

@@ -179,7 +179,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.segments:
             langs = changes.get("openai_stt_languages", ())
             whisper_lang = langs[0] if len(langs) == 1 else ""
-        parts = asyncio.run(transcribe_chunks(client, cfg, chunks, whisper_lang))
+        try:
+            parts = asyncio.run(transcribe_chunks(client, cfg, chunks, whisper_lang))
+        except Exception as e:
+            # Пустой баланс или лимит расходов: подсказка вместо трейсбека.
+            if voice.quota_exhausted(e):
+                raise SystemExit(_("расшифровка не удалась: кончились деньги на OpenAI или достигнут "
+                                   "лимит расходов проекта: пополнить или поднять лимит {url}").format(
+                                       url=voice.BILLING_URL))
+            raise
 
     text = "\n\n".join(x for x in parts if x).strip()
     if not text:
