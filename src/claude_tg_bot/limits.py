@@ -42,6 +42,9 @@ BACKGROUND_MAX_WAIT_SEC = 2 * 3600
 NEAR_RESET_SEC = 15 * 60
 # Повторов после ошибки лимита одного запроса не больше этого.
 MAX_RETRIES = 3
+# Время сброса из текста в пределах этого назад считается прошедшим сбросом, если
+# вперёд в тех же пределах его нет: пятичасовое окно дальше не уходит (ревью Codex 08.11.2026).
+PAST_RESET_SEC = 12 * 3600
 
 _path: Path | None = None
 
@@ -240,15 +243,31 @@ def reset_from_text(text: str, now: float | None = None) -> float | None:
         return None
     if m.group(3):
         hours = hours % 12 + (12 if m.group(3).lower() == "pm" else 0)
-    # Ближайшее подходящее из сегодня и завтра; оба fold, чтобы в час перевода
-    # стрелок осенью взять вторые 02:30, а не сутки спустя. Пропущенное весной
-    # время на часах не бывает: такой момент отбрасывается (ревью Codex).
+    # Из вчера, сегодня и завтра; оба fold, чтобы в час перевода стрелок осенью
+    # взять вторые 02:30, а не сутки спустя. Пропущенное весной время на часах не
+    # бывает: такой момент отбрасывается (ревью Codex).
     today = datetime.fromtimestamp(at, tz).date()
     moments = (datetime.combine(today + timedelta(days=d), dtime(hours, minutes), tz).replace(fold=f).timestamp()
-               for d in (0, 1) for f in (0, 1))
-    real = [t for t in moments if t >= at - 300
-            and datetime.fromtimestamp(t, tz).time() == dtime(hours, minutes)]
-    return min(real) if real else None
+               for d in (-1, 0, 1) for f in (0, 1))
+    real = [t for t in moments if datetime.fromtimestamp(t, tz).time() == dtime(hours, minutes)]
+    # Дневной или модельный лимит сбрасывается почти через сутки: прошедшим
+    # его время не считается, как и раньше берётся ближайшее будущее.
+    if re.search(r"\bda(?:y|ily)\b|opus|sonnet", text, re.IGNORECASE):
+        return min((t for t in real if t >= at - 300), default=None)
+    return pick_reset(real, at)
+
+
+def pick_reset(moments: list[float], at: float) -> float | None:
+    """Сначала ближайший будущий сброс в пределах полусуток, затем прошедший в
+    тех же пределах («resets 4pm» в 16:06 уже прошёл, а не завтрашний), иначе
+    любой будущий. Та же логика в моде limit-resume (logic.js clockTime с recent)."""
+    future = sorted(t for t in moments if t >= at - 300)
+    past = [t for t in moments if at - PAST_RESET_SEC <= t < at - 300]
+    if future and future[0] <= at + PAST_RESET_SEC:
+        return future[0]
+    if past:
+        return max(past)
+    return future[0] if future else None
 
 
 def hit_reset(rate: dict | None, error_text: str, now: float | None = None) -> float | None:
@@ -262,15 +281,18 @@ def hit_reset(rate: dict | None, error_text: str, now: float | None = None) -> f
 
 def _hit_reset(rate: dict | None, error_text: str, now: float | None) -> float | None:
     at = time.time() if now is None else now
-    for source in (_clean(rate or {}), read()):
-        resets = [float(w["resets_at"]) for k in WINDOWS
-                  if isinstance(w := source.get(k), dict)
-                  and isinstance(w.get("resets_at"), (int, float)) and w["resets_at"] > at
-                  # Снимок отстаёт: окно за порогом резерва уже считается блокирующим.
-                  and float(w.get("pct") or 0) >= RESERVE_AT[k]]
-        if resets:
-            return max(resets)
-    return reset_from_text(error_text, at)
+    event, saved = _clean(rate or {}), read()
+    # По каждому окну снимок: раны пишут в него каждое событие по мере прихода
+    # (claude_runner), record оставляет самое свежее наблюдение, а последнее событие
+    # этого рана бывает старше чужого. Событие только там, где снимка нет. Неделя
+    # на 100% не теряется из-за события с одним пятичасовым окном (ревью Codex 08.11.2026).
+    windows = ((k, saved.get(k) if isinstance(saved.get(k), dict) else event.get(k)) for k in WINDOWS)
+    resets = [float(w["resets_at"]) for k, w in windows
+              if isinstance(w, dict)
+              and isinstance(w.get("resets_at"), (int, float)) and w["resets_at"] > at
+              # Снимок отстаёт: окно за порогом резерва уже считается блокирующим.
+              and float(w.get("pct") or 0) >= RESERVE_AT[k]]
+    return max(resets) if resets else reset_from_text(error_text, at)
 
 
 def span(first: dict | None, last: dict | None) -> str:
