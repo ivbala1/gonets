@@ -156,6 +156,7 @@ class BuildAppBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = SimpleNamespace(
                 telegram_bot_token="1:test", claude_bin="claude", codex_bin="",
+                telegram_bot_api_url="https://api.telegram.org",
                 claude_cwd=Path(d), state_dir=Path(d),
             )
             app = botmod.build_app(cfg)
@@ -184,7 +185,7 @@ class SilentWakeRunTests(unittest.IsolatedAsyncioTestCase):
         self.cfg = SimpleNamespace(
             approve_shared_secret="", primary_chat_id=1,
             allowed_chat_ids=frozenset({-100}), allowed_user_ids=frozenset({1, 2}),
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,
             large_reply_as_file_threshold=100_000, telegram_text_limit=40,

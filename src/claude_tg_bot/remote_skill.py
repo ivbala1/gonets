@@ -19,10 +19,11 @@ import shlex
 import sys
 from pathlib import Path
 
+from . import paths
 from .i18n import _
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+REPO_ROOT = paths.BOT_ROOT
+PYTHON = paths.VENV_PYTHON
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 # PATH как у systemd-юнитов бота: claude и uv лежат в ~/.local/bin, а sshd
 # отдаёт forced command системный PATH без него.

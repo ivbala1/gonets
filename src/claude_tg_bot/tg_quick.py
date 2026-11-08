@@ -7,10 +7,10 @@ import json
 import logging
 import secrets
 
-from telegram import InaccessibleMessage, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InaccessibleMessage, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from . import reactions
+from . import buttons, reactions
 from .config import Config
 from .i18n import N_, _
 from .replies import send_text_to
@@ -155,7 +155,7 @@ def codex_check_markup(ctx: ContextTypes.DEFAULT_TYPE, question: str, answer: st
         log.exception("codex check not stored")
         dict.pop(checks, check_id, None)
         return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton(_("🔎 Проверь Кодексом"), callback_data=f"cdx:{check_id}")]])
+    return buttons.markup([[{"text": _("🔎 Проверь Кодексом"), "data": f"cdx:{check_id}"}]])
 
 
 def _keep_fresh(checks, check_id: str) -> None:
@@ -190,8 +190,7 @@ async def _codex_check(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, msg, check_i
         with contextlib.suppress(Exception):
             await msg.reply_text(_("⚠️ Проверка Кодексом не удалась, смотри журнал бота; кнопка осталась"), disable_notification=True)
         return
-    with contextlib.suppress(Exception):
-        await msg.edit_reply_markup(reply_markup=None)
+    await buttons.strip_buttons(msg, message=True)
     with contextlib.suppress(Exception):
         running["codex_checks"].pop(check_id, None)
 

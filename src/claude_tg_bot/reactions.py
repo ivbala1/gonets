@@ -7,10 +7,10 @@ notify пишут свои отправки в личку в короткий ж
 личку и стоил бы хода."""
 from __future__ import annotations
 
-import json
 import logging
-import os
 from pathlib import Path
+
+from . import jsonstore
 
 log = logging.getLogger(__name__)
 
@@ -31,17 +31,9 @@ def configure(state_dir: Path) -> None:
 
 
 def _trim(path: Path) -> None:
+    """Под замком дописывания: notify (другой процесс) пишет сюда же."""
     try:
-        if path.stat().st_size <= _MAX_BYTES:
-            return
-        with path.open("rb") as f:
-            f.seek(-_MAX_BYTES // 2, os.SEEK_END)
-            tail = f.read()
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            f.write(tail[tail.find(b"\n") + 1:])
-        os.replace(tmp, path)
+        jsonstore.jsonl_trim(path, _MAX_BYTES, _MAX_BYTES // 2)
     except FileNotFoundError:
         pass
     except OSError as e:
@@ -56,30 +48,30 @@ def remember(chat_id: object, message_id: object, text: object, state_dir: Path 
         return
     if not isinstance(message_id, int) or not isinstance(text, str) or not text.strip():
         return
-    line = json.dumps({"c": chat_id, "m": message_id, "t": text[:TEXT_LIMIT]}, ensure_ascii=False)
     try:
-        fd = os.open(base / SENT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        jsonstore.jsonl_append(base / SENT_FILE, {"c": chat_id, "m": message_id, "t": text[:TEXT_LIMIT]})
     except OSError as e:
         log.warning("sent log write failed: %s", e)
 
 
+def remember_sent(response: object, text: object, state_dir: Path | None = None) -> None:
+    """То же по ответу Bot API на send* (handoff, otklik, счёт): чат и номер
+    из `result`. Сообщение уже ушло: никакой сбой здесь наружу не выходит,
+    иначе зовущий счёл бы отправку неудачной и повторил её."""
+    try:
+        result = response.get("result") if isinstance(response, dict) else None
+        if not isinstance(result, dict):
+            return
+        chat = result.get("chat")
+        remember(chat.get("id") if isinstance(chat, dict) else None, result.get("message_id"), text, state_dir)
+    except Exception:
+        log.warning("sent log write failed", exc_info=True)
+
+
 def lookup(state_dir: Path, chat_id: int, message_id: int) -> str:
     """Текст своего сообщения; пусто, если его нет в хвосте журнала."""
-    try:
-        with (state_dir / SENT_FILE).open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - _TAIL_BYTES))
-            raw = f.read()
-    except OSError:
-        return ""
-    for line in reversed(raw.splitlines()):
-        try:
-            rec = json.loads(line)
-        except ValueError:   # обрезанная первая строка хвоста
-            continue
-        if isinstance(rec, dict) and rec.get("c") == chat_id and rec.get("m") == message_id:
+    for rec in reversed(jsonstore.jsonl_tail(state_dir / SENT_FILE, _TAIL_BYTES)):
+        if rec.get("c") == chat_id and rec.get("m") == message_id:
             return str(rec.get("t") or "")
     return ""
 

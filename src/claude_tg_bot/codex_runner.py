@@ -34,6 +34,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import procs
 from .claude_runner import _reap_proc, kill_process_tree
 from .auth import is_auth_error
 from .config import agent_env
@@ -119,14 +120,14 @@ async def run_codex(
     log.info("codex start cwd=%s sandbox=%s network=%s prompt_len=%d",
              cwd, sandbox, network_access, len(prompt))
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
+        # Своя группа; отмена посреди запуска не бросает родившийся процесс.
+        proc = await procs.spawn(
+            args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=child_env,
-            start_new_session=True,
         )
     except OSError as e:
         log.error("codex spawn failed: %s", e)
@@ -158,7 +159,8 @@ async def run_codex(
             await _reap_proc(proc)
             stdout = b""
             stderr = b""
-        except asyncio.CancelledError:
+        except BaseException:
+            # Отмена и любая другая ошибка: группу не оставлять жить.
             kill_process_tree(proc, signal.SIGKILL)
             await _reap_proc(proc)
             last_msg.unlink(missing_ok=True)

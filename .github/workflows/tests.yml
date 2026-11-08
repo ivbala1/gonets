@@ -15,6 +15,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,voice]'
       - run: python -m pytest -q
       - run: python tools/i18n_catalog.py check

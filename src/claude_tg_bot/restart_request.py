@@ -14,7 +14,7 @@ import sys
 
 import httpx
 
-from .config import load_config
+from .config import bridge_url, load_config
 from .i18n import _
 from .restart import code_problem, git_state
 
@@ -34,11 +34,12 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    cfg = load_config()
-    host = cfg.approve_http_host
-    if ":" in host:
-        host = f"[{host}]"
-    url = f"http://{host}:{cfg.approve_http_port}/restart"
+    try:
+        cfg = load_config()
+    except RuntimeError as e:
+        print(_("заявка не подана: {error}").format(error=e), file=sys.stderr)
+        return 2
+    url = bridge_url(cfg, "/restart")
     headers = {"X-Approve-Token": cfg.approve_shared_secret} if cfg.approve_shared_secret else {}
     body = {"reason": args.reason.strip(), "commit": head,
             "chat_key": os.environ.get(CHAT_KEY_ENV, "")}
@@ -47,11 +48,24 @@ def main(argv: list[str] | None = None) -> int:
     except httpx.HTTPError as e:
         print(_("бот не ответил: {error}").format(error=e), file=sys.stderr)
         return 3
-    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):  # null, список, строка: как без тела
+        data = {}
     if r.status_code >= 300:
         print(_("заявка отклонена ({status}): {error}").format(
             status=r.status_code, error=data.get('error') or r.text[:200]), file=sys.stderr)
-        return 2
+        # 503 мост отдаёт отказом до всякого действия (бот останавливается,
+        # перезапуск недоступен): это отказ. Прочие 5xx: мост мог принять
+        # заявку, исход неизвестен, как при обрыве (ревью 08.11.2026).
+        return 3 if r.status_code >= 500 and r.status_code != 503 else 2
+    if not data.get("id"):
+        # Принята, но ответ не прочесть: номера нет, повтор безвреден.
+        print(_("бот ответил {status} без номера заявки: проверь, придёт ли версия в тему").format(
+            status=r.status_code), file=sys.stderr)
+        return 3
     print(_("заявка {id} принята: бот перезапустится, когда закончится текущая "
             "работа, включая этот ран, и сообщит версию в тему. Заканчивай ответ.").format(
               id=data.get('id')))

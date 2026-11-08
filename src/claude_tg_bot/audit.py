@@ -4,17 +4,18 @@
 и, когда известны, "sid" (сессия), "run" (запуск процесса claude, runs.py) и
 "plan" (aid карточки плана, по которой действие пропущено).
 
-append-write в < PIPE_BUF атомарно на POSIX при open("a"), так что concurrent
-вызовы из разных async-тасков безопасны без locks.
+Дописывание через jsonstore.jsonl_append: одна запись под flock файла, так что
+одновременные вызовы из тасков бота и процессов хука строк не перемешают.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from . import jsonstore
 
 log = logging.getLogger(__name__)
 
@@ -61,15 +62,9 @@ def write_event(
     if why:
         # Почему карточка: причины serious.py (замер tools/replay_reads.py).
         event["why"] = why
-    line = json.dumps(event, ensure_ascii=False)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # 0o600: snippet содержит tool-input (команды/пути/url), который может
-        # включать секреты — не оставляем журнал world-readable. O_CREAT mode
-        # действует только на новый файл, поэтому fchmod чинит и ранее созданный.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            os.fchmod(f.fileno(), 0o600)
-            f.write(line + "\n")
+        # 0o600 (и старому файлу): snippet содержит tool-input (команды/пути/url),
+        # который может включать секреты, журнал не должен быть world-readable.
+        jsonstore.jsonl_append(path, event)
     except Exception:
         log.exception("audit log write failed (aid=%s)", approval_id)

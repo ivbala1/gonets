@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .config import local_zone
 from .i18n import _
 
 log = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class SessionInfo:
 
     @property
     def when(self) -> str:
-        return datetime.fromtimestamp(self.mtime).strftime("%d.%m %H:%M")
+        return datetime.fromtimestamp(self.mtime, local_zone()).strftime("%d.%m %H:%M")
 
 
 def _session_preview(path: Path) -> str:

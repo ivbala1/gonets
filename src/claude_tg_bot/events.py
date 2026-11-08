@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
-import os
 import re
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from . import jsonstore
 
 EVENTS_DIRNAME = "events"
 DEFAULT_TTL_SEC = 2 * 3600
@@ -59,34 +58,15 @@ def _path(base: Path, eid: str) -> Path:
 
 def load(base: Path, eid: str) -> dict[str, Any] | None:
     try:
-        rec = json.loads(_path(base, eid).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        path = _path(base, eid)
+    except ValueError:  # чужой id (из кнопки или аргумента): записи нет
         return None
-    return rec if isinstance(rec, dict) else None
-
-
-def _write_tmp(base: Path, rec: dict[str, Any]) -> str:
-    base.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=base, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=1)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-    return tmp
+    return jsonstore.read_dict(path, keep_corrupt=False) or None
 
 
 def reserve(base: Path, rec: dict[str, Any]) -> bool:
     """Положить принятое событие. False: файл с этим id уже есть (повтор по ключу)."""
-    tmp = _write_tmp(base, rec)
-    try:
-        os.link(tmp, _path(base, rec["id"]))
-    except FileExistsError:
-        return False
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    return True
+    return jsonstore.create_json(_path(base, rec["id"]), rec, indent=1)
 
 
 def update(base: Path, eid: str, **fields: Any) -> dict[str, Any] | None:
@@ -94,8 +74,7 @@ def update(base: Path, eid: str, **fields: Any) -> dict[str, Any] | None:
     if rec is None:
         return None
     rec.update(fields)
-    tmp = _write_tmp(base, rec)
-    os.replace(tmp, _path(base, eid))
+    jsonstore.write_json(_path(base, eid), rec, indent=1)
     return rec
 
 
@@ -146,8 +125,9 @@ def startup(base: Path, now: float | None = None,
     wake, interrupted, stale = [], [], []
     if not base.is_dir():
         return wake, interrupted, stale
-    for tmp in base.glob(".tmp-*.json"):
-        # Обрыв между созданием и ссылкой: черновик записи, не событие.
+    for tmp in (*base.glob(".tmp-*.json"), *base.glob(".*.tmp")):
+        # Обрыв между созданием и ссылкой: черновик записи, не событие
+        # (`.<имя>.*.tmp` от jsonstore, `.tmp-*.json` от записи до 07.11.2026).
         with contextlib.suppress(OSError):
             if now - tmp.stat().st_mtime > 3600:
                 tmp.unlink()

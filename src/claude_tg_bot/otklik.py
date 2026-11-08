@@ -32,19 +32,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
 import re
 import sys
-import tempfile
 import uuid
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import jsonstore, tg_api
+from .buttons import keyboard
 from .i18n import N_, _
 
 OTKLIK_DIRNAME = "otkliki"
@@ -69,7 +69,7 @@ PICK_FROM = {"o": ("pending",), "e": ("pending",), "s": ("pending",),
              "c": ("approved",), "r": ("failed", "unknown", "edit")}
 NOTE_CAP = 200
 # Запас на строку статуса: сообщение потом правится, а лимит Telegram 4096.
-NEW_TEXT_CAP = 4096 - 300
+NEW_TEXT_CAP = tg_api.TEXT_LIMIT - 300
 STATUS_LINES = {
     "pending": "",
     "approved": N_("✅ одобрено, отправляю…"),
@@ -121,36 +121,26 @@ def record_path(base: Path, oid: str) -> Path:
 
 def load(base: Path, oid: str) -> dict[str, Any] | None:
     try:
-        return json.loads(record_path(base, oid).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        path = record_path(base, oid)
+    except ValueError:  # чужой id (из кнопки или аргумента): записи нет
         return None
+    return jsonstore.read_dict(path, keep_corrupt=False) or None
 
 
 def save(base: Path, rec: dict[str, Any]) -> None:
-    base.mkdir(parents=True, exist_ok=True)
-    path = record_path(base, rec["id"])
-    fd, tmp = tempfile.mkstemp(dir=base, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    jsonstore.write_json(record_path(base, rec["id"]), rec, indent=2)
 
 
 @contextlib.contextmanager
 def locked(base: Path) -> Iterator[None]:
     """Замок всех переходов: бот и команды агента (ревью Codex 22.10.2026).
     Держать только на чтение и запись файлов, без сети."""
-    base.mkdir(parents=True, exist_ok=True)
-    with open(base / LOCK_NAME, "a", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    with jsonstore.file_lock(base / LOCK_NAME):
         yield
 
 
 def _records(base: Path) -> Iterator[dict[str, Any]]:
-    # Временные `.tmp-*.json` при записи не записи: имя не номер.
+    # Временные файлы записи (`.<имя>.*.tmp`, раньше `.tmp-*.json`) не записи.
     for path in sorted(base.glob("*.json")):
         if _ID_RE.fullmatch(path.stem):
             rec = load(base, path.stem)
@@ -449,7 +439,7 @@ def sync_targets(base: Path, now: datetime | None = None) -> list[dict[str, Any]
     """Записи, чьё сообщение могло отстать от состояния (правка не прошла):
     живые статусы за SYNC_DAYS дней, у которых показано не то. Итоговые
     записи до 22.10.2026 (без поля shown) не трогаются."""
-    now = now or datetime.now().astimezone()
+    now = now or datetime.now(timezone.utc)
     out = []
     oldest = now.timestamp() - (SYNC_DAYS + 1) * 86400
     for path in sorted(base.glob("*.json")):
@@ -497,17 +487,26 @@ def _bot_api(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
 
     from .config import load_config
     cfg = load_config(skip_hook_validation=True)
-    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/{method}"
+    # Как в handoff: неушедшее и 429 повторяются сами, правка при любом сбое
+    # связи (not modified успех), неподтверждённая отправка остаётся отказом.
+    edit = method.startswith("edit")
     try:
-        r = httpx.post(url, json=payload, timeout=10.0)
+        r = tg_api.post(cfg.telegram_bot_token, method, json=payload, timeout=10.0,
+                        retry_not_sent=True, retry_any=edit)
     except httpx.HTTPError as e:
         print(f"otklik: HTTP error: {type(e).__name__}", file=sys.stderr)
         return None
+    if edit and tg_api.not_modified(r):
+        return {"ok": True, "result": True}
     if r.status_code != 200:
         # Без URL: в нём токен бота.
         print(f"otklik: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
         return None
-    return r.json()
+    res = r.json()
+    if not edit:
+        from . import reactions
+        reactions.remember_sent(res, payload.get("text"), cfg.state_dir)
+    return res
 
 
 def _result_text(res: Any) -> str | None:
@@ -518,8 +517,7 @@ def _result_text(res: Any) -> str | None:
 
 
 def _markup(rec: dict[str, Any]) -> dict[str, Any]:
-    return {"inline_keyboard": [[{"text": b["text"], "callback_data": b["data"]} for b in row]
-                                for row in buttons(rec)]}
+    return keyboard(buttons(rec))
 
 
 def _show_in_chat(rec: dict[str, Any], base: Path | None = None) -> bool:
@@ -595,7 +593,7 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
         rec["status"] = "pending"
         save(base, rec)
     payload = {"chat_id": rec["chat_id"], "message_id": rec["message_id"], "reply_markup": _markup(rec)}
-    shown = _bot_api("editMessageReplyMarkup", payload) or _bot_api("editMessageReplyMarkup", payload)
+    shown = _bot_api("editMessageReplyMarkup", payload)
     if shown is None:
         # Код 0: запись есть, повтор `new` дал бы второе сообщение. Кнопки
         # дорисует бот после рана (синхронизация по отметке показа).
@@ -607,17 +605,28 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
     return 0
 
 
+def _created_at(rec: dict) -> datetime | None:
+    """Время создания записи как aware datetime. Строки сравнивать нельзя: в
+    записи смещение пояса, а пояс у пишущего и читающего может разниться.
+    Строка без смещения считается в поясе системы, как её писал _now()."""
+    try:
+        t = datetime.fromisoformat(str(rec.get("created") or ""))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.astimezone()
+
+
 def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
     """Одно сообщение с кнопкой «✅ Все N» под показанной пачкой: только свежие
     карточки этого чата, каждая названа в списке. Ждущих меньше двух: ничего,
     хватает кнопки на карточке. Кнопка последней, как у карточки: сообщение,
     потом файл пачки, потом кнопка."""
     source = chat_key or str(primary_chat_id)
-    fresh_from = (datetime.now() - timedelta(hours=BATCH_FRESH_HOURS)).isoformat(timespec="seconds")
+    fresh_from = datetime.now(timezone.utc) - timedelta(hours=BATCH_FRESH_HOURS)
     with locked(base):
         recs = [r for r in _records(base) if r.get("status") == "pending" and r.get("message_id")
                 and r.get("chat_id") is not None and source_of(r) == source
-                and str(r.get("created") or "") >= fresh_from][-BATCH_MAX:]
+                and (t := _created_at(r)) is not None and t > fresh_from][-BATCH_MAX:]
     if len(recs) < 2:
         print(_("otklik: ждущих меньше двух, кнопка не нужна"))
         return 0
@@ -628,18 +637,19 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
     if res is None:
         return 1
     path = _batch_path(base, bid)
-    path.parent.mkdir(parents=True, exist_ok=True)
     with locked(base):
-        path.write_text(json.dumps({
+        jsonstore.write_json(path, {
             "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
             "items": [{"id": r["id"], "sha": r["sha"], "gen": gen_of(r), "chat_id": r["chat_id"],
-                       "message_id": r["message_id"]} for r in recs]}), encoding="utf-8")
+                       "message_id": r["message_id"]} for r in recs]})
     if _bot_api("editMessageReplyMarkup", {
         "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
-        "reply_markup": {"inline_keyboard": [[{"text": _("✅ Все {count}").format(count=len(recs)),
-                                               "callback_data": f"{BATCH_PREFIX}:{bid}"}]]},
+        "reply_markup": keyboard([[{"text": _("✅ Все {count}").format(count=len(recs)),
+                                    "data": f"{BATCH_PREFIX}:{bid}"}]]),
     }) is None:
-        path.unlink(missing_ok=True)
+        # Файл пачки остаётся: правка могла пройти без ответа (повторы при
+        # сбое связи), и видимая кнопка без файла отказала бы. Кнопки нет:
+        # файл никто не тронет (ревью Codex 08.11.2026).
         return 1
     print(f"otklik batch {bid}: {len(recs)}")
     return 0

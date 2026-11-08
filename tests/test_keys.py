@@ -202,6 +202,7 @@ class KeyRoutingTests(unittest.TestCase):
     def test_button_handler_precedes_text_and_skips_forwarded(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             cfg = SimpleNamespace(telegram_bot_token="1:test", claude_bin="claude", codex_bin="",
+                                  telegram_bot_api_url="https://api.telegram.org",
                                   claude_cwd=Path(d), state_dir=Path(d))
             app = botmod.build_app(cfg)
         handlers = app.handlers[0]

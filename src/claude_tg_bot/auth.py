@@ -4,13 +4,13 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import re
 import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import procs
 from .config import agent_env
 from .i18n import _
 
@@ -108,20 +108,17 @@ class LoginManager:
             session.messages.append(message)
 
     async def _spawn(self, session: LoginSession, args: list[str]):
-        env = {k: v for k, v in agent_env().items()
-               if k not in ("CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")}
+        # Внутри функции: codex_runner сам импортирует auth (is_auth_error).
+        from .codex_runner import CODEX_OWN_SANDBOX_MARKERS
+        env = {k: v for k, v in agent_env().items() if k not in CODEX_OWN_SANDBOX_MARKERS}
         env.update(BROWSER="/bin/true", NO_COLOR="1")
-        spawning = asyncio.create_task(asyncio.create_subprocess_exec(
-            self.binaries[session.engine], *args,
+        # procs.spawn: своя группа, отмена посреди запуска (и повторная)
+        # добивает родившийся процесс; живой процесс гасит finally у _run.
+        session.proc = await procs.spawn(
+            [self.binaries[session.engine], *args],
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, start_new_session=True,
-            cwd=str(self.cwd), env=env,
-        ))
-        try:
-            session.proc = await asyncio.shield(spawning)
-        except asyncio.CancelledError:
-            session.proc = await spawning
-            raise
+            stderr=asyncio.subprocess.STDOUT, cwd=str(self.cwd), env=env,
+        )
         return session.proc
 
     async def _flow(self, session: LoginSession) -> str:
@@ -196,11 +193,10 @@ class LoginManager:
         finally:
             session.accepts_code = False
             proc = session.proc
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+            if proc is not None:
+                # Группу и когда сам CLI уже вышел: потомок мог остаться.
+                procs.kill_group(proc, signal.SIGKILL)
+                await procs.reap(proc)
             for message in session.messages:
                 with contextlib.suppress(Exception):
                     await message.delete()

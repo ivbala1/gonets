@@ -7,12 +7,13 @@ import time
 import uuid
 from typing import Any, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
+from . import buttons
 from .claude_runner import SessionStore
 from .config import Config
 from .i18n import _
+from .replies import is_unconfirmed
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
@@ -115,9 +116,8 @@ async def _retire_ask_cards(ctx: ContextTypes.DEFAULT_TYPE, cards: list[dict], n
         if not where:
             continue
         listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(c["options"], 1))
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_text(f"❓ {c['question']}\n\n{listing}\n\n{note}",
-                                            chat_id=where[0], message_id=where[1], reply_markup=None)
+        await buttons.note_on_card(ctx.bot, f"❓ {c['question']}\n\n{listing}", note, "retire ask",
+                                   where[0], where[1], parse_mode=None)
 
 
 async def _send_ask_card(
@@ -184,11 +184,10 @@ async def _send_ask_card(
             "card": card_id,
             "at": time.time(),
         }
-        rows.append([InlineKeyboardButton(_ask_button_label(len(rows) + 1, opt),
-                                          callback_data=f"ask:{token}")])
+        rows.append([{"text": _ask_button_label(len(rows) + 1, opt), "data": f"ask:{token}"}])
     try:
         sent = await update.message.reply_text(
-            f"❓ {question}\n\n{listing}", reply_markup=InlineKeyboardMarkup(rows),
+            f"❓ {question}\n\n{listing}", reply_markup=buttons.markup(rows),
         )
         if isinstance(getattr(sent, "message_id", None), int):
             where = (sent.chat_id, sent.message_id, getattr(sent, "message_thread_id", None))
@@ -200,7 +199,13 @@ async def _send_ask_card(
                 # идёт после замка темы): без сообщения та её не поправила.
                 await _retire_ask_cards(ctx, [{"msg": where, "question": question, "options": list(options)}],
                                         _("↓ вопрос заменён новым ниже"))
-    except Exception:
+    except Exception as e:
+        if is_unconfirmed(e):
+            # Карточка обычно доходит; номер сообщения неизвестен, _card_msg_matches
+            # такую не сверяет. Остаётся в реестре, старая гаснет ниже как при доставке.
+            log.warning("ask card unconfirmed by Telegram, kept")
+            await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
+            return
         log.exception("ask card failed")
         for t, v in list(pending.items()):
             if v.get("card") == card_id:
@@ -296,10 +301,7 @@ async def on_ask_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             query, _("Ответ не принят: вопрос устарел (старше 12 часов, заменён новым, бот "
             "перезапускался) или на него уже ответили. Если нужно, напиши ответ текстом."), show_alert=True,
         )
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        await buttons.strip_buttons(query)
         return
     if not same_session:
         await _ask_pick_finish(update, ctx, query, picked, same_session)
@@ -326,15 +328,18 @@ async def _ask_pick_finish(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE, qu
         # в другую сессию бессмысленно и вводит в заблуждение. Новая сессия
         # контекста вопроса не знает, а по его тексту роутер памяти мог бы
         # закрепить её за другим заказчиком (ревью /2mind 25.10.2026).
-        try:
-            await query.edit_message_text(f"🗳 {card.text}\n\n{_ask_pick_refusal(picked)}")
-        except Exception:
-            pass
+        # Текста нет у недоступного сообщения (InaccessibleMessage).
+        card_text = getattr(card, "text", None) or ""
+        if not await buttons.note_on_card(query, f"🗳 {card_text}" if card_text else "", _ask_pick_refusal(picked),
+                                          "ask refusal",
+                                          parse_mode=None):
+            # Кнопки сняты, а пояснения на карточке нет: отдельным сообщением.
+            with contextlib.suppress(Exception):
+                await card.reply_text(_ask_pick_refusal(picked), disable_notification=True)
         return
-    try:
-        await query.edit_message_text(f"🗳 {card.text}\n\n→ {answer}")
-    except Exception:
-        log.debug("ask card finalize failed (ignored)", exc_info=True)
+    card_text = getattr(card, "text", None) or ""
+    await buttons.note_on_card(query, f"🗳 {card_text}" if card_text else "", f"→ {answer}", "ask finalize",
+                               parse_mode=None)
     # Время принятого нажатия для разбора недели (ожидание кнопки до старта
     # рана); отказ по сроку и по смене сессии сюда не доходит.
     log.info("ask pick chat=%s", chat_key)
@@ -429,15 +434,15 @@ async def _send_plan_card(
             pending.pop(t, None)
     pending[token] = {"chat_key": chat_key, **snapshot}
     rows = [
-        [InlineKeyboardButton(_("✅ Выполнять"), callback_data=f"plan:{token}:ok")],
+        [{"text": _("✅ Выполнять"), "data": f"plan:{token}:ok"}],
         [
-            InlineKeyboardButton(_("✏️ Доработать"), callback_data=f"plan:{token}:more"),
-            InlineKeyboardButton(_("❌ Отмена"), callback_data=f"plan:{token}:no"),
+            {"text": _("✏️ Доработать"), "data": f"plan:{token}:more"},
+            {"text": _("❌ Отмена"), "data": f"plan:{token}:no"},
         ],
     ]
     try:
         sent = await update.message.reply_text(
-            _("План выше. Выполнять?"), reply_markup=InlineKeyboardMarkup(rows),
+            _("План выше. Выполнять?"), reply_markup=buttons.markup(rows),
         )
     except Exception:
         log.exception("plan card failed")

@@ -7,11 +7,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters, Update
+from telegram import InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
-from . import otklik
+from . import buttons, otklik, tg_api
 from .approval import AUTO_ENTITIES, entity_rows, keyboard_rows
 from .config import Config
 from .i18n import _
@@ -21,9 +21,7 @@ log = logging.getLogger("claude_tg_bot.bot")
 
 
 def _otklik_markup(rec: dict) -> InlineKeyboardMarkup | None:
-    rows = otklik.buttons(rec)
-    return InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row]
-                                 for row in rows]) if rows else None
+    return buttons.markup(otklik.buttons(rec))
 
 
 _OTKLIK_SHOW_LOCKS: dict[str, asyncio.Lock] = {}
@@ -49,7 +47,7 @@ async def _otklik_edit(bot: Any, rec: dict) -> str | None:
             otklik.render(rec), chat_id=rec["chat_id"], message_id=rec["message_id"],
             reply_markup=_otklik_markup(rec), link_preview_options=LinkPreviewOptions(is_disabled=True))
     except BadRequest as e:
-        if "not modified" not in str(e).lower():
+        if not tg_api.not_modified_text(str(e)):
             log.warning("otklik edit failed aid=%s: %s", rec.get("id"), e)
             return None
         return ""
@@ -186,8 +184,7 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         if cur is not None and msg is not None and msg.message_id == cur.get("message_id"):
             await _otklik_show(ctx.bot, cur, base)
         else:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
+            await buttons.strip_buttons(query)
         return
     except (OSError, ValueError) as e:
         log.warning("otklik save failed: %s", e)
@@ -274,14 +271,12 @@ async def on_otklik_all_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     except (otklik.Refused, OSError, ValueError) as e:
         log.warning("otklik batch refused: %s", e)
         await _b._answer_quietly(query, _("Кнопка устарела: эта пачка уже решена"), show_alert=True)
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await buttons.strip_buttons(query)
         return
     log.info("otklik batch %s picked=%d", bid, len(picked))
     if not picked:
         await _b._answer_quietly(query, _("Кнопка устарела: эта пачка уже решена"), show_alert=True)
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await buttons.strip_buttons(query)
         return
     gens = {rec["id"]: otklik.gen_of(rec) for rec in picked}
     first, source = picked[0], otklik.source_of(picked[0])
@@ -295,9 +290,8 @@ async def on_otklik_all_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     reason = _("агент не взял текст")
     try:
         await _b._answer_quietly(query, _("Отправляю: {count}").format(count=len(picked)))
-        with contextlib.suppress(Exception):
-            await query.edit_message_text(
-                f"{msg.text}\n\n" + _("✅ одобрено {count}, отправляю").format(count=len(picked)))
+        await buttons.note_on_card(query, getattr(msg, "text", None) or "", _("✅ одобрено {count}, отправляю").format(count=len(picked)),
+                                   "otklik batch", parse_mode=None)
         for rec in picked:
             await _otklik_show(ctx.bot, rec, base)
         if await _b._dispatch_to_claude(

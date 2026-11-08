@@ -14,17 +14,15 @@ CLAUDE_TG_LIMIT_RESERVE_CHATS), фоновые дела Домового тож�
 """
 from __future__ import annotations
 
-import json
 import logging
 import math
-import os
 import re
-import tempfile
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import jsonstore
 from .config import local_zone
 from .i18n import _
 
@@ -125,10 +123,8 @@ def _clean(data) -> dict:
 def read() -> dict:
     if _path is None:
         return {}
-    try:
-        return _clean(json.loads(_path.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return {}
+    # Снимок наблюдений, следующий ответ CLI его обновит: копия битого не нужна.
+    return _clean(jsonstore.read_dict(_path, keep_corrupt=False))
 
 
 def record(windows: dict, observed_at: float | None = None) -> None:
@@ -162,11 +158,7 @@ def _record(windows: dict, observed_at: float | None) -> None:
     if not changed:
         return
     try:
-        _path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=_path.parent, prefix=".claude_limits.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
-        os.replace(tmp, _path)
+        jsonstore.write_json(_path, data)
     except (OSError, TypeError, ValueError):
         log.warning("claude limits snapshot not written", exc_info=True)
 

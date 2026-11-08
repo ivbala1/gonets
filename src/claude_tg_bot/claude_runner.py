@@ -5,7 +5,6 @@ import atexit
 import hashlib
 import json
 import logging
-import os
 import shlex
 import shutil
 import signal
@@ -18,7 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import limits, runs
+from . import jsonstore, limits, runs
+from .procs import kill_group, reap, run_bounded, spawn
 from .auth import is_auth_error
 from .config import agent_env
 from .i18n import _
@@ -38,40 +38,8 @@ log = logging.getLogger(__name__)
 _STREAM_LINE_LIMIT = 10 * 1024 * 1024
 
 
-def kill_process_tree(proc: asyncio.subprocess.Process, sig: int) -> None:
-    """Послать сигнал всему process group, в которой живёт claude.
-
-    Claude запускается с `start_new_session=True`, поэтому он становится
-    лидером своей process group, и все его дети (Bash из Bash-tool, sub-процессы
-    от MCP-серверов и т.п.) наследуют ту же pgid. `proc.terminate()` бьёт
-    только по верхнему PID, оставляя детей зомбями. `os.killpg(pgid, sig)`
-    кладёт всё дерево.
-
-    pgid берём через os.getpgid(proc.pid) — у нас он равен pid после
-    start_new_session, но на случай гонок safer использовать getpgid.
-    Если процесс уже мёртв (returncode != None) — no-op.
-    """
-    if proc.pid is None or proc.returncode is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        # Уже умер или нет такого PID — нечего убивать.
-        return
-    try:
-        os.killpg(pgid, sig)
-    except ProcessLookupError:
-        pass
-    except OSError as e:
-        # На POSIX это редкий случай; fall-back на прямой kill самого процесса.
-        log.warning("killpg(%s, %s) failed: %s — falling back to proc.terminate/kill", pgid, sig, e)
-        try:
-            if sig == signal.SIGTERM:
-                proc.terminate()
-            else:
-                proc.kill()
-        except ProcessLookupError:
-            pass
+# Старое имя общей функции: тесты и соседние модули патчат его здесь.
+kill_process_tree = kill_group
 
 # F1: mtime-cached revalidation hook settings.
 # load_config валидирует hook-файл при старте бота, но админ может изменить
@@ -105,22 +73,6 @@ def new_session_id() -> str:
     return str(uuid.uuid4())
 
 
-def _atomic_write_text(path: Path, data: str) -> None:
-    """Пишем через tmp-файл в той же директории + os.replace — atomic на одном FS."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 class SessionStore:
     """chat_key -> {session_id, last-used ts}, persisted to JSON (atomic).
 
@@ -146,35 +98,26 @@ class SessionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.data: dict[str, dict] = {}
-        if path.exists():
-            try:
-                raw = json.loads(path.read_text() or "{}")
-            except ValueError:  # не JSON или не UTF-8: бот должен стартовать
-                # Копия рядом: первая же запись перезапишет файл, и сессии
-                # всех тем пропали бы без следа (аудит 31.10.2026).
-                kept = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
-                try:
-                    os.replace(path, kept)
-                except OSError:
-                    kept = path
-                log.warning("sessions file %s is corrupt, kept as %s, starting fresh", path, kept)
-                raw = {}
-            now = time.time()
-            for k, v in (raw.items() if isinstance(raw, dict) else []):
-                if isinstance(v, dict):
-                    val = str(v.get("v", ""))
-                    if val:
-                        try:
-                            ts = float(v.get("ts", 0.0) or 0.0)
-                        except (TypeError, ValueError):
-                            ts = 0.0
-                        self.data[k] = {"v": val, "ts": ts}
-                elif isinstance(v, str) and v:
-                    # legacy голая строка — мигрируем, ts=now (grace-окно).
-                    self.data[k] = {"v": v, "ts": now}
+        # Битый (не JSON, не UTF-8) откладывается рядом копией: первая же
+        # запись перезапишет файл, и сессии всех тем пропали бы без следа
+        # (аудит 31.10.2026). Бот при этом стартует.
+        raw = jsonstore.read_dict(path)
+        now = time.time()
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                val = str(v.get("v", ""))
+                if val:
+                    try:
+                        ts = float(v.get("ts", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        ts = 0.0
+                    self.data[k] = {"v": val, "ts": ts}
+            elif isinstance(v, str) and v:
+                # legacy голая строка — мигрируем, ts=now (grace-окно).
+                self.data[k] = {"v": v, "ts": now}
 
     def _flush(self) -> None:
-        _atomic_write_text(self.path, json.dumps(self.data, indent=2))
+        jsonstore.write_json(self.path, self.data, indent=2)
 
     def get(self, chat_key: str) -> str | None:
         entry = self.data.get(chat_key)
@@ -491,27 +434,24 @@ _CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 _oauth_refresh_lock = asyncio.Lock()
 
 
-async def _reap_proc(proc: asyncio.subprocess.Process) -> None:
-    """Снять зомби после SIGKILL, не виснув навсегда (uninterruptible sleep).
-    Не вышел и тогда: запись в журнал, returncode остаётся None, по нему
-    вызывающий держит проект задачи до выхода (unexited, ревью Codex 14.10)."""
-    try:
-        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        pass
-    if proc.returncode is None:
-        log.warning("pid=%s не вышел за 5 с после SIGKILL", proc.pid)
+# Старое имя: тесты и соседние модули патчат и импортируют его отсюда.
+_reap_proc = reap
+
+
+def oauth_credentials(path: Path | None = None) -> dict | None:
+    """Раздел claudeAiOauth из .credentials.json Claude Code, либо None, если
+    файла/раздела нет, он битый или это не OAuth-логин (ANTHROPIC_API_KEY).
+    Файл чужой: битый не откладывается (общий для models и срока входа)."""
+    data = jsonstore.read_json(path or _CREDENTIALS_PATH, None, keep_corrupt=False)
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    return oauth if isinstance(oauth, dict) else None
 
 
 def _oauth_expires_at() -> float | None:
     """expiresAt (секунды, UTC) OAuth-токена из .credentials.json, либо None,
     если файла/поля нет или это не OAuth-логин (например, ANTHROPIC_API_KEY)."""
-    try:
-        data = json.loads(_CREDENTIALS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
-    if not isinstance(oauth, dict):
+    oauth = oauth_credentials()
+    if oauth is None:
         return None
     exp = oauth.get("expiresAt")
     # expiresAt хранится в миллисекундах.
@@ -542,35 +482,23 @@ async def ensure_oauth_fresh(claude_bin: str, *, buffer_sec: int = 120) -> None:
             log.debug("oauth refreshed by concurrent run — skip warmup")
             return
         log.info("oauth token expiring (%.0fs left) — warmup-refresh via claude", exp - time.time())
-        proc = None
         try:
             # Ран идёт без хука бота и его запретов: инструментов и MCP у него
             # нет, остальное отказ без вопроса, сессия не сохраняется. Без
             # этого он видел Bash, Gmail и allow из настроек пользователя
             # (ревью Codex 19.10.2026, проверено на 2.1.303). --tools
             # принимает несколько слов: за ним флаг, а не запрос.
-            proc = await asyncio.create_subprocess_exec(
-                claude_bin, "-p", "--tools", "", "--strict-mcp-config",
-                "--permission-mode", "dontAsk", "--no-session-persistence",
-                "--output-format", "json",
-                "--model", "claude-haiku-4-5-20251001", "ok",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=agent_env(),
-                start_new_session=True,
+            # Таймаут и отмена: run_bounded убивает всю группу.
+            await run_bounded(
+                [claude_bin, "-p", "--tools", "", "--strict-mcp-config",
+                 "--permission-mode", "dontAsk", "--no-session-persistence",
+                 "--output-format", "json",
+                 "--model", "claude-haiku-4-5-20251001", "ok"],
+                timeout=45, env=agent_env(),
             )
-            await asyncio.wait_for(proc.communicate(), timeout=45)
         except asyncio.TimeoutError:
-            log.warning("oauth warmup timed out — killing pgroup")
-            kill_process_tree(proc, signal.SIGKILL)
-            await _reap_proc(proc)
+            log.warning("oauth warmup timed out — killed pgroup")
             return
-        except asyncio.CancelledError:
-            if proc is not None:
-                kill_process_tree(proc, signal.SIGKILL)
-                await _reap_proc(proc)
-            raise
         except OSError as e:
             log.warning("oauth warmup failed: %s — proceeding, main call may refresh or error", e)
             return
@@ -614,17 +542,14 @@ def resume_target(
     return existing
 
 
-# Этап плана: инструменты мимо хука, которые действуют, а не читают
+# Ран /plan: инструменты мимо хука, которые действуют, а не читают
 # (субагенты, выход из плана, планировщики, сообщения другим сессиям).
-# Хук закрывает остальное (approval, plan_stage; ревью Codex 13.10.2026).
+# Write и Edit в режиме plan не выполняет сам CLI; замка «только чтение» в
+# хуке с 04.11.2026 нет (решение Ивана).
 PLAN_DISALLOWED_TOOLS = (
     "Task", "Agent", "ExitPlanMode", "Artifact", "ScheduleWakeup",
     "CronCreate", "CronDelete", "RemoteTrigger", "PushNotification", "SendMessage",
 )
-# Обдумывание темы задачи с Иваном у карточек: субагенты разрешены. Их Bash и
-# запись идут через тот же хук с sid родителя и режимом plan (проверено
-# 18.10.2026 пробным раном), то есть под теми же правилами этапа плана.
-PLAN_AGENT_TOOLS = ("Task", "Agent")
 
 _untrusted_dir: Path | None = None
 
@@ -656,7 +581,7 @@ def untrusted_settings_path(hook_settings: Path) -> Path:
         atexit.register(shutil.rmtree, _untrusted_dir, True)
     path = _untrusted_dir / f"settings-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json"
     if not path.exists():
-        _atomic_write_text(path, text)
+        jsonstore.write_text(path, text)
     return path
 
 
@@ -683,7 +608,6 @@ async def run_claude(
     progress_cb: Callable[[str], Awaitable[None]] | None = None,
     activity_cb: Callable[[], None] | None = None,
     permission_mode: str = "bypassPermissions",
-    plan_agents: bool = False,
     unattended_sids: set[str] | None = None,
     untrusted_sids: set[str] | None = None,
     on_session_start: Callable[[str], None] | None = None,
@@ -713,8 +637,6 @@ async def run_claude(
     max_runtime_sec — жёсткий потолок выполнения; 0 = без таймаута.
     memory_scope_hint - сохранённый scope Telegram-темы для read-only hook
         общей памяти. Передаётся только в окружении дочернего Claude-процесса.
-    plan_agents - в режиме plan не запрещать субагентов (PLAN_AGENT_TOOLS):
-        обдумывание темы задачи, где Иван у карточек.
     untrusted_sids - не None для рана по чужому тексту: набор инструментов
         прежний, режим dontAsk с правилами ask (UNTRUSTED_ASK_TOOLS), sid
         регистрируется на время рана, и хук отклоняет всё, кроме MCP на чтение.
@@ -805,8 +727,7 @@ async def run_claude(
         # и выжег месячный лимит. Variadic <tools...> завершается следующим флагом
         # (--effort/--model/--resume), поэтому одного значения достаточно.
         "--disallowedTools", "Workflow",
-        *(tuple(t for t in PLAN_DISALLOWED_TOOLS if not (plan_agents and t in PLAN_AGENT_TOOLS))
-          if permission_mode == "plan" else ()),
+        *(PLAN_DISALLOWED_TOOLS if permission_mode == "plan" else ()),
     ]
     if untrusted_sids is not None:
         # Не --tools: набор инструментов тот же, что у обычного рана (см.
@@ -913,14 +834,14 @@ async def run_claude(
         # start_new_session=True: claude становится session+pgroup leader, его дети
         # (Bash-tool, MCP-серверы и т.п.) попадают в ту же pgroup. Это позволяет
         # /cancel и timeout убивать ВСЁ поддерево через os.killpg, а не только верх.
-        proc = await asyncio.create_subprocess_exec(
-            *args,
+        # procs.spawn: отмена посреди запуска добивает уже родившийся процесс.
+        proc = await spawn(
+            args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
             env=child_env,
-            start_new_session=True,
             limit=_STREAM_LINE_LIMIT,
         )
         if should_stop is not None and should_stop():
@@ -1056,7 +977,8 @@ async def run_claude(
                                 evt.get("type") == "result" and evt.get("is_error") is not True):
                             blocked_tools.append(_("(событие init не пришло)"))
                         if blocked_tools:
-                            log.error("untrusted run stopped chat=%s: no lock for tools %s",
+                            log.error("%s run stopped chat=%s: no lock for tools %s",
+                                      "untrusted" if untrusted_sids is not None else "read-only",
                                       chat_key, ", ".join(blocked_tools))
                             kill_process_tree(proc, signal.SIGKILL)
                             stderr_task.cancel()

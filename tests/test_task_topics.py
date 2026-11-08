@@ -101,7 +101,7 @@ class _TaskBase(unittest.IsolatedAsyncioTestCase):
         self.replies: list[str] = []
         self.result: ClaudeResult | None = None
         self.cfg = SimpleNamespace(
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             codex_fallback_sandbox="read-only",
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,
@@ -284,7 +284,8 @@ def _task_words_head() -> str:
 
 
 class ThinkTests(_TaskBase):
-    """Обдумывание: только чтение, проект под «Делай» лишь у ответа с
+    """Обдумывание (решение Ивана 04.11.2026: замка «только чтение» нет, ран идёт
+    в bypassPermissions): проект под «Делай» лишь у ответа с
     маркером и только если Иван не писал, пока ответ писался."""
 
     async def test_reply_with_marker_gets_do_button(self) -> None:
@@ -292,7 +293,7 @@ class ThinkTests(_TaskBase):
         self.replies = [f"{PLAN}\n<<DO>>"]
         msg = await self.say("а проверь ещё CHANGELOG")
         run = self.runs[-1]
-        self.assertEqual(run["kw"]["permission_mode"], "plan")
+        self.assertEqual(run["kw"]["permission_mode"], "bypassPermissions")
         # правила обдумывания напоминаются в каждом ходе
         self.assertIn(tasks.think_note(), run["prompt"])
         task = self.task("t7-5")
@@ -444,7 +445,7 @@ class DoTests(_TaskBase):
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
         await self.say("да")
         self.assertEqual(len(self.runs), 1)
-        self.assertEqual(self.runs[0]["kw"]["permission_mode"], "plan")
+        self.assertEqual(self.runs[0]["kw"]["permission_mode"], "bypassPermissions")
         self.assertEqual(self.task("t7-5")["status"], "thinking")
         # старая кнопка после этого не выполняет
         query = await self.press(f"nt:t7-5:do:{SHA}")
@@ -561,7 +562,7 @@ class DoTests(_TaskBase):
         self.put_command(status="done", delivered="2026-10-15T10:00:00+04:00")
         self.replies = [f"{PLAN}\n<<DO>>"]
         await self.say("а теперь ещё и CHANGELOG")
-        self.assertEqual(self.runs[-1]["kw"]["permission_mode"], "plan")
+        self.assertEqual(self.runs[-1]["kw"]["permission_mode"], "bypassPermissions")
         self.assertEqual(self.task("t7-5")["status"], "proposed")
         # тема, где снова обдумывают, утром не удаляется
         later = datetime.now().astimezone() + timedelta(days=2)
@@ -634,7 +635,7 @@ class QueueTests(_TaskBase):
         await first
         await later
         await self.settle()
-        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["bypassPermissions", "plan"])
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["bypassPermissions", "bypassPermissions"])
         self.assertIn("не трогай CHANGELOG", self.runs[1]["prompt"])
 
     async def test_message_after_exec_can_propose(self) -> None:
@@ -676,7 +677,7 @@ class QueueTests(_TaskBase):
         lock.release()
         await later
         await self.settle()
-        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["bypassPermissions"])
         self.assertEqual(self.task("t7-5")["status"], "thinking")
 
     async def test_two_waiting_messages_go_in_one_turn(self) -> None:
@@ -759,8 +760,7 @@ class QueueTests(_TaskBase):
         self.assertTrue(any(_("Выполнение не запустилось из-за рестарта: после него скажи «делай» ещё раз.") in t
                             for t in self.card_texts()))
         self.bot_data["draining"] = False
-        with patch.dict(os.environ, {"NEWS_TG_CHAT_ID": ""}):
-            await botmod._tasks_startup(self.ctx)
+        await botmod._tasks_startup(self.ctx)
         await self.settle()
         self.assertEqual(self.runs, [])
         await self.press(f"nt:t7-5:do:{SHA}")
@@ -1104,8 +1104,7 @@ class RecoverTests(_TaskBase):
         # Авария после записи итога, до ответа в тему: старт присылает итог
         self.put_command("t7-5", thread=THREAD, status="done", result="✅ Готово\nобновил README",
                          result_ok=True, result_unsent=True, result_at="2026-10-19T10:00:00+04:00")
-        with patch.dict(os.environ, {"NEWS_TG_CHAT_ID": ""}):
-            await botmod._tasks_startup(self.ctx)
+        await botmod._tasks_startup(self.ctx)
         self.assertIn("обновил README", self.bot.send_message.await_args.args[1])
         self.assertIsNone(self.task("t7-5")["result_unsent"])
 class HousekeepingTests(_TaskBase):
@@ -1211,11 +1210,20 @@ class ExecRightsTests(unittest.TestCase):
             card.assert_not_called()
 
     def test_danger_and_send_still_card(self) -> None:
-        for tool, inp in (("Bash", {"command": "rm -rf /srv/data"}),
+        for tool, inp in (("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"}),
                           ("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})):
             out, card = self.decide(tool, inp)
             self.assertEqual(out["decision"], "deny", tool)
             card.assert_called()
+
+    def test_removed_classes_go_without_card_2026_11_04(self) -> None:
+        """решение Ивана 04.11.2026: карточка только на отправку людям
+        (docs/design-2026-11-04-system-boundaries.md)"""
+        for cmd in ("rm -rf /srv/data", "git push origin main", "git push --force origin main"):
+            with self.subTest(cmd=cmd):
+                out, card = self.decide("Bash", {"command": cmd})
+                self.assertEqual(out["decision"], "allow")
+                card.assert_not_called()
 
     def test_self_restart_refused(self) -> None:
         out, card = self.decide("Bash", {"command": "systemctl --user restart claude-tg-bot"})
@@ -1223,7 +1231,8 @@ class ExecRightsTests(unittest.TestCase):
         card.assert_not_called()
 
     def test_same_session_outside_exec_cards(self) -> None:
-        out, card = self.decide("Bash", {"command": "rm -rf /srv/data"}, exec_sids=frozenset())
+        out, card = self.decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"},
+                                exec_sids=frozenset())
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
 
@@ -1233,9 +1242,7 @@ class CommandTests(_TaskBase):
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
-        env = patch.dict(os.environ, {"NEWS_TG_CHAT_ID": str(GROUP)})
-        env.start()
-        self.addCleanup(env.stop)
+        self.cfg.news_tg_chat_id = GROUP
         self.bot.id = BOT_ID
         self.bot.create_forum_topic = AsyncMock(return_value=SimpleNamespace(message_thread_id=NEW_THREAD))
         # Значков тем у Telegram в тесте нет: цвет, в имени только номер.
@@ -1287,7 +1294,8 @@ class CommandTests(_TaskBase):
             short="1 поправь README бота", link=tasks.topic_link(GROUP, NEW_THREAD)))
         # обдумывание сразу, только чтение, ни одной кнопки кроме «Закрыть»
         self.assertEqual(len(self.runs), 1)
-        self.assertEqual(self.runs[0]["kw"]["permission_mode"], "plan")
+        # Первое обдумывание в обычном режиме (решение Ивана 04.11.2026).
+        self.assertEqual(self.runs[0]["kw"]["permission_mode"], "bypassPermissions")
         self.assertTrue(self.runs[0]["prompt"].startswith(_task_words_head() + "поправь README бота"))
         card = self.bot.send_message.await_args_list[0]
         self.assertEqual(_buttons(card.kwargs["reply_markup"]), [f"nt:t{USER}-31:close"])
@@ -1423,7 +1431,7 @@ class AdditionTests(_TaskBase):
         self.assertEqual(self.echoes(), [_("📨 Через Домового: {words}").format(words="сначала сделай бэкап")])
         self.assertEqual(len(self.runs), 1)
         run = self.runs[0]
-        self.assertEqual((run["kw"]["permission_mode"], run["chat_key"]), ("plan", f"{GROUP}:{THREAD}"))
+        self.assertEqual((run["kw"]["permission_mode"], run["chat_key"]), ("bypassPermissions", f"{GROUP}:{THREAD}"))
         self.assertTrue(run["prompt"].startswith(
             _("Владелец пишет в эту задачу через Домового. Его слова:\n{words}{extra}").format(
                 words="сначала сделай бэкап", extra="")))
@@ -1435,7 +1443,7 @@ class AdditionTests(_TaskBase):
     async def test_do_word_through_domovoy_never_approves(self) -> None:
         self.put_command(status="proposed", plan=PLAN, plan_sha=SHA)
         await self.add("t7-5", "делай")
-        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["bypassPermissions"])
         self.assertNotEqual(self.task("t7-5")["status"], "running")
         query = await self.press(f"nt:t7-5:do:{SHA}")
         self.assertEqual(_("Этот проект уже не действует: под последним проектом своя кнопка"),
@@ -1455,7 +1463,7 @@ class AdditionTests(_TaskBase):
             data["t7-5"]["status"] = "done"
         lock.release()
         await self.settle()
-        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["plan"])
+        self.assertEqual([r["kw"]["permission_mode"] for r in self.runs], ["bypassPermissions"])
 
     async def test_closed_unknown_and_creating_refused(self) -> None:
         self.put_command("t7-5", status="closed", name="1 README")
@@ -1474,6 +1482,22 @@ class AdditionTests(_TaskBase):
         again = await self.add("t7-5", "и CHANGELOG", key="k1")
         self.assertRegex(again, msg_re("Уже добавлено в задачу «{name}»: {link}"))
         self.assertEqual(len(self.echoes()), 1)
+        self.assertEqual(len(self.runs), 1)
+
+    async def test_unconfirmed_echo_still_adds(self) -> None:
+        # Эхо без подтверждения обычно в теме видно: «не добавлено» вело к
+        # повтору и второму эху (ревью 05.11.2026)
+        import httpx
+        from telegram.error import TimedOut
+        self.put_command(name="1 README")
+        err = TimedOut()
+        err.__cause__ = httpx.ReadTimeout("")
+        self.bot.send_message.side_effect = [err]
+        reply = await self.add("t7-5", "и CHANGELOG", key="k1")
+        self.bot.send_message.side_effect = None
+        self.assertRegex(reply, msg_re("Добавил в задачу «{name}»: {link}"))
+        again = await self.add("t7-5", "и CHANGELOG", key="k1")
+        self.assertRegex(again, msg_re("Уже добавлено в задачу «{name}»: {link}"))
         self.assertEqual(len(self.runs), 1)
 
     async def test_plan_dropped_before_echo_goes_out(self) -> None:
@@ -1691,7 +1715,7 @@ class RunStartMarkTests(unittest.IsolatedAsyncioTestCase):
 
         async def create(*_a, **_kw):
             self.order.append("process")
-            return SimpleNamespace(pid=1, returncode=0, stdin=_RunnerStdin(self.order),
+            return SimpleNamespace(pid=123456789, returncode=0, stdin=_RunnerStdin(self.order),
                                    stdout=_RunnerStdout(*results),
                                    stderr=SimpleNamespace(read=AsyncMock(return_value=b"")),
                                    wait=AsyncMock(return_value=0))
@@ -1754,7 +1778,7 @@ class UnexitedRunTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(claude_runner, "_ensure_hook_still_valid", lambda *_: None), \
                 patch.object(claude_runner, "ensure_oauth_fresh", AsyncMock()), \
                 patch.object(claude_runner, "kill_process_tree", lambda proc, sig: None), \
-                self.assertLogs(claude_runner.log, "WARNING") as logs, self.assertRaises(RuntimeError):
+                self.assertLogs("claude_tg_bot", "WARNING") as logs, self.assertRaises(RuntimeError):
             await claude_runner.run_claude("claude", "k", 1, None, "x", store, cwd=Path("/tmp"),
                                            hook_settings=Path("/tmp/x.json"), process_registry=procs,
                                            unexited=unexited)
@@ -1815,6 +1839,7 @@ class CommandRoutingTests(unittest.TestCase):
     def test_forwarded_task_is_not_a_command(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             cfg = SimpleNamespace(telegram_bot_token="1:test", claude_bin="claude", codex_bin="",
+                                  telegram_bot_api_url="https://api.telegram.org",
                                   claude_cwd=Path(d), state_dir=Path(d))
             app = botmod.build_app(cfg)
         handlers = app.handlers[0]

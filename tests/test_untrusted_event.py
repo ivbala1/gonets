@@ -442,13 +442,16 @@ class HandleApproveWebFetchTests(unittest.TestCase):
         self.assertEqual(self._decide("https://api.open-meteo.com/v1/forecast?x=1"),
                          {"decision": "allow", "reason": "default"})
 
-    def test_local_and_ip_urls_card(self) -> None:
-        # guard3, Н8 (docs/audit-2026-11/guard3-decisions.md): loopback и
-        # IP-литерал причиной «запрос во внутреннюю сеть». Карточка не ушла:
-        # итог deny.
+    def test_local_and_ip_urls_go_without_card_2026_11_04(self) -> None:
+        """решение Ивана 04.11.2026: карточка только на отправку людям
+        (docs/design-2026-11-04-system-boundaries.md)"""
         for url in ("http://127.0.0.1:8788/health", "http://localhost/x", "http://192.168.1.50/"):
             with self.subTest(url=url):
-                self.assertEqual(self._decide(url)["decision"], "deny")
+                self.assertEqual(self._decide(url)["decision"], "allow")
+
+    def test_telegram_server_url_cards(self) -> None:
+        # Сервер Telegram на loopback это отправка людям. Карточка не ушла: итог deny.
+        self.assertEqual(self._decide("http://127.0.0.1:8770/mcp")["decision"], "deny")
 
     def test_other_local_names_pass(self) -> None:
         # Прочее без карточки: узкое правило Н8 не берёт имена (nip.io, .lan).

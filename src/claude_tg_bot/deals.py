@@ -14,14 +14,13 @@ failed, interrupted (рестарт посреди хода, исход неиз
 from __future__ import annotations
 
 import contextlib
-import fcntl
-import json
-import os
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from . import jsonstore
 
 DEALS_SUBDIR = "deals"
 # Дело без ходов дольше суток закрывается само.
@@ -54,30 +53,14 @@ def locked(base: Path):
     """Реестр под замком файла: нажатие, свайп и конец хода приходят
     параллельно, а ответ принимается ровно один раз. Нечитаемый реестр это
     отказ, а не пустой: запись затёрла бы все дела."""
-    base.mkdir(parents=True, exist_ok=True)
-    with open(base / "deals.lock", "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        path = _path(base)
-        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-        if not isinstance(data, dict):
-            raise ValueError(f"{path}: не словарь")
-        before = json.dumps(data, ensure_ascii=False, indent=1)
+    with jsonstore.locked(_path(base), lock_path=base / "deals.lock") as data:
         yield data
-        after = json.dumps(data, ensure_ascii=False, indent=1)
-        if after == before:
-            return
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(after, encoding="utf-8")
-        os.replace(tmp, path)
 
 
 def load(base: Path) -> dict[str, dict]:
     """Реестр на чтение; нечитаемый пустой (только для показа и маршрута)."""
-    try:
-        data = json.loads(_path(base).read_text(encoding="utf-8")) if _path(base).is_file() else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    # Не откладывать битый: locked на нём намеренно отказывает.
+    return jsonstore.read_dict(_path(base), keep_corrupt=False)
 
 
 def make_label(question: str) -> str:

@@ -37,7 +37,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ... import procs
 from ...approval import _curl_url_ok
+from ...config import agent_env
 from ...i18n import _
 
 OUT_DIR = Path("/tmp/yt-subs")
@@ -62,9 +64,8 @@ def _uvx() -> str:
 def _ytdlp(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     cmd = [_uvx(), "yt-dlp@latest", *_YTDLP_BASE, *args]
     try:
-        return subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT_SEC,
-        )
+        # Своя группа: на таймауте гаснут и uv, и сам yt-dlp (procs).
+        return procs.run_bounded_sync(cmd, cwd=cwd, text=True, timeout=TIMEOUT_SEC, env=agent_env())
     except subprocess.TimeoutExpired:
         raise SystemExit(_("yt-dlp не уложился в {seconds} с").format(seconds=TIMEOUT_SEC))
 

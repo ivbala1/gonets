@@ -9,13 +9,15 @@ import uuid
 from datetime import timedelta
 from typing import Any, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
+from . import buttons
 from .config import Config
 from .i18n import _, plural
+from .replies import is_unconfirmed
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
@@ -77,6 +79,8 @@ class _RunStatus:
         self._clock = clock
         self.run_id = uuid.uuid4().hex[:12]
         self._message_id: int | None = None
+        # Первая отправка статуса не подтверждена: больше его в этом ране не шлём.
+        self._send_unknown = False
         self._started = clock()
         self._last_edit = 0.0
         # Начало тишины для статуса и текста тревоги: последнее событие, а
@@ -163,7 +167,7 @@ class _RunStatus:
 
     async def _show(self, now: float) -> None:
         """Отправить или перерисовать статус. Звать под self._lock."""
-        if now < max(self._pause_until, self._status_pause_until):
+        if now < max(self._pause_until, self._status_pause_until) or self._send_unknown:
             return
         try:
             if self._message_id is None:
@@ -185,6 +189,11 @@ class _RunStatus:
             # (аудит 10.2026).
             self._last_edit = max(now, self._clock())
         except Exception as e:
+            if self._message_id is None and is_unconfirmed(e):
+                # Статус мог дойти, номера нет: новый при каждом показе плодил бы копии.
+                self._send_unknown = True
+                log.warning("run status send unconfirmed by Telegram, no more status in this run")
+                return
             if isinstance(e, RetryAfter):
                 self._back_off(e)
             elif (
@@ -229,6 +238,10 @@ class _RunStatus:
             )
             return m.message_id, left
         except Exception as e:
+            if is_unconfirmed(e):
+                # Сообщение обычно доходит: считаем отправленным, эпизод закрыт (left 0), повтора нет.
+                log.warning("run watch message unconfirmed by Telegram, not repeated")
+                return None, 0
             if isinstance(e, RetryAfter):
                 self._back_off(e)
             unsure = not isinstance(e, TelegramError) or (
@@ -270,9 +283,9 @@ class _RunStatus:
             ):
                 quiet = self._quiet_since
                 mins = int(now - self._last_event) // 60
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(_("Ждать"), callback_data=f"runwatch:wait:{self.run_id}"),
-                    InlineKeyboardButton(_("Прервать"), callback_data=f"runwatch:stop:{self.run_id}"),
+                markup = buttons.markup([[
+                    {"text": _("Ждать"), "data": f"runwatch:wait:{self.run_id}"},
+                    {"text": _("Прервать"), "data": f"runwatch:stop:{self.run_id}"},
                 ]])
                 mid, left = await self._send_loud(
                     _("⏳ {mins} {unit} тишины: "
@@ -388,19 +401,13 @@ async def on_run_watch_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -
     card = query.message
     if status is None:
         await _b._answer_quietly(query, _("Ран уже закончился"))
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            log.debug("run watch markup clear failed (ignored)", exc_info=True)
+        await buttons.strip_buttons(query)
         return
     alert_id = getattr(card, "message_id", None)
     if action == "wait":
         status.snooze(alert_id)
         await _b._answer_quietly(query, _("Жду дальше"))
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            log.debug("run watch markup clear failed (ignored)", exc_info=True)
+        await buttons.strip_buttons(query)
         return
     if action != "stop":
         await _b._answer_quietly(query, _("Неизвестная кнопка"))
@@ -413,8 +420,12 @@ async def on_run_watch_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -
     else:
         note = await _b._cancel_running(ctx, status.chat_key, proc)
     await _b._answer_quietly(query, _("Прерываю"))
+    text = getattr(card, "text", None) or ""
+    if text:
+        await buttons.note_on_card(query, text, note, "run watch stop", parse_mode=None)
+        return
     try:
-        await query.edit_message_text(f"{getattr(card, 'text', '') or ''}\n\n{note}".lstrip())
+        await query.edit_message_text(note)
     except Exception:
         log.debug("run watch card edit failed (ignored)", exc_info=True)
 

@@ -2,26 +2,25 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import signal
 import time
 import uuid
-from datetime import datetime, time as dtime
+from datetime import time as dtime
 from typing import Any
 
-import aiohttp
 from aiohttp import web
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 
-from . import bigfile, otklik, restart
+from . import bigfile, buttons, login_expiry, otklik, restart, tg_api
+from . import procs as procs_mod
 from .approval import ApprovalRegistry, warn_if_no_shared_secret
 from .claude_runner import SessionStore
 from .config import Config, local_zone
 from .i18n import _
-from .voice import make_client
+from .voice import log_local_stt_status, make_client
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
@@ -80,6 +79,7 @@ async def _on_post_init(app: Application) -> None:
     openai_client = make_client(cfg)
     app.bot_data["openai"] = openai_client
     log.info("voice features: %s", "enabled" if openai_client else "DISABLED (no OPENAI_API_KEY)")
+    log_local_stt_status(cfg)
 
     # Меню команд при вводе «/» в клиенте. Заодно перетирает стейл-меню,
     # оставшееся на токене от прошлых ботов.
@@ -121,6 +121,10 @@ async def _on_post_init(app: Application) -> None:
     app.job_queue.run_daily(_b._tasks_housekeeping, name="news-tasks",
                             time=dtime(8, 45, tzinfo=local_zone()))
     app.job_queue.run_once(_b._tasks_startup, when=30, name="news-tasks-start")
+    # Конец сохранённого входа claude.ai: напоминание владельцу заранее.
+    app.job_queue.run_daily(login_expiry.check_login_expiry, name="login-expiry",
+                            time=dtime(9, 30, tzinfo=local_zone()))
+    app.job_queue.run_once(login_expiry.check_login_expiry, when=60, name="login-expiry-start")
     # Сообщение о перезапуске по заявке: после старта приёма обновлений.
     app.job_queue.run_once(_restart_announce, when=3, name="restart-announce")
     # Работа, оборванная аварией прошлого процесса: забрать до приёма обновлений.
@@ -177,7 +181,8 @@ async def _send_shutdown_notice_via_api(
     bot_token: str, chat_key: str, text: str, timeout_sec: float = 5.0
 ) -> None:
     """Прямой POST к Telegram bot API. Bot client уже shut down в post_shutdown,
-    поэтому app.bot.send_message не работает — используем raw HTTPS."""
+    поэтому app.bot.send_message не работает: используем raw HTTPS
+    (tg_api: тот же адрес сервера, одна попытка, timeout_sec на всё)."""
     try:
         chat_id, thread_id = _parse_chat_key(chat_key)
     except Exception:
@@ -186,16 +191,15 @@ async def _send_shutdown_notice_via_api(
     payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    log.warning(
-                        "shutdown notice POST returned %s for chat_key=%s", resp.status, chat_key
-                    )
-    except Exception:
-        log.exception("shutdown notice POST failed for chat_key=%s", chat_key)
+        resp = await tg_api.apost(bot_token, "sendMessage", json=payload, timeout=timeout_sec)
+    except Exception as e:
+        # Без traceback: цепочка исключения раньше могла нести адрес с токеном;
+        # текст ошибок httpx tg_api уже очистил от токена.
+        log.warning("shutdown notice POST failed for chat_key=%s: %s: %s", chat_key, type(e).__name__, e)
+        return
+    if resp.status_code != 200:
+        log.warning("shutdown notice POST returned %s for chat_key=%s", resp.status_code, chat_key)
 
 
 _STOP_GRACE_SEC = 30.0
@@ -224,15 +228,18 @@ def _terminate_runs(app: Application) -> None:
     app.bot_data["stopping"] = True
     # Большая загрузка может идти до получаса, а stop() ждёт обработчики.
     _b._downloads_cancel(app)
+    _b._local_stt_cancel(app)
     procs: dict[str, asyncio.subprocess.Process] = app.bot_data.get("procs") or {}
-    alive = [(ck, p) for ck, p in list(procs.items()) if p.returncode is None]
+    # В реестре только идущие раны. Группу бьём и тогда, когда сам claude уже
+    # вышел, а его внук держит вывод (procs.kill_group); пустая группа: no-op.
+    alive = list(procs.items())
     for ck, p in alive:
         log.warning("stop signal: SIGTERM to claude proc pid=%s (chat_key=%s)", p.pid, ck)
         _b.kill_process_tree(p, signal.SIGTERM)
 
     def _kill_left() -> None:
         for ck, p in alive:
-            if p.returncode is None:
+            if procs_mod.running(p):
                 log.warning("claude proc pid=%s (chat_key=%s) ignored SIGTERM, SIGKILL", p.pid, ck)
                 _b.kill_process_tree(p, signal.SIGKILL)
 
@@ -254,7 +261,7 @@ async def _restart_wait_workshop(app: Application, req: dict, drain: Any) -> Non
     """Первый шаг перезапуска: дождаться конца работы мастерской. Личка и её
     события тем временем работают; «/cancel мастерская» ускорит."""
     run = app.bot_data.get("workshop_run") or {}
-    since = datetime.fromtimestamp(run["since"]).strftime("%H:%M") if run.get("since") else "?"
+    since = _b._workshop_since(run)
     await _restart_notify(app, req, _("♻️ Перезапуск ждёт конца работы мастерской «{what}» с {since}; "
                                       "личка работает как обычно. «/cancel мастерская» ускорит.").format(
         what=run.get("what") or "?", since=since), True)
@@ -270,10 +277,10 @@ def _restart_active(app: Application) -> int:
 
 
 def _restart_keyboard(rid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(_("Перезапустить сейчас"), callback_data=f"rst:now:{rid}"),
-        InlineKeyboardButton(_("Ждать"), callback_data=f"rst:wait:{rid}"),
-        InlineKeyboardButton(_("Отменить"), callback_data=f"rst:cancel:{rid}"),
+    return buttons.markup([[
+        {"text": _("Перезапустить сейчас"), "data": f"rst:now:{rid}"},
+        {"text": _("Ждать"), "data": f"rst:wait:{rid}"},
+        {"text": _("Отменить"), "data": f"rst:cancel:{rid}"},
     ]])
 
 
@@ -414,8 +421,7 @@ async def on_restart_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     if drain is None or drain.req.get("id") != rid:
         await _b._answer_quietly(query, _("Эта заявка уже не действует"))
         return
-    with contextlib.suppress(Exception):
-        await query.edit_message_reply_markup(reply_markup=None)
+    await buttons.strip_buttons(query)
     if action == "now":
         await _b._answer_quietly(query, _("Проверяю код и перезапускаю"))
         drain.now_event.set()
@@ -522,7 +528,10 @@ async def _on_post_shutdown(app: Application) -> None:
     if burst_tasks:
         await asyncio.gather(*list(burst_tasks.values()), return_exceptions=True)
     procs: dict[str, asyncio.subprocess.Process] = app.bot_data.get("procs") or {}
-    active = [(ck, p) for ck, p in list(procs.items()) if p.returncode is None]
+    # Гасим и раны, где claude уже вышел, а внук держит вывод (procs.running);
+    # весть о перезапуске, как и раньше, только темам с живым claude.
+    active = [(ck, p) for ck, p in list(procs.items()) if procs_mod.running(p)]
+    notify = [ck for ck, p in active if p.returncode is None]
     if active:
         # Уведомляем юзеров (через прямой Telegram API — bot client уже мёртв
         # в post_shutdown). Без этого юзер видит загадочное "отменено
@@ -541,7 +550,7 @@ async def _on_post_shutdown(app: Application) -> None:
                         _("♻️ Бот перезапускается, эта сессия будет прервана. "
                           "Дождись пары секунд и повтори запрос."),
                     )
-                    for ck, _unused in active
+                    for ck in notify
                 ),
                 return_exceptions=True,
             )
@@ -560,14 +569,22 @@ async def _terminate_and_wait(chat_key: str, proc: asyncio.subprocess.Process, *
     """SIGTERM всей pgroup, подождать grace_sec, SIGKILL если живы. Гарантирует,
     что к концу shutdown ни claude, ни его дети не остаются зомбями."""
     log.warning("terminating claude proc pid=%s (chat_key=%s) on shutdown", proc.pid, chat_key)
-    if proc.returncode is not None:
+    # Сам claude мог уже выйти, а его потомки нет: судим по группе, не по
+    # returncode лидера (procs.kill_group).
+    if not procs_mod.group_alive(proc):
         return
     _b.kill_process_tree(proc, signal.SIGTERM)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + grace_sec
     try:
         await asyncio.wait_for(proc.wait(), timeout=grace_sec)
-        return
     except asyncio.TimeoutError:
-        log.warning("claude proc pid=%s did not exit in %ss; sending SIGKILL to pgroup", proc.pid, grace_sec)
+        pass
+    while procs_mod.group_alive(proc) and loop.time() < deadline:
+        await asyncio.sleep(0.1)
+    if not procs_mod.group_alive(proc):
+        return
+    log.warning("claude proc pid=%s group alive after %ss; sending SIGKILL to pgroup", proc.pid, grace_sec)
     _b.kill_process_tree(proc, signal.SIGKILL)
     try:
         await asyncio.wait_for(proc.wait(), timeout=2.0)

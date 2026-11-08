@@ -1,5 +1,4 @@
-"""Тесты transcribe: граница входа, метки времени и то, что вызов скилла
-идёт без карточки."""
+"""Тесты transcribe: граница входа, метки времени."""
 from __future__ import annotations
 
 import shutil
@@ -8,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from claude_tg_bot.approval import _SKILL_PYTHON, _bash_auto_allowed
 from claude_tg_bot.skills.transcribe.__main__ import (
     check_input,
     hms,
@@ -31,11 +29,6 @@ class HelpersTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
-    def test_secret_paths_refused(self) -> None:
-        for raw in ("/home/user/src/claude-tg-bot/.env", "~/.ssh/id_ed25519"):
-            with self.subTest(raw=raw), self.assertRaises(SystemExit):
-                check_input(raw)
-
     def test_missing_file_refused(self) -> None:
         with self.assertRaises(SystemExit):
             check_input("/nonexistent/x.m4a")
@@ -58,23 +51,6 @@ class InputTests(unittest.TestCase):
                 check=True, timeout=60,
             )
             self.assertAlmostEqual(probe_duration(out), 2, delta=0.2)
-
-
-class AutoAllowTests(unittest.TestCase):
-    _CMD = f"{_SKILL_PYTHON} -m claude_tg_bot.skills.transcribe"
-
-    def test_call_needs_no_card(self) -> None:
-        for cmd in (
-            self._CMD + ' "/tmp/asr/in.m4a"',
-            self._CMD + " '/tmp/a b.ogg' --segments --lang ru,en",
-            self._CMD + ' "/tmp/in.m4a" --prompt "Kubernetes, DevOps, AWS" 2>&1',
-        ):
-            with self.subTest(cmd=cmd):
-                self.assertTrue(_bash_auto_allowed(cmd, None))
-
-    def test_chained_tail_stays_on_card(self) -> None:
-        cmd = self._CMD + " /tmp/in.m4a; cat ~/src/claude-tg-bot/.env"
-        self.assertFalse(_bash_auto_allowed(cmd, None))
 
 
 if __name__ == "__main__":

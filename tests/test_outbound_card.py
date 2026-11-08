@@ -77,7 +77,7 @@ class OutboundCardTests(unittest.TestCase):
 
     def test_other_send_verbs_go_to_card(self) -> None:
         for tool in ("mcp__telegram__send_voice", "mcp__telegram__edit_message",
-                     "mcp__telegram__send_scheduled_message",
+                     "mcp__telegram__send_scheduled_message", "mcp__telegram__vote_poll",
                      "mcp__claude_ai_Slack__slack_send_message"):
             with self.subTest(tool=tool):
                 out, card = self._decide(tool, {"chat_id": "@x", "message": "hi"})
@@ -215,7 +215,7 @@ class CardTimeoutTests(unittest.TestCase):
         cfg = SimpleNamespace(
             approve_shared_secret="", primary_chat_id=1, state_dir=Path(tempfile.gettempdir()),
             approve_auto_chat_keys=frozenset(), approve_whitelist_paths=(),
-            mcp_auto_allow_re=None, bash_auto_allow_re=None, approve_timeout_sec=5 if press else 0.01,
+            mcp_auto_allow_re=None, approve_timeout_sec=5 if press else 0.01,
         )
         bot_data = {"unattended_sids": set(), "untrusted_sids": set(), "burst_until_by_target": {}}
         request = SimpleNamespace(
@@ -239,7 +239,9 @@ class CardTimeoutTests(unittest.TestCase):
             raise err
 
         card = AsyncMock(side_effect=send)
+        # обычная карточка берётся подменой причины: механика таймаута не зависит от класса
         with patch.object(approval, "send_approval_request", card), \
+                patch.object(approval.serious, "send_reasons", return_value={"тестовая причина"}), \
                 patch.object(approval.asyncio, "sleep", AsyncMock()), \
                 patch.object(approval.audit, "write_event"):
             resp = asyncio.run(approval.handle_approve(request))
@@ -300,13 +302,6 @@ class CardBindTests(unittest.TestCase):
 
     def test_outbound_card_never_binds(self) -> None:
         self.assertFalse(bot._is_card_of(self._msg(), self._pending("mcp__telegram__send_message"), 1))
-
-    def test_quoted_skill_name_is_seen(self) -> None:
-        for cmd in ("python -m claude_tg_bot.ski\"\"lls.task_new x", "python -m 'claude_tg_bot.skills.task_new'",
-                    "echo 'unclosed"):
-            with self.subTest(cmd=cmd):
-                self.assertTrue(approval._calls_bot_skill(cmd))
-        self.assertFalse(approval._calls_bot_skill("ssh immich docker ps"))
 
 
 if __name__ == "__main__":

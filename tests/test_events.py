@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot import events  # noqa: E402
+from claude_tg_bot import events, limits  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
 
 
@@ -104,7 +104,8 @@ class EventHttpTests(unittest.TestCase):
         cfg = SimpleNamespace(approve_shared_secret="", primary_chat_id=1, state_dir=state,
                               allowed_chat_ids=frozenset(), allowed_user_ids=frozenset({1}))
         wake = AsyncMock()
-        send = AsyncMock(side_effect=OSError) if send_fails else AsyncMock(
+        send = AsyncMock(side_effect=send_fails if isinstance(send_fails, BaseException) else OSError) \
+            if send_fails else AsyncMock(
             return_value=SimpleNamespace(message_id=5))
         application = SimpleNamespace(bot=SimpleNamespace(send_message=send), bot_data={"event_wake": wake})
         out = []
@@ -139,6 +140,18 @@ class EventHttpTests(unittest.TestCase):
         out, wake, store = self._post([{"title": "x", "wake": True, "key": "watch-abcdef12"}], send_fails=True)
         self.assertEqual(out[0][0], 502)
         self.assertEqual(list(store.glob("*.json")), [])
+
+    def test_unconfirmed_notice_accepted(self) -> None:
+        # Telegram не подтвердил уведомление: оно обычно дошло, 502 дал бы
+        # повтор отправителя и второе уведомление (ревью Codex 05.11.2026)
+        import httpx
+        from telegram.error import TimedOut
+        err = TimedOut()
+        err.__cause__ = httpx.ReadTimeout("")
+        out, wake, store = self._post([{"title": "x", "wake": True, "key": "watch-abcdef12"}], send_fails=err)
+        self.assertEqual(out[0][0], 200)
+        self.assertEqual(wake.await_count, 1)
+        self.assertEqual(events.load(store, wake.call_args.kwargs["event_id"])["status"], "accepted")
 
     def test_repeat_while_receiving_waits(self) -> None:
         import asyncio
@@ -308,13 +321,12 @@ class EventWakeTests(unittest.IsolatedAsyncioTestCase):
         await self.botmod._events_resume(self.app)
         await __import__("asyncio").sleep(0)
         args, kwargs = wake.call_args
-        from datetime import datetime
-        when = datetime.fromtimestamp(float(waiting["accepted_at"])).strftime("%H:%M")
+        when = limits.clock(float(waiting["accepted_at"]))
         self.assertIn(_("(Событие получено в {when}, ждало {minutes} мин: бот перезапускался.)\n\n").format(
             when=when, minutes=20), args[2])
         self.assertEqual((args[3], kwargs["untrusted"], kwargs["event_id"]), (False, True, waiting["id"]))
         self.assertEqual(events.load(self.store, started["id"])["outcome"], "interrupted")
-        cut_at = datetime.fromtimestamp(float(started["accepted_at"])).strftime("%H:%M")
+        cut_at = limits.clock(float(started["accepted_at"]))
         self.assertIn(_("⚠️ Пробуждение «{source}: {title}» (получено в {when}) оборвал "
                         "перезапуск бота посреди рана. Повторять не стал: что успело "
                         "сделаться, видно по журналу и чату.").format(source="домовой", title="Утро", when=cut_at),

@@ -70,6 +70,26 @@ sets the language. The limit is 4 hours. Pass skill errors on in words.
 - The AskUserQuestion tool is not available in this mode; only the marker works.
 - Do not ask about details with an obvious default: choose and say so briefly.
 
+## Follow-up checks
+
+- If something has to be checked later (did the deploy come up, did the reply
+  arrive, did the deadline pass), end your answer with the marker
+  `<<LATER:30m|what to check>>`. The bot removes it, schedules a job and wakes you
+  in the same topic at that time, in the conversation session. Make the text
+  self-contained: after a pause of more than a day the session starts afresh.
+- Time: `Nm`, `Nh`, `Nd` or `HH:MM`, from 5 minutes to 14 days. Text up to 200
+  characters, one line. One marker per answer, only at the very end of the
+  answer: in the middle, in a `>` quote or inside `code` it does nothing.
+- Limits: at most 3 such jobs waiting per topic, at most 3 steps in a row without
+  the owner's word. Not available in task topics, deal turns, the workshop, on
+  untrusted text, at the `/plan` stage, in a GPT reply or a reply with an error.
+- The check run is an ordinary background run with no read-only lock; the rule
+  is yours to keep: check and report briefly, change nothing. If an action is
+  needed, ask the owner with the ASK marker; the action runs on their tap.
+- Do not schedule a check instead of answering: answer first, marker at the end.
+- A distant date or a check that is not yours: put it in the owner's task list,
+  not in LATER.
+
 ## Style
 
 - Short and to the point. Propose concrete commands or edits.

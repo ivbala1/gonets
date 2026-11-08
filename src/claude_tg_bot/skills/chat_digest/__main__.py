@@ -36,18 +36,16 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
-import json
 import os
-import subprocess
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ... import paths
+from ...config import _int_env
 from ...i18n import _
 from ...notify import send_message
-from ...dashes import soften_dashes
-from .._oneshot import resolve_claude_bin, run_claude_oneshot
+from .._oneshot import run_claude_json
 from .core import (
     PLAIN_TOPIC_ID,
     PLAIN_TOPIC_TITLE,
@@ -67,9 +65,7 @@ from .core import (
     validate_digest,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-HOOK_SETTINGS = REPO_ROOT / "claude-hook-settings.json"
-LOCK_PATH = REPO_ROOT / "state" / "chat_digest.lock"
+LOCK_NAME = "chat_digest.lock"
 DEFAULT_TELEGRAM_ENV = "~/.local/share/telegram-mcp/.env"
 DEFAULT_TIMEOUT_SEC = 480  # один чат вместе со сбором и доставкой укладывается в 10 минут Bash у бота
 DEFAULT_LIMIT_PER_TOPIC = 600
@@ -242,47 +238,10 @@ async def mark_read(creds: TelegramCreds, chat: ChatUnread) -> list[str]:
 
 
 def run_digest_claude(prompt: str, timeout: int) -> str:
-    """Ран сводки без единого инструмента: claude здесь только читает промпт
-    и пишет текст. В промпте чужие сообщения, поэтому встроенные инструменты
-    выключены целиком (--tools ""), MCP-серверы не поднимаются, режим plan
-    как второй замок, транскрипт с чужой перепиской на диск не пишется."""
-    args = [
-        resolve_claude_bin(),
-        "-p",
-        "--output-format", "json",
-        "--permission-mode", "plan",
-        "--tools", "",
-        "--no-session-persistence",
-        "--settings", str(HOOK_SETTINGS),
-        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-    ]
-    try:
-        proc = run_claude_oneshot(args, input=prompt.encode("utf-8"), timeout=timeout, cwd=str(REPO_ROOT))
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(_("claude не уложился в {seconds} с").format(seconds=timeout)) from None
-    except OSError as e:
-        raise RuntimeError(_("claude не запустился: {error}").format(error=type(e).__name__)) from None
-    if proc.returncode != 0:
-        # Сырой вывод дочернего процесса наружу не идёт: в журнал и боту
-        # уходит только код и класс причины.
-        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-        kind = (_("лимит или доступ") if any(k in stderr for k in ("429", "401", "rate", "limit"))
-                else _("ошибка запуска"))
-        raise RuntimeError(_("claude exit {rc}: {kind}").format(rc=proc.returncode, kind=kind))
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(_("claude stdout не JSON: {error}").format(error=e)) from e
-    if payload.get("is_error"):
-        raise RuntimeError(_("claude вернул is_error=true"))
-    # Тире на дефис здесь: хук против тире в плановых ранах бота молчит, его
-    # строка «Исправлено» подменила бы сводку (решение Ивана 22.10.2026).
-    return soften_dashes((payload.get("result") or "").strip())
+    """Ран сводки без единого инструмента (_oneshot.run_claude_json): в
+    промпте чужие сообщения."""
+    return run_claude_json(prompt, timeout=timeout)
 
-
-def _int_env(name: str) -> int | None:
-    raw = os.environ.get(name, "").strip()
-    return int(raw) if raw else None
 
 
 def _positive(value: int, name: str) -> int:
@@ -313,8 +272,10 @@ def _deliver(messages: list[str], chat_id: int, thread_id: int) -> int:
 
 
 def _lock():
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(LOCK_PATH, "w")
+    # Каталог состояния из .env, поэтому замок считается после load_dotenv.
+    lock_path = paths.state_dir() / LOCK_NAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "w")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -333,14 +294,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="максимум сообщений на тему за прогон")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    load_dotenv(REPO_ROOT / ".env")
-    chat = _int_env("CHAT_DIGEST_TG_CHAT_ID")
-    thread = _int_env("CHAT_DIGEST_TG_THREAD_ID")
+    load_dotenv(paths.ENV_FILE)
+    chat = _int_env("CHAT_DIGEST_TG_CHAT_ID", None)
+    thread = _int_env("CHAT_DIGEST_TG_THREAD_ID", None)
     if chat is None or thread is None:
         print(_("chat_digest: нужны CHAT_DIGEST_TG_CHAT_ID и CHAT_DIGEST_TG_THREAD_ID в .env (пара)"),
               file=sys.stderr)
         return 1
-    env_path = Path(os.environ.get("CHAT_DIGEST_TELEGRAM_ENV", "").strip() or DEFAULT_TELEGRAM_ENV).expanduser()
+    env_path = paths.env_path("CHAT_DIGEST_TELEGRAM_ENV", DEFAULT_TELEGRAM_ENV)
 
     lock = _lock()
     if lock is None:
@@ -348,10 +309,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         try:
-            timeout = _positive(_int_env("CHAT_DIGEST_TIMEOUT_SEC") or DEFAULT_TIMEOUT_SEC, "CHAT_DIGEST_TIMEOUT_SEC")
+            timeout = _positive(_int_env("CHAT_DIGEST_TIMEOUT_SEC", None) or DEFAULT_TIMEOUT_SEC, "CHAT_DIGEST_TIMEOUT_SEC")
             limit = _positive(args.limit if args.limit is not None else
-                              (_int_env("CHAT_DIGEST_MAX_PER_TOPIC") or DEFAULT_LIMIT_PER_TOPIC), _("лимит на тему"))
-            max_chars = _positive(_int_env("CHAT_DIGEST_MAX_CHARS") or DEFAULT_MAX_CHARS, "CHAT_DIGEST_MAX_CHARS")
+                              (_int_env("CHAT_DIGEST_MAX_PER_TOPIC", None) or DEFAULT_LIMIT_PER_TOPIC), _("лимит на тему"))
+            max_chars = _positive(_int_env("CHAT_DIGEST_MAX_CHARS", None) or DEFAULT_MAX_CHARS, "CHAT_DIGEST_MAX_CHARS")
             sources: list[int | str]
             if args.chat:
                 sources = [parse_chat_spec(c) for c in args.chat]

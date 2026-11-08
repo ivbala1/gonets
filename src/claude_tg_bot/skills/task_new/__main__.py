@@ -34,7 +34,7 @@ import time
 import httpx
 
 from ... import tasks
-from ...config import load_config
+from ...config import bridge_url, load_config
 from ...i18n import _
 
 
@@ -45,8 +45,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--open", action="store_true", help="открытые задачи со ссылками, ничего не заводит")
     parser.add_argument("--to", default="", help="id открытой задачи: добавить слова в неё")
     args = parser.parse_args(argv)
-    if args.open:
+    try:
         cfg = load_config(skip_hook_validation=True)
+    except RuntimeError as e:
+        print(f"task_new: {e}", file=sys.stderr)
+        return 2
+    if args.open:
         opened = tasks.open_tasks(tasks.load(tasks.registry_dir(cfg.state_dir)))
         print(tasks.open_list(opened, with_id=True) if opened else _("открытых задач нет"))
         return 0
@@ -54,31 +58,33 @@ def main(argv: list[str] | None = None) -> int:
     if not words:
         print("task_new: нужны слова задачи", file=sys.stderr)
         return 2
-    cfg = load_config(skip_hook_validation=True)
-    host = cfg.approve_http_host
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
     key = hashlib.sha256(f"{words}\n{int(time.time() // 60)}".encode()).hexdigest()[:16]
     headers = {"X-Approve-Token": cfg.approve_shared_secret} if cfg.approve_shared_secret else {}
     try:
         # Тема рана и сообщение Ивана из окружения рана бота (claude_runner):
         # на него ответит строка итога после закрытия (19.10.2026).
         ask = os.environ.get("CLAUDE_TG_ASK_ID", "")
-        r = httpx.post(f"http://{host}:{cfg.approve_http_port}/task",
+        r = httpx.post(bridge_url(cfg, "/task"),
                        json={"words": words, "context": args.context, "key": key, "to": args.to,
                              "chat_key": os.environ.get("CLAUDE_TG_CHAT_KEY", ""),
                              "ask_id": int(ask) if ask.isdigit() else None},
                        headers=headers, timeout=120)
     except httpx.HTTPError as e:
+        # Код 3, как у restart_request: исход неизвестен (тема могла
+        # завестись), повтор в ту же минуту второй темы не заведёт.
         print(f"task_new: бот не ответил ({type(e).__name__})", file=sys.stderr)
-        return 1
+        return 3
     try:
         data = r.json()
     except ValueError:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     if r.status_code != 200:
         print(f"task_new: отказ {r.status_code}: {data.get('error') or r.text[:200]}", file=sys.stderr)
-        return 1
+        # 503 «tasks unavailable» мост отдаёт до заведения темы: отказ. Прочие
+        # 5xx: мост мог успеть завести тему, исход неизвестен, как при обрыве.
+        return 3 if r.status_code >= 500 and r.status_code != 503 else 2
     print(data.get("text") or "")
     return 0
 

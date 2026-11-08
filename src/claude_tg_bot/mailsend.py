@@ -31,7 +31,6 @@ import re
 import smtplib
 import ssl
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -39,13 +38,14 @@ from email.utils import formatdate, make_msgid
 from pathlib import Path
 from typing import Any
 
+from . import jsonstore, paths
 from .i18n import _
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 SMTP_TIMEOUT_SEC = 60
 ENV_FILE_VAR = "MAILSEND_ENV"
-DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+DEFAULT_ENV_FILE = paths.ENV_FILE
 # Текст письма целиком идёт на карточку: большой файл там не прочесть.
 BODY_MAX_BYTES = 100_000
 TICKET_DIRNAME = "mailsend"
@@ -69,6 +69,10 @@ _MSGID_RE = re.compile(r"<[^<>\s]+@[^<>\s]+>")
 
 class MailError(Exception):
     """Письмо не собрать или не отправить; текст для человека."""
+
+
+class MailMaybeSent(MailError):
+    """Связь оборвалась во время передачи: письмо могло уйти (код 3)."""
 
 
 @dataclass(frozen=True)
@@ -214,8 +218,9 @@ def write_ticket(state_dir: Path, digest: str, secret: str, approval_id: str = "
     base = ticket_dir(state_dir)
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     now = time.time()
-    # Попутно убрать протухшие билеты: они уже ничего не разрешают.
-    for old in base.glob("*.json"):
+    # Попутно убрать протухшие билеты: они уже ничего не разрешают; заодно
+    # обрывки записи (`.<имя>.*.tmp` от jsonstore).
+    for old in (*base.glob("*.json"), *base.glob(".*.tmp")):
         try:
             if now - old.stat().st_mtime > TICKET_TTL_SEC:
                 old.unlink()
@@ -223,15 +228,8 @@ def write_ticket(state_dir: Path, digest: str, secret: str, approval_id: str = "
             pass
     rec = {"created": round(now, 3), "approval_id": approval_id,
            "mac": _ticket_mac(digest, round(now, 3), secret)}
-    fd, tmp = tempfile.mkstemp(dir=base, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(rec, f)
-        path = base / f"{digest}.json"
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    path = base / f"{digest}.json"
+    jsonstore.write_json(path, rec)
     return path
 
 
@@ -329,7 +327,7 @@ def send(letter: Letter, user: str, password: str) -> tuple[str, dict[str, Any]]
             # Обрыв во время передачи: ответ на конец письма мог потеряться
             # после приёма. «Не ушло» вело к новой карточке и второму письму
             # (аудит outbound 31.10.2026).
-            raise MailError(_("SMTP: связь оборвалась при отправке ({error}): письмо могло уйти. "
+            raise MailMaybeSent(_("SMTP: связь оборвалась при отправке ({error}): письмо могло уйти. "
                               "Проверь «Отправленные» в Gmail, прежде чем просить новую карточку").format(
                                   error=type(e).__name__)) from e
         raise MailError(f"SMTP: {type(e).__name__}: {e}") from e
@@ -349,8 +347,12 @@ def main(argv: list[str] | None = None) -> int:
     except (MailError, argparse.ArgumentError) as e:
         print(f"mailsend: {e}", file=sys.stderr)
         return 2
-    cfg = _load_cfg()
-    env_file = Path(os.environ.get(ENV_FILE_VAR) or DEFAULT_ENV_FILE).expanduser()
+    try:
+        cfg = _load_cfg()
+    except RuntimeError as e:
+        print(f"mailsend: {e}", file=sys.stderr)
+        return 2
+    env_file = paths.env_path(ENV_FILE_VAR, str(DEFAULT_ENV_FILE))
     try:
         letter = load_letter(args, dirs=attach_dirs(), limit=max_bytes(), base=Path.cwd())
         if args.dry_run:
@@ -367,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         user, password = load_credentials(env_file)
         message_id, refused = send(letter, user, password)
+    except MailMaybeSent as e:
+        print(f"mailsend: {e}", file=sys.stderr)
+        return 3
     except MailError as e:
         print(f"mailsend: {e}", file=sys.stderr)
         return 1
@@ -377,9 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     print(_("отправлено от {user}: {recipients}; {names}").format(
         user=user, recipients=', '.join(ok), names=names))
     if refused:
-        print(_("mailsend: сервер отклонил адресатов: {recipients}").format(
+        # Остальным письмо ушло: код 3, повтор отправил бы его им второй раз.
+        print(_("mailsend: сервер отклонил адресатов: {recipients}; остальным письмо ушло, "
+                "не повторяй отправку").format(
             recipients=', '.join(refused)), file=sys.stderr)
-        return 1
+        return 3
     return 0
 
 

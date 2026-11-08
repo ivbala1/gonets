@@ -9,13 +9,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
+from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, ContextTypes
 
-from . import deals
+from . import buttons, deals
 from .claude_runner import ClaudeResult
-from .config import Config
+from .config import Config, now_local
 from .i18n import N_, _
+from .replies import is_unconfirmed
 from .skills.news_digest import backlog as news_backlog, core as news
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
@@ -46,16 +47,27 @@ def _deal_update(app: Any, deal_id: str, fn: Callable[[dict], Any]) -> Any:
         return None
 
 
+def _deal_stamp(deal: dict) -> int:
+    """Метка заданного вопроса: повторный вопрос дела получает новую."""
+    return int(float(deal.get("asked_at") or 0) * 1000)
+
+
 async def _send_deal_card(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, deal: dict) -> bool:
     """Карточка вопроса дела: ярлык первой строкой, варианты из реестра на
     диске (кнопка живёт и после рестарта). Прежняя карточка дела гаснет."""
-    rows = [[InlineKeyboardButton(_b._ask_button_label(i, opt), callback_data=f"deal:{deal['id']}:{i}")]
+    # Метка вопроса в кнопке: по ней узнаётся карточка, ушедшая без номера.
+    stamp = _deal_stamp(deal)
+    rows = [[{"text": _b._ask_button_label(i, opt), "data": f"deal:{deal['id']}:{i}:{stamp}"}]
             for i, opt in enumerate(deal["options"], 1)]
     listing = "\n".join(f"{i}. {opt}" for i, opt in enumerate(deal["options"], 1))
     try:
         sent = await msg.reply_text(f"{deals.head(deal)}\n❓ {deal['question']}\n\n{listing}",
-                                    reply_markup=InlineKeyboardMarkup(rows))
-    except Exception:
+                                    reply_markup=buttons.markup(rows))
+    except Exception as e:
+        if is_unconfirmed(e):
+            # Карточка обычно доходит: дело остаётся открытым, второй карточки не шлём.
+            log.warning("deal card unconfirmed by Telegram, not repeated id=%s", deal["id"])
+            return True
         log.exception("deal card failed id=%s", deal["id"])
         return False
     mid = getattr(sent, "message_id", None)
@@ -67,8 +79,7 @@ async def _send_deal_card(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, deal: dict) 
 
     old = _deal_update(ctx.application, deal["id"], remember)
     if old and old != mid:
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_reply_markup(chat_id=deal["chat_id"], message_id=old, reply_markup=None)
+        await buttons.strip_buttons(ctx.bot, deal["chat_id"], old)
     log.info("deal card id=%s chat=%s", deal["id"], deal["chat_id"])
     return True
 
@@ -175,8 +186,7 @@ async def _deal_swipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: s
         return False
     if seen.get("state") == "asked" and seen.get("card"):
         # Ответ словами на вопрос дела: кнопки его карточки гаснут.
-        with contextlib.suppress(Exception):
-            await ctx.bot.edit_message_reply_markup(chat_id=seen["chat"], message_id=seen["card"], reply_markup=None)
+        await buttons.strip_buttons(ctx.bot, seen["chat"], seen["card"])
     log.info("deal pick id=%s via=swipe", deal_id)
     await _deal_turn(update, ctx, deal_id, from_callback=False)
     return True
@@ -283,6 +293,7 @@ async def on_deal_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parts = (query.data or "").split(":")
     try:
         deal_id, n = parts[1], int(parts[2])
+        stamp = int(parts[3]) if len(parts) > 3 else None
     except (IndexError, ValueError):
         await _b._answer_quietly(query, _("Кнопка не разобрана."), show_alert=True)
         return
@@ -294,6 +305,11 @@ async def on_deal_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     def take(d: dict) -> bool:
         opts = d.get("options") or []
         seen.update(state=d.get("state"), asked_at=float(d.get("asked_at") or 0))
+        if (d.get("card_msg") is None and mid is not None and d.get("chat_id") == chat_id
+                and stamp is not None and stamp == _deal_stamp(d)):
+            # Карточка ушла без подтверждения, номер неизвестен: первое нажатие с
+            # кнопки этого же вопроса (метка) называет её номер (ревью Codex 05.11.2026).
+            d["card_msg"] = mid
         if d.get("chat_id") != chat_id or d.get("card_msg") != mid or not 1 <= n <= len(opts):
             seen["why"] = "card"
             return False
@@ -315,14 +331,13 @@ async def on_deal_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "taken": _("На этот вопрос уже ответили или дело ещё отвечает."),
         }.get(why or "", _("Ответ не принят: дело не найдено.")), show_alert=True)
         if why in ("old", "taken", None):
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
+            await buttons.strip_buttons(query)
         return
     with contextlib.suppress(Exception):
         await query.answer()
-    with contextlib.suppress(Exception):
-        # Ярлык остаётся первой строкой: свайп на карточку тоже идёт в дело.
-        await query.edit_message_text(f"{card.text}\n\n🗳 → {seen['answer']}")
+    # Ярлык остаётся первой строкой: свайп на карточку тоже идёт в дело.
+    await buttons.note_on_card(query, getattr(card, "text", None) or "", f"🗳 → {seen['answer']}", "deal pick",
+                               parse_mode=None)
     log.info("deal pick id=%s via=button wait=%.0fs", deal_id, time.time() - seen["asked_at"])
     await _deal_turn(_b.Update(update_id=update.update_id, message=card), ctx, deal_id, from_callback=True)
 
@@ -377,7 +392,7 @@ async def on_news_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _b._answer_quietly(query, _("Кнопка от старого выпуска, она больше не работает"))
         return
     digest_id, _unused, action = parsed
-    now = datetime.now().astimezone()
+    now = now_local()
     if action == "p":
         await _news_file_to_backlog(query, cfg, ctx, digest_id, item, now)
         return
@@ -397,10 +412,7 @@ async def on_news_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _news_edit(query, item, digest_id: str, view: str, where: str = "") -> None:
-    rows = news.item_buttons(item, digest_id, view)
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row] for row in rows]
-    ) if rows else None
+    markup = buttons.markup(news.item_buttons(item, digest_id, view))
     try:
         await query.edit_message_text(
             news.render_item(item, view, where), parse_mode="HTML", reply_markup=markup,

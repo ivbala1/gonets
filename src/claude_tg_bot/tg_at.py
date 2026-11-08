@@ -1,6 +1,7 @@
 """Команда /at и отложенные запуски (перенесено из bot.py, шаг 6 разбиения 2)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -12,7 +13,7 @@ from telegram.ext import Application, ContextTypes
 
 from .burst import parse_duration
 from .claude_runner import SessionStore
-from .config import Config
+from .config import Config, local_zone, now_local
 from .i18n import _
 from .replies import split_for_telegram
 
@@ -31,11 +32,94 @@ def _parse_at_when(spec: str) -> float | None:
     hh, mm = int(m.group(1)), int(m.group(2))
     if hh > 23 or mm > 59:
         return None
-    now = datetime.now()
+    # В поясе бота, не системы. Разность через timestamp: вычитание aware в
+    # одном поясе считает по стрелкам и ошибается на час в день перевода часов.
+    now = now_local()
     target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
-    return (target - now).total_seconds()
+    return target.timestamp() - now.timestamp()
+
+
+# Повторная проверка, которую агент назначил себе сам (<<LATER:...>>, решение
+# Ивана 04.11.2026): срок от 5 минут до 14 дней, в теме ждут не больше трёх,
+# подряд без слова Ивана не больше трёх шагов. С 04.11.2026 это обычный фоновый
+# ран (решение Ивана: замка «только чтение» нет), правило в тексте запроса.
+LATER_MIN_SEC = 300
+LATER_MAX_SEC = 14 * 86400
+LATER_MAX_PENDING = 3
+LATER_MAX_HOPS = 3
+
+
+def _parse_later_when(spec: str) -> float | None:
+    """Секунды до проверки: как у /at, плюс 'Nd'; вне 5 минут..14 дней None."""
+    spec = spec.strip()
+    if len(spec) > 8:
+        return None  # огромное число переполнило бы float (ревью Codex 04.11.2026)
+    m = re.fullmatch(r"(\d{1,2})\s*d", spec.lower())
+    delay = float(int(m.group(1)) * 86400) if m else _parse_at_when(spec)
+    if delay is None or not LATER_MIN_SEC <= delay <= LATER_MAX_SEC:
+        return None
+    return delay
+
+
+def _later_hops(data: dict) -> int:
+    """Шаг цепочки из записи задания; испорченное значение считается первым."""
+    try:
+        return max(1, int(data.get("hops") or 1))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
+def schedule_later(app: Application, chat_key: str, chat_id: int, thread_id: int | None,
+                   spec: str, about: str, hops: int, *, silent: bool = False) -> tuple[str | None, str]:
+    """Поставить повторную проверку агента обычной записью /at с пометкой
+    later → (id или None, строка для футера). silent: назначил ран без звука,
+    проверка тоже без звука."""
+    if hops > LATER_MAX_HOPS:
+        return None, _("⏰ цепочка «позже» дошла до {n}, дальше по твоему слову").format(n=LATER_MAX_HOPS)
+    delay = _parse_later_when(spec)
+    if delay is None:
+        return None, _("⏰ «позже» не поставлено: срок «{spec}» не понят или вне пределов "
+                       "(от 5 минут до 14 дней: Nm, Nh, Nd или ЧЧ:ММ)").format(spec=spec[:20])
+    store: SessionStore | None = app.bot_data.get("at_jobs")
+    if store is None or getattr(app, "job_queue", None) is None:
+        return None, _("⏰ «позже» не поставлено: очередь заданий недоступна")
+    pending = 0
+    for entry in list(store.data.values()):
+        try:
+            job = json.loads(entry["v"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if job.get("later") and job.get("chat_key") == chat_key:
+            pending += 1
+    if pending >= LATER_MAX_PENDING:
+        return None, _("⏰ «позже» не поставлено: в теме уже ждут {n} проверки агента (/at)").format(
+            n=LATER_MAX_PENDING)
+    jid = uuid.uuid4().hex[:6]
+    fire_at = time.time() + delay
+    prompt = _("Повторная проверка, которую ты назначил себе {when}: «{about}». Проверь и "
+               "коротко доложи; ничего не меняй: нужно действие, спроси Ивана маркером "
+               "ASK.").format(
+        when=now_local().strftime("%d.%m %H:%M"), about=about)
+    payload = {
+        "chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
+        "fire_at": fire_at, "prompt": prompt, "later": True, "hops": hops, "about": about,
+    }
+    if silent:
+        payload["silent"] = True
+    try:
+        store.set(jid, json.dumps(payload, ensure_ascii=False))
+        _b._schedule_at_job(app, jid, payload)
+    except Exception:
+        log.exception("later: scheduling failed chat=%s", chat_key)
+        with contextlib.suppress(Exception):
+            store.remove(jid)
+        return None, _("⏰ «позже» не поставлено: сбой записи задания, смотри журнал бота")
+    log.info("later: scheduled chat=%s jid=%s hops=%d in=%.0fs", chat_key, jid, hops, delay)
+    when = datetime.fromtimestamp(fire_at, local_zone()).strftime("%d.%m %H:%M")
+    return jid, _("⏰ позже: {when} «{about}» (отмена /at cancel {jid})").format(
+        when=when, about=about[:80], jid=jid)
 
 
 async def _at_fire(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,9 +147,13 @@ async def _at_fire_running(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
         return
     token = _b._SILENT_RUN.set(bool(data.get("silent")))
     deal_token = _b._DEAL_ASKS.set(data.get("deal_asks") is True)
+    # Шаг цепочки «позже»: маркер из ответа этого рана получит следующий.
+    hops_token = _b._LATER_HOPS.set(_later_hops(data)) if data.get("later") else None
     try:
         await _at_fire_dispatch(ctx, data, store, prompt)
     finally:
+        if hops_token is not None:
+            _b._LATER_HOPS.reset(hops_token)
         _b._DEAL_ASKS.reset(deal_token)
         _b._SILENT_RUN.reset(token)
 
@@ -78,7 +166,13 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
         return
     # Слова самого Ивана, отложенные на перезапуск: пометка «⏰ отложенный
     # промпт» не нужна, о переносе он знает из ответа на своё сообщение.
-    if not drained:
+    later = bool(data.get("later"))
+    # Проверка агента отдельным уведомлением не пишет: строка шага идёт в
+    # футер её ответа (Иван на пробе 04.11.2026 получил два сообщения).
+    step_note = _("⏰ позже (сам назначил, шаг {n} из {total}): {about}").format(
+        n=_later_hops(data), total=LATER_MAX_HOPS,
+        about=str(data.get("about") or prompt)[:80]) if later else ""
+    if not drained and not later:
         try:
             await ctx.bot.send_message(
                 chat_id=data["chat_id"],
@@ -110,6 +204,9 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
             still_wanted=(lambda: float(expires_at) > time.time()) if expires_at is not None
             else (lambda: data["jid"] in store.data) if drained else None,
             event_ref=ref,
+            # Проверку назначил агент, а не Иван: метка для переноса лимитом.
+            read_only=later, step_note=step_note,
+            later_about=str(data.get("about") or "") if later else "", at_jid=data["jid"],
         ))
     except Exception:
         raised = True  # отложенное Ивана ждёт следующего старта, а не пропадает молча
@@ -152,8 +249,11 @@ async def on_at(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             if payload.get("chat_key") != chat_key:
                 continue
-            when = datetime.fromtimestamp(payload["fire_at"]).strftime("%d.%m %H:%M")
-            rows.append(f"• {jid} · {when} · {payload['prompt'][:60]}")
+            when = datetime.fromtimestamp(payload["fire_at"], local_zone()).strftime("%d.%m %H:%M")
+            # Назначил агент сам (<<LATER:...>>): пометка и его текст.
+            later = bool(payload.get("later"))
+            text = str(payload.get("about") or payload["prompt"]) if later else payload["prompt"]
+            rows.append(f"• {jid} · {when} · {'🤖 ' if later else ''}{text[:60]}")
         if not rows:
             await msg.reply_text(
                 _("Отложенных промптов нет.\n"
@@ -192,7 +292,7 @@ async def on_at(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     }
     store.set(jid, json.dumps(payload, ensure_ascii=False))
     _b._schedule_at_job(ctx.application, jid, payload)
-    when = datetime.fromtimestamp(fire_at).strftime("%d.%m %H:%M:%S")
+    when = datetime.fromtimestamp(fire_at, local_zone()).strftime("%d.%m %H:%M:%S")
     await msg.reply_text(_("⏰ ок, {when}: «{prompt}» (отмена: /at cancel {jid})").format(when=when, prompt=prompt[:80], jid=jid))
 
 

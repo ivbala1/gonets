@@ -91,10 +91,20 @@ class ChatAutoSecretTests(unittest.TestCase):
         self.assertEqual(out["decision"], "allow")
         card.assert_not_called()
 
-    def test_dangerous_goes_to_card_in_auto_chat(self):
-        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"})
+    def test_send_goes_to_card_in_auto_chat(self):
+        out, card = self._decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"})
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
+
+    def test_removed_classes_go_without_card_2026_11_04(self):
+        """решение Ивана 04.11.2026: карточка только на отправку людям
+        (docs/design-2026-11-04-system-boundaries.md)"""
+        for unattended in (False, True):
+            for cmd in ("rm -rf /srv/data", "git push origin main"):
+                with self.subTest(cmd=cmd, unattended=unattended):
+                    out, card = self._decide("Bash", {"command": cmd}, unattended=unattended)
+                    self.assertEqual(out["decision"], "allow")
+                    card.assert_not_called()
 
     def test_ordinary_commands_stay_auto(self):
         for cmd in ("git status", "rm -rf /tmp/x", "ssh host uptime", "grep -rn TODO src"):
@@ -103,10 +113,13 @@ class ChatAutoSecretTests(unittest.TestCase):
                 self.assertEqual(out["decision"], "allow")
                 card.assert_not_called()
 
-    def test_unattended_dangerous_goes_to_card(self):
-        out, card = self._decide("Bash", {"command": "rm -rf /srv/data"}, unattended=True)
+    def test_unattended_send_denied_without_card(self):
+        # из фонового рана отправка людям мимо карточки отправки: отказ сразу,
+        # карточка ждала бы без человека весь срок (deny:outbound-unattended)
+        out, card = self._decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"},
+                                 unattended=True)
         self.assertEqual(out["decision"], "deny")
-        card.assert_called()
+        card.assert_not_called()
 
 
 class ConfigParseTests(unittest.TestCase):

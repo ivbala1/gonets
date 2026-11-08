@@ -436,7 +436,7 @@ class DispatchWarmTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.store = SessionStore(Path(self.tmp.name) / "sessions.json")
         cfg = SimpleNamespace(
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,
             warm_chats=frozenset({"1"}), warm_hours=(0, 24), warm_idle_min=55,

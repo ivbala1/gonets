@@ -27,7 +27,8 @@ from typing import Any
 
 from aiohttp import ClientSession, WSMsgType, web
 
-from . import handoff
+from . import handoff, paths, procs
+from .config import agent_env
 
 log = logging.getLogger("claude_tg_bot.screen")
 
@@ -103,23 +104,14 @@ async def _eval(session: str, js: str, timeout: float) -> Any:
     """Скрипт во вкладке сессии; любой сбой даёт None."""
     if not session:
         return None
+    # И по таймауту, и при отмене (экран закрыт) run_bounded гасит группу
+    # процесса; фоновый процесс agent-browser живёт в своей сессии.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            handoff._agent_browser(), "eval", js,
-            env=dict(os.environ, **{handoff.SESSION_ENV: session}),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    except OSError:
+        _rc, out, _err = await procs.run_bounded(
+            [handoff._agent_browser(), "eval", js], timeout=timeout,
+            env={**agent_env(), handoff.SESSION_ENV: session})
+    except (OSError, TimeoutError):
         return None
-    try:
-        async with asyncio.timeout(timeout):
-            out, _err = await proc.communicate()
-    except TimeoutError:
-        return None
-    finally:
-        # И по таймауту, и при отмене (экран закрыт): процесс не бросаем.
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
     try:
         return json.loads(out.decode("utf-8", "replace").strip() or "null")
     except ValueError:
@@ -160,11 +152,6 @@ HEADERS = {
                                 "style-src 'unsafe-inline'; img-src blob: data:; connect-src 'self'; "
                                 "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
 }
-
-
-def state_dir() -> Path:
-    default = Path(__file__).resolve().parents[2] / "state"
-    return Path(os.environ.get("CLAUDE_TG_BOT_STATE_DIR", str(default))).expanduser().resolve()
 
 
 def bind_host() -> str:
@@ -507,8 +494,8 @@ def make_app(base: Path) -> web.Application:
 def main() -> int:
     from dotenv import load_dotenv
 
-    from .config import BOT_ENV_FILE
-    load_dotenv(BOT_ENV_FILE if BOT_ENV_FILE.is_file() else None)
+    from .config import _int_env
+    load_dotenv(paths.ENV_FILE)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     # Журнал доступа aiohttp не нужен: путь с id и так в наших строках.
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
@@ -517,9 +504,9 @@ def main() -> int:
     except RuntimeError as e:
         log.error("%s", e)
         return 1
-    port = int(os.environ.get("SCREEN_PORT", DEFAULT_PORT))
+    port = _int_env("SCREEN_PORT", DEFAULT_PORT)
     log.info("listening on %s:%d", host, port)
-    web.run_app(make_app(handoff.handoff_dir(state_dir())), host=host, port=port,
+    web.run_app(make_app(handoff.handoff_dir(paths.state_dir())), host=host, port=port,
                 access_log=None, print=None)
     return 0
 

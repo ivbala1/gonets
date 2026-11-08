@@ -19,7 +19,6 @@ import argparse
 import contextlib
 import fcntl
 import json
-import os
 import sys
 import time
 from datetime import datetime
@@ -29,21 +28,37 @@ import httpx
 
 from .config import load_config, local_zone
 from .i18n import _
-from . import reactions
+from . import jsonstore, reactions, tg_api
+from .buttons import keyboard
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI-обёртка: код возврата 0/1. message_id не нужен, см. send_message.
-    Из командной строки (так зовёт агент) `--chat-id` только в чаты бота."""
-    rc, _unused = _run(argv, any_chat=False)
+    """CLI-обёртка: код возврата 0/1 (2 от argparse). message_id не нужен,
+    см. send_message. Из командной строки (так зовёт агент) `--chat-id` только
+    в чаты бота. Негодные настройки: код 1 и строка, а не трейсбек."""
+    try:
+        rc, _unused = _run(argv, any_chat=False)
+    except RuntimeError as e:
+        print(f"notify: {e}", file=sys.stderr)
+        return 1
     return rc
 
 
 def send_message(argv: list[str]) -> tuple[int, int | None]:
     """То же, что main, но отдаёт ещё и message_id ПЕРВОГО отправленного чанка
     (якорь, по которому отправитель может узнать ответ человека). Скиллы
-    шлют в свои чаты из .env (NEWS_TG_CHAT_ID и др.), их не сверяем."""
-    return _run(argv)
+    шлют в свои чаты из .env (NEWS_TG_CHAT_ID и др.), их не сверяем.
+    Ошибка разбора аргументов (argparse бросает SystemExit) и негодные
+    настройки (load_config бросает RuntimeError) отдаются кодом: иначе
+    вызывающий скилл выходил мимо своего rc, не сохранив состояние (ревизия
+    07.11.2026)."""
+    try:
+        return _run(argv)
+    except SystemExit as e:
+        return (e.code if isinstance(e.code, int) and e.code else 2), None
+    except RuntimeError as e:
+        print(f"notify: {e}", file=sys.stderr)
+        return 1, None
 
 
 def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, int | None]:
@@ -58,7 +73,7 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
         default="",
         help=(
             'inline-кнопки JSON: [[{"text":"...","data":"..."}],...] (ряды). '
-            "Прикрепляются только к ПЕРВОМУ чанку. Невалидный JSON — ошибка до отправки."
+            "Прикрепляются только к ПОСЛЕДНЕМУ чанку. Невалидный JSON — ошибка до отправки."
         ),
     )
     parser.add_argument(
@@ -95,13 +110,9 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
         # callback-обработчик, хуже честной ошибки.
         try:
             rows = json.loads(args.buttons)
-            reply_markup = {
-                "inline_keyboard": [
-                    [{"text": b["text"], "callback_data": b["data"]} for b in row]
-                    for row in rows
-                ]
-            }
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # Только кнопки с данными, как раньше: ссылки агент шлёт текстом.
+            reply_markup = keyboard([[{"text": b["text"], "data": b["data"]} for b in row] for row in rows])
+        except (ValueError, KeyError, TypeError) as e:
             print(_("notify: --buttons невалиден: {error}").format(error=e), file=sys.stderr)
             return 1, None
 
@@ -138,9 +149,14 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
     # не отправят по вопросу и не затрут учёт друг друга.
     with _daily_lock(daily[0]):
         if (prev := _daily_sent(*daily)) is not None:
-            print(_("notify: «{prefix}» за {day} уже отправлен и закреплён, второй не шлю").format(
-                prefix=DAILY_PREFIX, day=daily[1].split("|")[-1]), file=sys.stderr)
-            print(f"message_id: {prev}")
+            if prev:
+                print(_("notify: «{prefix}» за {day} уже отправлен и закреплён, второй не шлю").format(
+                    prefix=DAILY_PREFIX, day=daily[1].split("|")[-1]), file=sys.stderr)
+                print(f"message_id: {prev}")
+            else:
+                # Отметка 0: отправка не подтверждена, номера и закрепа нет.
+                print(f"notify: «{DAILY_PREFIX}» за {daily[1].split('|')[-1]} уже отправлен без "
+                      "подтверждения, номера нет, второй не шлю", file=sys.stderr)
             return 1, prev
         return _deliver(cfg, args, text, chat_id, thread_id, reply_markup, daily)
 
@@ -148,24 +164,26 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
 def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: int | None,
              reply_markup: dict | None, daily: tuple[Path, str] | None) -> tuple[int, int | None]:
     """Отправка частями, закреп и вывод message_id (тело прежнего _run)."""
-    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
     limit = cfg.telegram_text_limit
     # Защита и для вызовов с подставной конфигурацией (ревью 12.10.2026).
-    if not 1 <= limit <= 4096:
+    if not 1 <= limit <= tg_api.TEXT_LIMIT:
         print(_("notify: недопустимый лимит текста"), file=sys.stderr)
         return 1, None
 
-    if args.html and len(text) > limit:
+    # Резка общая с ответами бота: по строкам, длина в UTF-16, как считает
+    # Telegram (ревизия повторов 07.11.2026, п. 4).
+    from .replies import split_for_telegram
+    chunks = split_for_telegram(text, limit)
+    if args.html and len(chunks) > 1:
         print(_("notify: --html текст длиннее {limit}, резать разметку нельзя").format(limit=limit),
               file=sys.stderr)
         return 1, None
-    chunks = [text[i : i + limit] for i in range(0, len(text), limit)]
     first_message_id: int | None = None
     for idx, ch in enumerate(chunks):
         payload: dict = {"chat_id": chat_id, "text": ch}
         if thread_id is not None:
             payload["message_thread_id"] = thread_id
-        if reply_markup is not None and idx == 0:
+        if reply_markup is not None and idx == len(chunks) - 1:  # кнопки под последней, как в боте
             payload["reply_markup"] = reply_markup
         if args.html:
             payload["parse_mode"] = "HTML"
@@ -176,13 +194,20 @@ def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: 
         # Без raise_for_status: его HTTPStatusError несёт полный URL с
         # bot-токеном и через traceback утёк бы в journald вызывающих юнитов.
         try:
-            r = httpx.post(url, json=payload, timeout=10.0)
+            # Неушедшее и 429 повторяются сами: дубля нет, а отказ части
+            # вёл к повтору всего сообщения вызывающим.
+            r = tg_api.post(cfg.telegram_bot_token, "sendMessage", json=payload, timeout=10.0,
+                            retry_not_sent=True)
         except httpx.ReadTimeout:
             # Запрос ушёл, ответа нет: часть обычно доходит (случаи 30-31.10.2026,
             # replies.is_unconfirmed). Код 1 давал повтор вызывающим (сводка
             # чатов слала себя ещё раз) и обрывал остаток (аудит outbound).
             print(_("notify: Telegram не подтвердил часть {n}, не повторяю: она могла дойти").format(
                 n=idx + 1), file=sys.stderr)
+            if idx == 0 and daily is not None:
+                # Номера нет, но вопрос дня ушёл: второй за дату не шлём (0 = id неизвестен).
+                # Код при --pin прежний (1 без message_id): так его читает промт Домового.
+                _daily_mark(*daily, 0)
             continue
         except httpx.HTTPError as e:
             print(f"notify: HTTP error: {type(e).__name__}", file=sys.stderr)
@@ -192,8 +217,8 @@ def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: 
             print(f"notify: sendMessage failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
             _print_id_on_failure(args.pin, first_message_id)
             return 1, first_message_id
-        with contextlib.suppress(AttributeError, ValueError, KeyError, TypeError):
-            reactions.remember(chat_id, int(r.json()["result"]["message_id"]), ch, cfg.state_dir)
+        with contextlib.suppress(AttributeError, ValueError):
+            reactions.remember_sent(r.json(), ch, cfg.state_dir)
         if idx == 0:  # id только первой части: ответ без id не должен подменяться id второй
             try:
                 first_message_id = int(r.json()["result"]["message_id"])
@@ -250,11 +275,7 @@ def _daily_lock(path: Path):
 
 
 def _daily_load(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return jsonstore.read_dict(path)
 
 
 def _daily_sent(path: Path, key: str) -> int | None:
@@ -279,10 +300,7 @@ def _daily_mark(path: Path, key: str, message_id: int) -> None:
     data = {k: v for k, v in _daily_load(path).items() if fresh(v)}
     data[key] = {"message_id": message_id, "at": now}
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(path)
+        jsonstore.write_json(path, data)
     except OSError as e:
         print(f"notify: daily_pins не записан: {type(e).__name__}", file=sys.stderr)
 
@@ -300,10 +318,12 @@ def _pin_call(token: str, method: str, chat_id: int, message_id: int, *, silent:
     if silent:
         payload["disable_notification"] = True
     try:
-        r = httpx.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=10.0)
+        r = tg_api.post(token, method, json=payload, timeout=10.0, retry_any=True)
     except httpx.HTTPError as e:
         print(f"notify: {method} HTTP error: {type(e).__name__}", file=sys.stderr)
         return False
+    if tg_api.not_modified(r):  # повтор уже прошедшего закрепа
+        return True
     if r.status_code != 200:
         print(f"notify: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
         return False
@@ -312,11 +332,8 @@ def _pin_call(token: str, method: str, chat_id: int, message_id: int, *, silent:
 
 def _unpin(token: str, chat_id: int, message_id: int) -> int:
     try:
-        r = httpx.post(
-            f"https://api.telegram.org/bot{token}/unpinChatMessage",
-            json={"chat_id": chat_id, "message_id": message_id},
-            timeout=10.0,
-        )
+        r = tg_api.post(token, "unpinChatMessage",
+                        json={"chat_id": chat_id, "message_id": message_id}, timeout=10.0, retry_any=True)
     except httpx.HTTPError as e:
         print(f"notify: unpinChatMessage HTTP error: {type(e).__name__}", file=sys.stderr)
         return 1

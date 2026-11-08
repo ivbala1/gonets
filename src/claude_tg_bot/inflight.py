@@ -13,14 +13,14 @@ SIGKILL, падение цикла): каждой записи одно сооб
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
-import os
 import time
 import uuid
 from datetime import datetime
 from collections.abc import Collection
 from pathlib import Path
+
+from . import jsonstore
 
 log = logging.getLogger(__name__)
 
@@ -36,14 +36,7 @@ def _path(state_dir: Path) -> Path:
 
 
 def _load(path: Path) -> dict[str, dict]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        log.warning("inflight: unreadable %s, ignored", path)
-        return {}
-    return data if isinstance(data, dict) else {}
+    return jsonstore.read_dict(path)
 
 
 def _save(path: Path, data: dict[str, dict]) -> None:
@@ -53,9 +46,7 @@ def _save(path: Path, data: dict[str, dict]) -> None:
         except FileNotFoundError:
             pass
         return
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    jsonstore.write_json(path, data, indent=1)
 
 
 def head(prompt: str) -> str:
@@ -113,17 +104,12 @@ def footer_trail(audit_path: Path, sid: str | None, since: float | None) -> list
     out: list[tuple[str, str]] = []
     if not sid or since is None:
         return out
-    with contextlib.suppress(OSError):
-        with open(audit_path, "rb") as f:
-            f.seek(max(0, f.seek(0, os.SEEK_END) - AUDIT_TAIL))
-            tail = f.read().decode("utf-8", "replace")
-        for line in tail.splitlines():
-            with contextlib.suppress(ValueError, KeyError, TypeError):
-                ev = json.loads(line)
-                kind, snippet = AUDIT_KINDS.get(ev["decision"]), ev["snippet"][-60:]
-                if (kind and ev.get("sid") == sid and "--dry-run" not in ev["snippet"]
-                        and datetime.fromisoformat(ev["ts"]).timestamp() >= int(since)):
-                    out.append((kind, f"{ev['tool']} {snippet}" if kind == "auto" else snippet))
+    for ev in jsonstore.jsonl_tail(audit_path, AUDIT_TAIL):
+        with contextlib.suppress(ValueError, KeyError, TypeError):
+            kind, snippet = AUDIT_KINDS.get(ev["decision"]), ev["snippet"][-60:]
+            if (kind and ev.get("sid") == sid and "--dry-run" not in ev["snippet"]
+                    and datetime.fromisoformat(ev["ts"]).timestamp() >= int(since)):
+                out.append((kind, f"{ev['tool']} {snippet}" if kind == "auto" else snippet))
     return out
 
 

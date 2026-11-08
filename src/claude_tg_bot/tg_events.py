@@ -6,7 +6,6 @@ import contextlib
 import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -16,6 +15,8 @@ from . import events, tasks
 from .claude_runner import SessionStore
 from .config import Config
 from .i18n import _
+from .limits import clock
+from .replies import is_unconfirmed
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
@@ -142,7 +143,7 @@ async def _event_expired_note(app: Application, rec: dict | None) -> bool:
     Всегда без звука. True: строка ушла."""
     if not rec:
         return False
-    with contextlib.suppress(Exception):
+    try:
         chat_id, thread_id, head = _event_show_target(app, rec)
         await app.bot.send_message(
             chat_id, head + _("⌛ Пробуждение «{source}: {title}» устарело, пока ждало очереди или "
@@ -150,7 +151,9 @@ async def _event_expired_note(app: Application, rec: dict | None) -> bool:
                 source=rec.get("source"), title=rec.get("title")),
             message_thread_id=thread_id, disable_notification=True)
         return True
-    return False
+    except Exception as e:
+        # Неподтверждённая строка обычно доходит: второй (в личку мастерской) не нужно.
+        return is_unconfirmed(e)
 
 
 async def _events_resume(app: Application) -> None:
@@ -187,21 +190,27 @@ async def _events_resume(app: Application) -> None:
                 _event_mark(store, eid, status="done", outcome="expired", done_at=now)
             elif kind == "cut":
                 log.warning("event %s interrupted by restart mid-run, not repeated", eid)
-                when = datetime.fromtimestamp(float(rec.get("accepted_at") or now)).strftime("%H:%M")
+                when = clock(float(rec.get("accepted_at") or now))
                 show_chat, show_thread, head = _event_show_target(app, rec)
-                await app.bot.send_message(
-                    show_chat, head + _("⚠️ Пробуждение «{source}: {title}» (получено в {when}) оборвал "
-                                        "перезапуск бота посреди рана. Повторять не стал: что успело "
-                                        "сделаться, видно по журналу и чату.").format(
-                        source=rec.get("source"), title=rec.get("title"), when=when),
-                    message_thread_id=show_thread, disable_notification=rec.get("silent") is True)
+                try:
+                    await app.bot.send_message(
+                        show_chat, head + _("⚠️ Пробуждение «{source}: {title}» (получено в {when}) оборвал "
+                                            "перезапуск бота посреди рана. Повторять не стал: что успело "
+                                            "сделаться, видно по журналу и чату.").format(
+                            source=rec.get("source"), title=rec.get("title"), when=when),
+                        message_thread_id=show_thread, disable_notification=rec.get("silent") is True)
+                except Exception as e:
+                    if not is_unconfirmed(e):
+                        raise
+                    # Строка обычно доходит: пометка ставится, при следующем старте не повторится.
+                    log.warning("event %s: interrupted note unconfirmed by Telegram, not repeated", eid)
                 # Пометка после доставки: не дошло, скажет при следующем старте.
                 _event_mark(store, eid, status="done", outcome="interrupted", done_at=now)
             elif wake_fn is not None:
                 fresh, untrusted, silent = events.resume_flags(rec, now)
                 accepted = float(rec["accepted_at"])
                 note = _("(Событие получено в {when}, ждало {minutes} мин: бот перезапускался.)\n\n").format(
-                    when=datetime.fromtimestamp(accepted).strftime("%H:%M"), minutes=int((now - accepted) // 60))
+                    when=clock(accepted), minutes=int((now - accepted) // 60))
                 log.warning("event %s resumed after restart (untrusted=%s fresh=%s)", eid, untrusted, fresh)
                 # Учёт как у принятого события: перезапуск по заявке его дождётся.
                 app.bot_data["admitted_events"] = app.bot_data.get("admitted_events", 0) + 1

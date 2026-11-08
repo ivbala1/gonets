@@ -28,11 +28,12 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from .paths import ENV_FILE
+
 LANG_ENV = "CLAUDE_TG_BOT_LANG"
 DEFAULT_LANG = "en"
 SOURCE_LANG = "ru"
 LOCALES_DIR = Path(__file__).resolve().parent / "locales"
-ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 # Явный язык поверх окружения (тесты, разовые утилиты). None значит окружение.
 _override: str | None = None

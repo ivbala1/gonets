@@ -129,7 +129,8 @@ class NotifyArgsTests(unittest.TestCase):
         cfg = _fake_cfg()
         out, err = io.StringIO(), io.StringIO()
         with patch.object(notify, "load_config", return_value=cfg):
-            with patch.object(notify.httpx, "post", side_effect=post_effect) as post:
+            with patch.object(notify.httpx, "post", side_effect=post_effect) as post, \
+                    patch.object(notify.tg_api.time, "sleep"):
                 with redirect_stdout(out), redirect_stderr(err):
                     rc = notify.main(argv)
         return rc, out.getvalue(), err.getvalue(), post
@@ -144,7 +145,7 @@ class NotifyArgsTests(unittest.TestCase):
 
     def test_pin_network_error_returns_1_but_prints_message_id(self):
         rc, out, err, _post = self._run_capture(
-            ["--pin", "текст"], [_ok_response(5), notify.httpx.ConnectError("x")]
+            ["--pin", "текст"], [_ok_response(5)] + [notify.httpx.ConnectError("x")] * 3
         )
         self.assertEqual(rc, 1)
         self.assertIn("message_id: 5\n", out)
@@ -161,7 +162,8 @@ class NotifyArgsTests(unittest.TestCase):
         cfg = SimpleNamespace(primary_chat_id=111, telegram_bot_token="TOKEN", telegram_text_limit=5)
         out, err = io.StringIO(), io.StringIO()
         with patch.object(notify, "load_config", return_value=cfg):
-            with patch.object(notify.httpx, "post", side_effect=post_effect) as post:
+            with patch.object(notify.httpx, "post", side_effect=post_effect) as post, \
+                    patch.object(notify.tg_api.time, "sleep"):
                 with redirect_stdout(out), redirect_stderr(err):
                     rc = notify.main(argv)
         return rc, out.getvalue(), err.getvalue(), post
@@ -170,17 +172,19 @@ class NotifyArgsTests(unittest.TestCase):
         # Первая часть доставлена, вторая не ушла (нет соединения): id нужен
         # вызывающему, иначе он перешлёт всё заново; закрепа нет. Таймаут чтения
         # сбоем не считается (неподтверждённая часть, аудит outbound 31.10.2026).
+        # Неушедшая часть сначала дважды повторяется сама (разбор 07.11.2026).
         rc, out, err, post = self._run_chunked(
-            ["--pin", "0123456789"], [_ok_response(7), notify.httpx.ConnectError("x")]
+            ["--pin", "0123456789"], [_ok_response(7)] + [notify.httpx.ConnectError("x")] * 3
         )
         self.assertEqual(rc, 1)
         self.assertEqual(out, "message_id: 7\n")
         self.assertIn("HTTP error: ConnectError", err)
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_count, 4)
 
     def test_pin_second_chunk_http_status_failure_still_prints_first_id(self):
         bad = SimpleNamespace(status_code=429, text="Too Many Requests")
-        rc, out, err, _post = self._run_chunked(["--pin", "0123456789"], [_ok_response(7), bad])
+        # 429 дважды пережидается, третий отдаётся как отказ.
+        rc, out, err, _post = self._run_chunked(["--pin", "0123456789"], [_ok_response(7)] + [bad] * 3)
         self.assertEqual(rc, 1)
         self.assertEqual(out, "message_id: 7\n")
         self.assertIn("sendMessage failed: 429", err)

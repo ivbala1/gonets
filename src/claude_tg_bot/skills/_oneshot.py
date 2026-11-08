@@ -3,21 +3,21 @@
 Зачем не `subprocess.run(timeout=...)`: на TimeoutExpired он шлёт SIGKILL
 только верхнему процессу (`claude`), а его дети — MCP-серверы (Gmail/Slack),
 Bash-tool и т.п. — осиротеют и продолжат жить (в т.ч. с доступом к почте/Slack).
-Тот же класс бага в интерактивном боте закрыт через start_new_session=True +
-kill_process_tree (см. claude_runner.run_claude); здесь — sync-аналог:
-claude становится лидером новой process group, и по таймауту мы убиваем ВСЮ
-группу через os.killpg.
+Запуск идёт через procs.run_bounded_sync: claude становится лидером своей
+группы, и по таймауту SIGKILL получает вся группа.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
-import signal
 import subprocess
 
 from dotenv import load_dotenv
 
+from .. import paths, procs
 from ..config import agent_env
+from ..dashes import soften_dashes
 from ..i18n import _
 
 
@@ -28,7 +28,7 @@ def resolve_claude_bin() -> str:
     CLAUDE_BIN из .env или окружения, иначе PATH. Хардкодить путь нельзя: он
     меняется при смене способа установки Claude Code (npm/nvm → нативный билд).
     """
-    load_dotenv()
+    load_dotenv(paths.ENV_FILE)
     configured = os.environ.get("CLAUDE_BIN", "").strip()
     if configured:
         return configured
@@ -46,7 +46,7 @@ MEMORY_SCOPES_ENV = "CLAUDE_TG_BOT_MEMORY_SCOPES"
 
 def known_memory_scopes() -> tuple[str, ...]:
     """Допустимые scope памяти плановой задачи из CLAUDE_TG_BOT_MEMORY_SCOPES."""
-    load_dotenv()
+    load_dotenv(paths.ENV_FILE)
     raw = os.environ.get(MEMORY_SCOPES_ENV, "")
     return tuple(s.strip().casefold() for s in raw.split(",") if s.strip())
 
@@ -93,27 +93,45 @@ def run_claude_oneshot(
     env[SCHEDULED_ENV] = "1"
     if memory_scope is not None:
         env["AGENT_MEMORY_SCOPE_HINT"] = require_memory_scope(memory_scope)
-    proc = subprocess.Popen(
-        args,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=cwd,
-        start_new_session=True,
-        env=env,
-    )
+    return procs.run_bounded_sync(args, input=input, timeout=timeout, cwd=cwd, env=env)
+
+
+def run_claude_json(prompt: str, *, timeout: int, model: str | None = None) -> str:
+    """Ран без единого инструмента и MCP для сводок (чатов, новостей) и
+    коротких вопросов: во входе чужой текст, читать и писать claude здесь
+    нечего. Встроенные инструменты выключены целиком (--tools ""), MCP не
+    поднимаются, режим plan как второй замок, транскрипт на диск не пишется.
+    Текст ответа; сбой: RuntimeError без сырого вывода дочернего процесса."""
+    args = [
+        resolve_claude_bin(), "-p",
+        "--output-format", "json",
+        "--permission-mode", "plan",
+        "--tools", "",
+        "--no-session-persistence",
+        "--settings", str(paths.hook_settings()),
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    ]
+    if model:
+        args += ["--model", model]
     try:
-        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        proc = run_claude_oneshot(args, input=prompt.encode("utf-8"), timeout=timeout, cwd=str(paths.BOT_ROOT))
     except subprocess.TimeoutExpired:
-        # Убиваем всю группу (claude + дети), затем reap'аем зомби. getpgid
-        # может бросить ProcessLookupError, если процесс уже умер сам — это ок.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        raise
-    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+        raise RuntimeError(_("claude не уложился в {seconds} с").format(seconds=timeout)) from None
+    except OSError as e:
+        raise RuntimeError(_("claude не запустился: {error}").format(error=type(e).__name__)) from None
+    if proc.returncode != 0:
+        # Сырой вывод дочернего процесса наружу не идёт: в журнал и боту
+        # уходит только код и класс причины.
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        kind = (_("лимит или доступ") if any(k in stderr for k in ("429", "401", "rate", "limit"))
+                else _("ошибка запуска"))
+        raise RuntimeError(_("claude exit {rc}: {kind}").format(rc=proc.returncode, kind=kind))
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(_("claude stdout не JSON: {error}").format(error=e)) from e
+    if payload.get("is_error"):
+        raise RuntimeError(_("claude вернул is_error=true"))
+    # Тире на дефис здесь: хук против тире в плановых ранах бота молчит, его
+    # строка «Исправлено» подменила бы сводку (решение Ивана 22.10.2026).
+    return soften_dashes((payload.get("result") or "").strip())

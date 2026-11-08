@@ -69,14 +69,30 @@ _VERB_RE = re.compile(r"(?:[a-z]+_)?(?:send|reply|forward|edit|post|schedule)[a-
 _FORWARD_RE = re.compile(r"(?:[a-z]+_)?forward[a-z_]*")
 # Отправка без глагола в имени: create_poll шлёт опрос в чат сообщением
 # (SendMediaRequest в tools/messages.py сервера, финальное ревью 03.11.2026).
-# Остальные инструменты telegram-mcp, которые шлют сообщение, глагол имеют.
-_SEND_NAMES = frozenset({"create_poll"})
+# vote_poll шлёт голос в опрос (SendVoteRequest), в открытом опросе люди видят
+# выбор Ивана (решение Ивана 08.11.2026, ревью Codex). Остальные инструменты
+# telegram-mcp, которые шлют сообщение, глагол имеют.
+_SEND_NAMES = frozenset({"create_poll", "vote_poll"})
+# Первое слово имени, с которым инструмент только читает или ждёт:
+# get_send_as, get_scheduled_messages, wait_for_new_message. Без этого
+# приставка _VERB_RE и слова serious.py ловили их как отправку: карточка, а в
+# фоне отказ (08.11.2026). Тот же набор зовёт serious.py.
+READ_WORDS = frozenset({"get", "list", "search", "read", "fetch", "find", "view", "wait"})
+# Слово отправки в имени, но текста людям нет: «печатает…» (SetTyping), отмена
+# своего отложенного сообщения (удаление, по модели 04.11.2026 без карточки),
+# черновик Slack (сохраняется в «Drafts & Sent», отправляет сам Иван: запись
+# памяти и каталог MintMCP, схема коннектора 08.11.2026 не проверена: Slack не
+# подключён). Telegram сверен с telegram-mcp (tools/messages.py) 08.11.2026;
+# serious.py их тоже пропускает. set_default_send_as сюда не входит: он
+# меняет, от чьего имени уйдут следующие сообщения, карточку даёт serious.py.
+NOT_SENDS = frozenset({"send_typing", "delete_scheduled_message", "slack_send_message_draft"})
 
 
 def is_send(tool_name: str) -> bool:
     parts = tool_name.split("__", 2)
     return (len(parts) == 3 and parts[0] == "mcp"
             and (parts[1] in _SERVERS or bool(_PLUGIN_RE.fullmatch(parts[1])))
+            and parts[2] not in NOT_SENDS and parts[2].split("_", 1)[0] not in READ_WORDS
             and (bool(_VERB_RE.fullmatch(parts[2])) or parts[2] in _SEND_NAMES))
 
 
@@ -309,6 +325,18 @@ def _human_size(size: int) -> str:
 _RECIPIENTS_CAP = 300
 # Вложений поимённо на карточке письма, остальные числом (все по 📄).
 _MAIL_ATTACH_SHOWN = 5
+RECIPIENTS_CLIPPED = N_("⚠️ <b>адресатов больше, чем видно: список целиком по 📄</b>")
+
+
+def _plain(val: Any) -> str:
+    """Список адресатов строкой через запятую, а не `['a@b.c']`."""
+    return ", ".join(str(v) for v in val) if isinstance(val, list) else str(val)
+
+
+def _recipients_clipped(*vals: str) -> bool:
+    """Строка адресатов на карточке обрезана: Иван даёт «ок» на адресатов,
+    поэтому обрезка идёт с ⚠️, а не молча (ревью 08.11.2026)."""
+    return any(len(_esc(v)) > _RECIPIENTS_CAP for v in vals)
 
 
 def format_mailsend(mail: dict[str, Any], text_cap: int) -> str:
@@ -318,13 +346,13 @@ def format_mailsend(mail: dict[str, Any], text_cap: int) -> str:
         return (_("⚠️ <b>команда запускает mailsend не простой формой</b>: письмо так не уйдёт, "
                   "без ✅ на карточке письма mailsend откажет. Форма для письма: "
                   "<code>{form}</code>").format(form=_esc(_MAILSEND_FORM)))
-    to, cc = ", ".join(mail.get("to") or []), ", ".join(mail.get("cc") or [])
+    to, cc = _plain(mail.get("to") or []), _plain(mail.get("cc") or [])
     lines = [_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"),
              _("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(to, _RECIPIENTS_CAP))]
     if cc:
         lines.append(_("копия: <code>{cc}</code>").format(cc=_esc_truncate(cc, _RECIPIENTS_CAP)))
-    if max(len(_esc(to)), len(_esc(cc))) > _RECIPIENTS_CAP:
-        lines.append(_("⚠️ <b>адресатов больше, чем видно: список целиком по 📄</b>"))
+    if _recipients_clipped(to, cc):
+        lines.append(_(RECIPIENTS_CLIPPED))
     if mail.get("reply_to"):
         lines.append(_("ответ на письмо: <code>{reply_to}</code>").format(reply_to=_esc_truncate(str(mail['reply_to']), 300)))
     lines.append(_("тема письма: {subject}").format(subject=_esc_truncate(str(mail.get('subject') or ''), 300)))
@@ -346,9 +374,9 @@ def format_mailsend(mail: dict[str, Any], text_cap: int) -> str:
 def mailsend_full_view(mail: dict[str, Any]) -> str:
     if mail.get("warning"):
         return _("--- mailsend ---\nкоманда не простой формой, письмо так не уйдёт.\nФорма: {form}").format(form=_MAILSEND_FORM)
-    lines = [_("--- письмо (mailsend) ---"), _("Кому: {to}").format(to=', '.join(mail.get('to') or []))]
+    lines = [_("--- письмо (mailsend) ---"), _("Кому: {to}").format(to=_plain(mail.get('to') or []))]
     if mail.get("cc"):
-        lines.append(_("Копия: {cc}").format(cc=', '.join(mail['cc'])))
+        lines.append(_("Копия: {cc}").format(cc=_plain(mail['cc'])))
     if mail.get("reply_to"):
         lines.append(_("Ответ на: {reply_to}").format(reply_to=mail['reply_to']))
     lines.append(_("Тема: {subject}").format(subject=mail.get('subject')))
@@ -362,58 +390,132 @@ def mailsend_full_view(mail: dict[str, Any]) -> str:
 
 TEXT_FIELDS = (("message", N_("текст")), ("text", N_("текст")), ("caption", N_("подпись")),
                ("body", N_("текст письма")), ("htmlBody", N_("HTML письма")),
-               ("question", N_("вопрос опроса")))
+               ("question", N_("вопрос опроса")), ("new_text", N_("новый текст")))
 
 
-def format_card(tool_input: dict[str, Any], text_cap: int) -> str:
+def format_card(tool_input: dict[str, Any], text_cap: int, tool_name: str = "") -> str:
     """Карточка отправки: кому, тема, файлы, все текстовые поля. Это то, на
     что Иван даёт «ок», поэтому поля называются словами, а не JSON, и ни одно
     отправляемое поле не прячется за другим (ревью Codex 12.10.2026)."""
     lines = [_("📤 <b>отправка от твоего имени</b>")]
-    to = tool_input.get("to") or tool_input.get("chat_id")
-    if to not in (None, ""):
-        lines.append(_("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(str(to), 300)))
+    # Первое непустое поле адресата идёт в «кому», остальные заполненные
+    # остаются в «прочем»: карточка не прячет ни одно поле (ревью 08.11.2026).
+    to_key = next((k for k in ("to", "chat_id", "channel_id")
+                   if tool_input.get(k) not in (None, "", [])), None)
+    to = tool_input.get(to_key) if to_key else None
+    reply_mail = tool_input.get("messageId")
+    reply_all = tool_input.get("replyAll")
+    if to not in (None, "", []):
+        lines.append(_("<b>кому:</b> <code>{to}</code>").format(to=_esc_truncate(_plain(to), _RECIPIENTS_CAP)))
+    elif reply_mail not in (None, ""):
+        # Ответ Gmail без `to` уходит тем, кому Gmail отвечает сам (автор,
+        # Reply-To, у своего письма прежние адресаты), с replyAll всем
+        # адресатам (схема коннектора 08.11.2026). Адреса бот не знает,
+        # поэтому называет письмо, а не человека.
+        # Заданная копия заменяет прежнюю (схема reply): «всем адресатам» тогда
+        # неверно, остаются строки «ответить всем» и «копия».
+        all_of = reply_all is True and "cc" not in tool_input and "to" not in tool_input
+        who = (_("<b>кому:</b> всем адресатам письма <code>{id}</code>") if all_of
+               else _("<b>кому:</b> как ответит Gmail на письмо <code>{id}</code>"))
+        lines.append(who.format(id=_esc_truncate(str(reply_mail), 300)))
+        reply_mail = None
+        if all_of:
+            reply_all = None
+        # Явно пустой список адресата у reply заменяет получателей пустым:
+        # называем его, а не прячем как незаданный.
+        empty = [k for k in ("to", "cc", "bcc") if tool_input.get(k, None) in ("", [])]
+        if empty:
+            lines.append(_("заданы пустыми") + f": <code>{_esc(', '.join(empty))}</code>")
+    if reply_all not in (None, False):
+        lines.append(_("ответить всем") + f": <code>{_esc_truncate(json.dumps(reply_all, ensure_ascii=False), 100)}</code>")
+    short = tool_name.split("__", 2)[-1]
+    target = (_("правка сообщения") if short.startswith("edit")
+              else _("реакция на сообщение") if "reaction" in short
+              else _("опрос в сообщении") if short == "vote_poll" else _("ответ на сообщение"))
     for key, label in (("cc", _("копия")), ("bcc", _("скрытая копия")),
-                       ("message_id", _("ответ на сообщение")),
+                       ("message_id", target),
+                       ("reply_to", _("ответ на сообщение или тема")),
                        ("replyToMessageId", _("ответ на письмо")),
                        ("replyThreadId", _("в переписке")), ("draftId", _("черновик")),
                        ("topic_id", _("тема"))):
         val = tool_input.get(key)
         if val not in (None, "", []):
-            lines.append(f"{label}: <code>{_esc_truncate(str(val), 300)}</code>")
+            lines.append(f"{label}: <code>{_esc_truncate(_plain(val), 300)}</code>")
+    if reply_mail not in (None, ""):
+        lines.append(_("ответ на письмо") + f": <code>{_esc_truncate(str(reply_mail), 300)}</code>")
+    if _recipients_clipped(*(_plain(tool_input.get(k) or "") for k in ("cc", "bcc")),
+                           _plain(to) if to not in (None, "", []) else ""):
+        lines.append(_(RECIPIENTS_CLIPPED))
+    if tool_input.get("includeSignature"):
+        lines.append(_("подпись Gmail: да"))
+    votes = tool_input.get("option_indices")
+    if votes not in (None, "", []):
+        # Сервер считает варианты с нуля, Иван видит опрос сверху вниз с первого:
+        # на карточке номер сверху с единицы (ревью Opus 08.11.2026). Не список
+        # целых сервер отклонит, такое значение показывается как есть.
+        # Порядок сервера это порядок создания опроса; в опросе с перемешанными
+        # вариантами приложение показывает другой (перепроверка Opus 08.11.2026).
+        # Сервер (FastMCP, pre_parse_json) разбирает строку поля не-строкового
+        # типа как JSON: "[1, 3]" уходит голосом, как список (перепроверка Opus
+        # 08.11.2026). Повторы сервер отклоняет.
+        if isinstance(votes, str):
+            try:
+                votes = json.loads(votes)
+            except ValueError:
+                pass
+        if (isinstance(votes, list) and all(type(v) is int and v >= 0 for v in votes)
+                and len(set(votes)) == len(votes)):
+            line = _("голос за варианты по порядку создания опроса (если варианты не "
+                     "перемешаны, это порядок сверху): <code>{n}</code>, заменит прежний голос, если был")
+            shown = ", ".join(str(v + 1) for v in votes)
+        else:
+            line = _("голос, номера как переданы (сервер такие отклонит): <code>{n}</code>")
+            shown = _plain(votes)
+        lines.append(line.format(n=_esc_truncate(shown, 100)))
+    emoji = tool_input.get("emoji")
+    if emoji not in (None, "", []):
+        lines.append(_("реакция") + f": {_esc_truncate(str(tool_input['emoji']), 100)}")
+    # Обрезка темы, имён файлов, текста и «прочего» даёт ⚠️ (ревью 08.11.2026).
+    clipped = False
     subject = tool_input.get("subject")
     if subject:
         lines.append(_("тема письма: {subject}").format(subject=_esc_truncate(str(subject), 300)))
-    files = tool_input.get("file_path")
+        clipped = len(_esc(str(subject))) > 300
+    files = [n for k in ("file_path", "file_paths")
+             for n in (tool_input.get(k) if isinstance(tool_input.get(k), list) else [tool_input.get(k)])
+             if n not in (None, "")]
     if files:
-        names = files if isinstance(files, list) else [files]
-        lines.append(_("файл: ") + ", ".join(f"<code>{_esc_truncate(str(n), 200)}</code>" for n in names))
+        lines.append(_("файл: ") + ", ".join(f"<code>{_esc_truncate(str(n), 200)}</code>" for n in files))
+        clipped = clipped or any(len(_esc(str(n))) > 200 for n in files)
     attachments = tool_input.get("attachments")
     if isinstance(attachments, list) and attachments:
-        names = [str(a.get("filename") or _("без имени")) if isinstance(a, dict) else "?"
+        names = [str(a.get("filename") or _("без имени")) if isinstance(a, dict) else str(a)
                  for a in attachments]
         lines.append(_("вложения: ") + ", ".join(f"<code>{_esc_truncate(n, 200)}</code>" for n in names))
+        clipped = clipped or any(len(_esc(n)) > 200 for n in names)
     for key in ("account", "parse_mode"):
         val = tool_input.get(key)
         if val not in (None, ""):
             lines.append(f"{key}: <code>{_esc_truncate(str(val), 100)}</code>")
     texts = [(_(label), str(tool_input[key])) for key, label in TEXT_FIELDS
              if tool_input.get(key) not in (None, "")]
-    clipped = False
     for label, text in texts:
         lines.append(f"{label}:\n<pre>{_esc_truncate(text, text_cap)}</pre>")
         clipped = clipped or len(_esc(text)) > text_cap
-    if not texts and not files and not attachments:
+    if not texts and not files and not attachments and emoji in (None, "", []) and votes in (None, "", []):
         lines.append(_("<i>текста нет</i>"))
-    if clipped:
-        lines.append(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"))
-    known = {"to", "chat_id", "cc", "bcc", "message_id", "replyToMessageId", "replyThreadId",
-             "draftId", "topic_id", "subject", "file_path", "attachments", "account",
-             "parse_mode"} | {k for k, _unused in TEXT_FIELDS}
+    # Вложения не списком карточка строкой не показывает: тогда они в «прочем».
+    known = {to_key, "attachments" if isinstance(attachments, list) else None, "cc", "bcc", "message_id", "reply_to",
+             "replyToMessageId", "replyThreadId", "messageId", "replyAll", "includeSignature",
+             "draftId", "topic_id", "subject", "file_path", "file_paths", "emoji", "option_indices",
+             "account", "parse_mode"} | {k for k, _unused in TEXT_FIELDS}
     rest = {k: v for k, v in tool_input.items() if k not in known and v not in (None, "", [])}
     if rest:
-        lines.append(_("<i>прочее:</i> <code>{rest}</code>").format(
-            rest=_esc_truncate(json.dumps(rest, ensure_ascii=False), 400)))
+        dumped = json.dumps(rest, ensure_ascii=False)
+        lines.append(_("<i>прочее:</i> <code>{rest}</code>").format(rest=_esc_truncate(dumped, 400)))
+        clipped = clipped or len(_esc(dumped)) > 400
+    if clipped:
+        lines.append(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"))
     return "\n".join(lines)
 
 
@@ -449,6 +551,10 @@ def _to_self(tool_name: str, tool_input: dict[str, Any], cfg: Any) -> bool:
     команду (`/auto 60`, «ок»), агент выдал бы разрешения сам себе (ревью
     03.11.2026). Почта и Slack себе этим не считаются."""
     if tool_name.split("__", 2)[1:2] != ["telegram"]:
+        return False
+    # Голос в опросе, пересланном в «Избранное», засчитывается в исходном
+    # опросе, где его видят люди: «себе» не бывает (ревью Codex 08.11.2026).
+    if tool_name.split("__", 2)[-1] == "vote_poll":
         return False
     chats = {str(tool_input[k]).strip().lower().removeprefix("@") for k in ("chat_id", "entity", "peer")
              if tool_input.get(k) not in (None, "")}
