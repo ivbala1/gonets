@@ -24,7 +24,7 @@ transport for a proactive personal assistant.
 |---|---|---|---|---|
 | What runs | a service that starts `claude -p` per message | events pushed into an interactive session you keep open | you drive local sessions from the Claude app or claude.ai | a bot types into tmux windows |
 | Parallel sessions | one per chat and per forum topic | one per running `claude --channels` | many in server mode (`claude remote-control`, up to 32 by default) | one per tmux window |
-| Tool approvals | inline cards with a risk estimate, audit log | permission relay (yes/no by id) | in the app, with push notifications | varies |
+| Tool approvals | inline cards for sending to people, audit log | permission relay (yes/no by id) | in the app, with push notifications | varies |
 | Unattended runs | scheduled prompts, external events, read-only mode for untrusted input | while the session is open | sessions start when you connect | varies |
 | Voice, files, photos | in and out | text, photos and files | photos and files | varies |
 
@@ -32,28 +32,26 @@ transport for a proactive personal assistant.
 Telegram/Discord bridge (research preview at the time of writing) and is the
 simplest option when you sit next to a running session. Gonets is for the case
 when nothing is open: the machine is at home, you are not, and the agent still
-has to ask before it deletes, pushes or sends anything.
+has to ask before it sends anything to people on your behalf.
 
 ## Features
 
 - **Sessions.** Private chat and forum supergroups; each topic keeps its own
   Claude session. Idle sessions start fresh after a configurable TTL to avoid
   replaying a cold cache. `/reset`, `/cancel`, `/status`.
-- **Approval cards.** A `PreToolUse` hook posts every `Bash`, `Monitor`,
-  `Write`, `Edit`, `WebFetch` and MCP call to the bot over loopback HTTP; the
-  bot shows a card with buttons and waits. The first line is a risk estimate
-  (🔴 irreversible or outbound, 🟠 changes files or runs programs, 🟡 nothing
-  dangerous found) computed from the full tool input. Shell commands are
-  parsed into segments with quotes, `$(...)`, `bash -c`, remote `ssh` commands
-  and heredocs, not matched by keywords.
+- **Approval cards only for sending to people.** A `PreToolUse` hook posts
+  every `Bash`, `Monitor`, `Write`, `Edit`, `WebFetch` and MCP call to the bot
+  over loopback HTTP. Everything passes without a card except sending to
+  people on your behalf: messages and files, GitHub comments and pull
+  requests, mail from the shell, invitations and sharing. The model protects
+  against honest agent mistakes, not against a hijacked agent; there is no
+  read-only stage and no risk estimate of shell commands.
 - **Outbound messages always ask.** Sending as you (Telegram, Gmail and Slack
   MCP servers, or the bundled SMTP sender) always shows a card with recipients,
   full text and attachments, even inside auto-approve windows. The SMTP sender
   only sends the exact bytes that were on the approved card.
-- **What passes without a card** is explicit: read-only tools, a configurable
-  regex for safe shell commands (with a built-in deny list of dangerous flags
-  such as `find -delete`), read-only MCP tools, and writes inside whitelisted
-  directories. Every decision goes to an append-only audit log.
+- **Every decision goes to an append-only audit log.** Writes inside
+  whitelisted directories and memory writes get a short note in the chat.
 - **Fail-closed startup.** The bot refuses to start if the hook settings do
   not cover all dangerous tools, if the approval hook lacks
   `"onFailure": "block"` (without it Claude Code lets the call through when
@@ -75,8 +73,8 @@ has to ask before it deletes, pushes or sends anything.
 - **Project topics.** Name a forum topic after a project and it gets that
   project's context automatically (`projects.json`), or set it with `/scope`.
 - **Task topics.** `/task <what to do>` (or `POST /task` from another
-  program) opens a dedicated topic. The agent first thinks with read-only
-  tools and says how it understood the task; a proposal gets one "▶️ Do it"
+  program) opens a dedicated topic. The agent first thinks (the rule is in
+  the prompt, not a lock) and says how it understood the task; a proposal gets one "▶️ Do it"
   button (or just write "do it"). One run at a time for the whole bot: while
   one runs, "Do it" elsewhere answers "busy" and the proposal waits. The
   result stays in the topic; a task started from your private chat also
@@ -180,7 +178,6 @@ setting. The ones you need first:
 | `CLAUDE_BIN` | absolute path to `claude` (systemd does not see your shell `PATH`) |
 | `CLAUDE_CWD` | the agent's working directory, by default your home |
 | `CLAUDE_TG_BOT_LANG` | `en` (default) or `ru` |
-| `APPROVE_BASH_AUTO_ALLOW_REGEX` | shell commands that pass without a card; empty by default |
 | `APPROVE_WHITELIST_PATHS` | directories where file edits pass without a card |
 | `APPROVE_AUTO_CHAT_KEYS` | chats where every tool passes without a card; a conscious trade-off, empty by default |
 
@@ -195,9 +192,9 @@ run it.
 - **Who can talk to it.** Only user ids from `TELEGRAM_ALLOWED_USER_IDS`.
   Without `TELEGRAM_ALLOWED_CHAT_IDS` it answers in private chats only, so
   adding it to a group by mistake does nothing.
-- **What the card protects.** Tool calls that reach the hook wait for your tap.
-  The risk estimate is advice, not a decision: 🟡 means "nothing dangerous
-  found", not "safe".
+- **What the card protects.** Sending to people on your behalf waits for your
+  tap. Everything else passes: the bot protects against agent mistakes in
+  what it sends, not against a hijacked agent.
 - **What bypasses the card.** The auto-approve settings above, the `/auto`
   window you open yourself, and background runs (`/at`, `/event` with `wake`),
   which cannot wait for a tap. Outbound messages still ask. Codex has no hooks
@@ -219,7 +216,7 @@ There is no warranty of any kind; see the license.
 src/claude_tg_bot/
   bot.py            Telegram handlers, runs, cards, topics
   approval.py       approval server, auto-allow rules, outbound cards
-  danger.py         risk estimate for tool input
+  serious.py        which tool calls send to people (card reasons)
   hook_approve.py   PreToolUse hook (talks to the bot over loopback)
   claude_runner.py  claude -p with stream-json, process groups, timeouts
   codex_runner.py   Codex fallback

@@ -198,7 +198,9 @@ class BotMTProto:
                 # после того, как бот проверил лимит по обновлению.
                 if max_bytes > 0 and size > max_bytes:
                     raise FetchError(limit_text(size, max_bytes))
-                check_disk(target.parent, size, min_free)
+                # Запас для больших: файл до 20 МБ сюда попадает после тайм-аута
+                # Bot API, и 07.11.2026 голосовое 0,4 МБ получило отказ при 1 ГБ.
+                check_disk(target.parent, size, min_free if size > BOT_API_MAX_BYTES else 0)
                 progress.update(0, size)
                 got = await client.download_media(msg, file=str(part),
                                                   progress_callback=progress.update)

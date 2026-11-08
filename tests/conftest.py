@@ -6,7 +6,14 @@
 меток). Английский по умолчанию проверяет tests/test_i18n.py, задавая язык явно.
 """
 import os
+import sys
+from pathlib import Path
 
-from claude_tg_bot import i18n
+# Код из этой копии, а не из установки venv: venv бота на ПК ставит пакет из
+# ~/src/claude-tg-bot (editable), и тесты в копии под ~/tmp иначе молча
+# проверяли живой код (04.11.2026).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from claude_tg_bot import i18n  # noqa: E402
 
 i18n.set_language(os.environ.get("CLAUDE_TG_BOT_TEST_LANG", "ru"))

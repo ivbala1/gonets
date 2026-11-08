@@ -7,7 +7,6 @@ BACKLOG.md (раздел «Из новостей», у задачи из /task �
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import subprocess
@@ -15,6 +14,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ... import jsonstore, procs
+from ...config import agent_env
 from ...i18n import _
 from .core import Item, add_backlog_line, backlog_prompt, new_backlog_text, parse_backlog_choice
 
@@ -38,8 +39,23 @@ def load_projects(path: Path = BACKLOGS_FILE) -> list[dict]:
     return [p for p in data if Path(p["path"]).expanduser().is_dir()]
 
 
-def _git(repo: Path, *args: str, **kw) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT, **kw)
+def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    # Без вопросов в терминал: запрос пароля держал бы вызов до таймаута; на
+    # таймауте SIGKILL получает вся группа, ssh тоже (procs.run_bounded_sync).
+    # Без секретов бота: кнопка работает в его процессе, а push зовёт хуки.
+    env = {**(agent_env() if env is None else env), "GIT_TERMINAL_PROMPT": "0"}
+    return procs.run_bounded_sync(["git", "-C", str(repo), *args], text=True, timeout=GIT_TIMEOUT, env=env)
+
+
+def _push_env(repo: Path) -> dict[str, str]:
+    """ssh у push без вопросов (ключ с фразой без агента: отказ, а не ожидание
+    до таймаута). Свой ssh (GIT_SSH_COMMAND, core.sshCommand, GIT_SSH) не
+    перебиваем: GIT_SSH_COMMAND у git старше их."""
+    env = agent_env()
+    if (not env.get("GIT_SSH_COMMAND") and not env.get("GIT_SSH")
+            and not _git(repo, "config", "core.sshCommand").stdout.strip()):
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+    return env
 
 
 def write_and_commit(repo: Path, name: str, item: Item, today: str, lock_dir: Path) -> Filed:
@@ -47,9 +63,7 @@ def write_and_commit(repo: Path, name: str, item: Item, today: str, lock_dir: Pa
     в нём уже были незакоммиченные правки или рабочая копия не на main, пункт
     дописывается, но коммита нет: чужие правки и ветки не трогаем."""
     path = repo / "BACKLOG.md"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with open(lock_dir / f"backlog-{repo.name}.lock", "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with jsonstore.file_lock(lock_dir / f"backlog-{repo.name}.lock"):
         dirty = bool(_git(repo, "status", "--porcelain", "--", "BACKLOG.md").stdout.strip())
         # Только в main: соседняя сессия могла переключить рабочую копию на
         # свою ветку под PR, строка бэклога ушла бы с ней (ревью 14.10).
@@ -61,7 +75,9 @@ def write_and_commit(repo: Path, name: str, item: Item, today: str, lock_dir: Pa
         updated = add_backlog_line(current, item, today)
         if updated is None:
             return Filed("dup", name)
-        path.write_text(updated, encoding="utf-8")
+        # Атомарно и с прежними правами: обрыв записи не обнулит файл с
+        # чужими незакоммиченными правками (ревью Codex 08.11.2026).
+        jsonstore.write_text(path, updated, mode=0o644 if created else path.stat().st_mode & 0o777)
         if dirty:
             return Filed("added", name, _("не закоммичено: в BACKLOG.md были чужие правки"))
         if not on_main:
@@ -86,7 +102,7 @@ def write_and_commit(repo: Path, name: str, item: Item, today: str, lock_dir: Pa
             if target is None:
                 return Filed("added", name, _("закоммичено, не отправлено"))
             remote, merge = target
-            proc = _git(repo, "push", "-q", remote, f"{sha}:{merge}")
+            proc = _git(repo, "push", "-q", remote, f"{sha}:{merge}", env=_push_env(repo))
         except (OSError, subprocess.SubprocessError) as e:
             return Filed("added", name, _("git push: {error}").format(error=type(e).__name__))
         if proc.returncode != 0:
@@ -137,7 +153,7 @@ def _commit(repo: Path, parent: str, msg: str) -> str | None:
     Дерево во временном индексе, как у commit --only: чужое из настоящего
     индекса в коммит не идёт."""
     with tempfile.TemporaryDirectory() as tmp:
-        env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        env = {**agent_env(), "GIT_INDEX_FILE": str(Path(tmp) / "index")}
         steps = (("read-tree", parent) if parent else ("read-tree", "--empty"),
                  ("update-index", "--add", "--", "BACKLOG.md"))
         for step in steps:

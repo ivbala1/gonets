@@ -838,14 +838,12 @@ class BotNewsContextTests(unittest.TestCase):
         self.bot = bot
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.cfg = SimpleNamespace(state_dir=Path(self.tmp.name), codex_trigger_prefix="gpt:")
+        self.cfg = SimpleNamespace(state_dir=Path(self.tmp.name), codex_trigger_prefix="gpt:",
+                                   news_tg_chat_id=-100, news_tg_thread_id=7)
         base = Path(self.tmp.name) / "news_digest"
         item = Item(1, "tools", "Пункт", "т", "к", "https://e.x/1", "s")
         save_digest(base, "202610080900", [item], [], NOW)
         set_message_id(base, "202610080900", 1, 501)
-        env = patch.dict("os.environ", {"NEWS_TG_CHAT_ID": "-100", "NEWS_TG_THREAD_ID": "7"})
-        env.start()
-        self.addCleanup(env.stop)
 
     def _msg(self, text="вопрос", chat=-100, thread=7, reply_id=None):
         reply = SimpleNamespace(message_id=reply_id) if reply_id else None

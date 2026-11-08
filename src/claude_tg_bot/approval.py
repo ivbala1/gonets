@@ -31,19 +31,18 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TimedOut
+from telegram.error import NetworkError
 from telegram.ext import Application
 
-from . import audit, danger, events, mailsend, outbound, runs, serious
+from . import audit, buttons, events, mailsend, outbound, paths, runs, serious
 from .burst import burst_target_key
 from .config import LOOPBACK_HOSTS, Config
 from .i18n import _, N_
+from .limits import clock
 from .outbound import _esc, _esc_truncate
 from .replies import is_unconfirmed
 
@@ -62,8 +61,8 @@ AUDIT_LOG_NAME = "audit.jsonl"
 # удобства на безопасность: в открытом окне rm/push/curl проходят без карточки.
 # С 28.10.2026 (решение Ивана «Пусть окно пускает») окно пускает и команды,
 # которые читают или пишут секрет: кнопки ⏩ на такой карточке были, а
-# следующая команда с токеном снова шла карточкой. В audit для них
-# decision="allow:burst:secret". Отправка наружу и фоновые раны окно
+# следующая команда с токеном снова шла карточкой (до 04.11.2026 в audit
+# decision="allow:burst:secret"). Отправка наружу и фоновые раны окно
 # по-прежнему не берёт. С 29.10.2026 (решение Ивана «⏩ и дубли») окно берёт и
 # обдумывание задачи: там без него каждая проверка шла карточкой.
 # Set оставлен пустым, чтобы при необходимости снова что-то исключить точечно.
@@ -105,9 +104,6 @@ class Pending:
     # сообщения в нажатии. Агент знает ключ бота и мог переписать карточку
     # через Bot API (проект 03.11.2026, п. 4).
     card_text: str = ""
-    # Сервер заказчика: «change» или пусто (serious.customer_kind). Изменению
-    # окно ⏩ не положено, кнопок окна на его карточке нет.
-    customer: str = ""
     # Отправка людям мимо карточки отправки (serious.Outbound): окно ⏩ тоже
     # не положено.
     sends: bool = False
@@ -186,33 +182,8 @@ class ApprovalRegistry:
         return len(self._items)
 
 
-_DANGER_REASONS_CAP = 400
 _DESCRIPTION_CAP = 200
 FULL_VIEW_THRESHOLD = 1500
-
-
-def _danger_line(tool_name: str, tool_input: Any, cwd: str | None = None) -> str:
-    """Первая строка карточки: оценка бота по ПОЛНОМУ входу инструмента.
-    Подсказка, а не решение: жёлтый значит «опасного не нашёл», не «безопасно»."""
-    try:
-        verdict = danger.classify(tool_name, tool_input if isinstance(tool_input, dict) else {},
-                                  cwd=cwd)
-    except Exception:
-        log.exception("danger classify failed")
-        return _("⚪ <b>оценка опасности не удалась</b>, читай команду целиком")
-    if verdict.red:
-        reasons = "; ".join(verdict.red)
-        return _("🔴 <b>ОПАСНО:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
-    changes = [r for r in verdict.orange if r not in verdict.unknown]
-    if changes:
-        reasons = "; ".join(changes + verdict.unknown)
-        return _("🟠 <b>Меняет:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
-    if verdict.orange:
-        # Изменений разбор не нашёл, но и чтение доказать не смог: подстановка,
-        # незнакомая программа. «Меняет» тут неправда (Иван 03.11.2026).
-        reasons = "; ".join(verdict.unknown)
-        return _("🟠 <b>Не разобрал, может и менять:</b> {reasons}").format(reasons=_esc_truncate(reasons, _DANGER_REASONS_CAP))
-    return _("🟡 опасного не нашёл (это не значит «безопасно»)")
 
 
 def needs_full_view(tool_input: Any, tool_name: str | None = None) -> bool:
@@ -258,7 +229,7 @@ def _full_view_main(tool_name: str, tool_input: Any) -> str:
             shown["attachments"] = [
                 {"filename": a.get("filename"), "mimeType": a.get("mimeType"),
                  "base64_chars": len(str(a.get("content") or ""))}
-                if isinstance(a, dict) else "?" for a in shown["attachments"]]
+                if isinstance(a, dict) else str(a) for a in shown["attachments"]]
         texts = [_("--- {label} ---\n{value}").format(label=_(label), value=shown.pop(key))
                  for key, label in outbound.TEXT_FIELDS
                  if shown.get(key) not in (None, "")]
@@ -280,16 +251,15 @@ def _full_view_main(tool_name: str, tool_input: Any) -> str:
 
 
 CARD_TEXT_CAP = 3800
-# Предел текста сообщения Telegram (знаков после разбора разметки; HTML длиннее, проверка с запасом).
-TELEGRAM_TEXT_LIMIT = 4096
 
 
 def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: str | None,
                       cwd: str | None = None) -> str:
-    """Карточка: оценка опасности, затем описание вызова (HTML, escape-нуто).
-    Если вышло длиннее лимита Telegram (длинный путь, много правок), тело
-    заменяется обрезанным полным текстом: целиком он доступен по «📄»."""
-    head = _danger_line(tool_name, tool_input, cwd)
+    """Карточка: заголовок, затем описание вызова (HTML, escape-нуто). С
+    04.11.2026 карточка только на отправку людям, оценки опасности по разбору
+    команды нет. Если вышло длиннее лимита Telegram, тело заменяется
+    обрезанным полным текстом: целиком он доступен по «📄»."""
+    head = _("📤 <b>отправка людям от твоего имени</b>: проверь адресата и текст")
     card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id)}"
     if len(card) <= CARD_TEXT_CAP:
         return card
@@ -419,7 +389,7 @@ def _format_tool_body(tool_name: str, tool_input: dict[str, Any], session_id: st
         body = url + (f"\n\n{prompt}" if prompt else "")
         return f"{header}\n<pre>{_esc_truncate(body, TRUNCATE_PAYLOAD)}</pre>"
     if outbound.is_send(tool_name):
-        return f"{header}\n{outbound.format_card(tool_input, text_cap)}"
+        return f"{header}\n{outbound.format_card(tool_input, text_cap, tool_name)}"
     # generic fallback
     dumped = json.dumps(tool_input, ensure_ascii=False, indent=2)
     return f"{header}\n<pre>{_esc_truncate(dumped, TRUNCATE_PAYLOAD)}</pre>"
@@ -443,56 +413,6 @@ _BASH_SAFE_REDIRECT_RE = re.compile(
 # `2>&1`/`&>/dev/null` стрипаются как safe-redirections ВЫШЕ, поэтому их `&`
 # сюда не доходит.
 _BASH_SEPARATORS = ("||", "&&", "|", "&", ";", "\n", "\r")
-
-# Флаги, превращающие читающую команду в исполняющую или мутирующую.
-# Allowlist-regex смотрит только на имя команды и пропустил бы `find . -delete`,
-# поэтому денилист проверяется отдельно и привязан к имени: `-i` у sed это
-# in-place, а у grep — ignore-case, общим списком их не различить.
-# Ключ для `git grep` — "git": имя команды берётся из первого токена.
-_BASH_DANGEROUS_ARGS: dict[str, frozenset[str]] = {
-    "find": frozenset({
-        "-delete", "-exec", "-execdir", "-ok", "-okdir",
-        "-fls", "-fprint", "-fprint0", "-fprintf",
-    }),
-    "fd": frozenset({"-x", "--exec", "-X", "--exec-batch"}),
-    "fdfind": frozenset({"-x", "--exec", "-X", "--exec-batch"}),
-    # rg --pre/--hostname-bin запускают внешнюю программу на каждый файл.
-    "rg": frozenset({"--pre", "--pre-glob", "--hostname-bin"}),
-    "ripgrep": frozenset({"--pre", "--pre-glob", "--hostname-bin"}),
-    # git grep -O/--open-files-in-pager отдаёт совпадения в pager, а pager
-    # исполняется shell'ом; --textconv/--ext-diff зовут настроенные фильтры.
-    "git": frozenset({
-        # `-c` после подкоманды это счёт у grep и сводный дифф у log, а
-        # настройка `git -c` бывает только до неё, и сюда такой вызов не
-        # доходит: шаблоны требуют подкоманду сразу после git (аудит guard 31.10.2026).
-        "-O", "--open-files-in-pager", "--textconv", "--ext-diff", "--config-env",
-        # git diff/log/show --output=<файл> пишет вывод в файл.
-        "--output",
-        # --upload-pack/--exec у fetch и ls-remote запускают программу,
-        # --filters у cat-file гонит содержимое через настроенные фильтры.
-        "--upload-pack", "--exec", "--filters",
-        # git grep --no-index ищет и по файлам из .gitignore, то есть по .env.
-        "--no-exclude-standard",
-    }),
-    # sort -o/--output перезаписывает файл, --compress-program запускает бинарь.
-    "sort": frozenset({"-o", "--output", "--compress-program", "--files0-from"}),
-    # tree -H с -R пишет 00Tree.html в каждый подкаталог (аудит 31.10.2026).
-    "tree": frozenset({"-o", "-H"}),
-    # file -C компилирует базу magic и пишет magic.mgc (ревью 11.10.2026).
-    "file": frozenset({"-C", "--compile"}),
-    # journalctl умеет удалять и переписывать журналы, а не только читать.
-    "journalctl": frozenset({
-        "--vacuum-time", "--vacuum-size", "--vacuum-files", "--rotate", "--flush",
-        "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys",
-        "--update-catalog",
-    }),
-}
-
-# Короткие флаги из денилиста, которые могут прийти в связке (`sort -uo out`).
-_BASH_DANGEROUS_SHORT: dict[str, frozenset[str]] = {
-    cmd: frozenset(f[1] for f in flags if len(f) == 2 and f[0] == "-")
-    for cmd, flags in _BASH_DANGEROUS_ARGS.items()
-}
 
 
 def _scan_bash_segments(command: str) -> list[str] | None:
@@ -586,468 +506,6 @@ def _has_unquoted_glob(segment: str) -> bool:
     return False
 
 
-# sed как фильтр и печать: флаги только списком (без `-i`, `-e`, `-f`; GNU sed
-# принимает флаги и после имён файлов, поэтому проверяется каждый токен),
-# ровно один скрипт, разобранный `_sed_script_ok`.
-_SED_FLAGS = frozenset({
-    "-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-s", "--separate",
-    "-u", "--unbuffered", "-z", "--null-data",
-})
-_SED_S_FLAGS = frozenset("gpiImM0123456789")
-
-
-def _sed_regex_end(script: str, i: int, delim: str, brackets: bool) -> int:
-    """Индекс после закрывающего `delim`, иначе -1. В регулярке (`brackets`)
-    скобочное выражение `[...]` пропускается целиком, и разделитель внутри
-    него запрещён: sed и этот разбор могли бы иначе по-разному понять, где
-    кончается шаблон, и за границей спрятался бы флаг `w` или `e`."""
-    n = len(script)
-    while i < n:
-        c = script[i]
-        if c == "\n":
-            return -1
-        if c == "\\":
-            i += 2
-            continue
-        if brackets and c == "[":
-            j = i + 1
-            if j < n and script[j] == "^":
-                j += 1
-            if j < n and script[j] == "]":
-                j += 1
-            while j < n and script[j] != "]":
-                if script[j] in (delim, "\n"):
-                    return -1
-                if script[j] == "[" and j + 1 < n and script[j + 1] in ":.=":
-                    close = script.find(script[j + 1] + "]", j + 2)
-                    if close < 0 or delim in script[j:close] or "\n" in script[j:close]:
-                        return -1
-                    j = close + 2
-                    continue
-                j += 1
-            if j >= n:
-                return -1
-            i = j + 1
-            continue
-        if c == delim:
-            return i + 1
-        i += 1
-    return -1
-
-
-def _sed_address_end(script: str, i: int) -> int:
-    """Конец адреса (`N`, `first~step`, `$`, `/re/I`), `i` если адреса нет,
-    -1 если он сломан."""
-    n = len(script)
-    if i < n and script[i].isdigit():
-        while i < n and (script[i].isdigit() or script[i] == "~"):
-            i += 1
-        return i
-    if i < n and script[i] == "$":
-        return i + 1
-    if i < n and script[i] == "/":
-        j = _sed_regex_end(script, i + 1, "/", True)
-        if j < 0:
-            return -1
-        while j < n and script[j] in "IM":
-            j += 1
-        return j
-    return i
-
-
-def _sed_script_ok(script: str, extended: bool = False) -> bool:
-    """Скрипт из команд `p`, `d`, `=`, `q`/`Q` и `s///` с флагами без `w`
-    и `e`, с адресами и `!`, через `;` или перевод строки. Всё остальное
-    (`w`, `r`, `e`, `{}`, `y`, адрес `\\%re%`) значит карточка.
-
-    extended (чтение по разбору danger, `_sed_args_read_ok`): ещё `y///`,
-    блоки `{}`, метки (`:a`, `b`, `t`, `T`) и команды без аргумента
-    (`n N P D g G h H x l z F`), которые там и раньше шли без карточки.
-    Метку разбор берёт не длиннее, чем sed: всё, что sed считает командой,
-    проверяется и здесь (аудит 31.10.2026)."""
-    n = len(script)
-    i = 0
-    while True:
-        while i < n and script[i] in " \t;\n":
-            i += 1
-        if i >= n:
-            return True
-        if script[i] == ":" and extended:
-            # Метка: до пробела, `;`, `}` или конца строки.
-            i += 1
-            while i < n and script[i] in " \t":
-                i += 1
-            start = i
-            while i < n and script[i] not in " \t;\n}":
-                i += 1
-            if i == start:
-                return False
-            continue
-        j = _sed_address_end(script, i)
-        if j < 0:
-            return False
-        if j > i and j < n and script[j] == ",":
-            k = j + 1
-            if k < n and script[k] in "+~":
-                k += 1
-                if k >= n or not script[k].isdigit():
-                    return False
-            j2 = _sed_address_end(script, k)
-            if j2 <= k:
-                return False
-            j = j2
-        i = j
-        while i < n and script[i] in " \t":
-            i += 1
-        if i < n and script[i] == "!":
-            i += 1
-            while i < n and script[i] in " \t":
-                i += 1
-        if i >= n:
-            return False
-        c = script[i]
-        if c == "{" and extended:
-            # Блок: следующая команда идёт сразу, без `;`.
-            i += 1
-            continue
-        if c in "pd=" or (extended and c in "}nNPDgGhHxzF"):
-            i += 1
-        elif c in "qQ" or (extended and c == "l"):
-            i += 1
-            while i < n and script[i].isdigit():
-                i += 1
-        elif c == "s":
-            if i + 1 >= n:
-                return False
-            d = script[i + 1]
-            if d.isalnum() or d.isspace() or d == "\\":
-                return False
-            j = _sed_regex_end(script, i + 2, d, True)
-            if j < 0:
-                return False
-            j = _sed_regex_end(script, j, d, False)
-            if j < 0:
-                return False
-            while j < n and script[j] in _SED_S_FLAGS:
-                j += 1
-            i = j
-        elif c == "y" and extended:
-            if i + 1 >= n:
-                return False
-            d = script[i + 1]
-            if d.isalnum() or d.isspace() or d == "\\":
-                return False
-            j = _sed_regex_end(script, i + 2, d, False)
-            if j < 0:
-                return False
-            j = _sed_regex_end(script, j, d, False)
-            if j < 0:
-                return False
-            i = j
-        elif c in "btT" and extended:
-            i += 1
-            while i < n and script[i] in " \t":
-                i += 1
-            while i < n and script[i] not in " \t;\n}":
-                i += 1
-        else:
-            return False
-        while i < n and script[i] in " \t":
-            i += 1
-        if i < n and script[i] not in (";\n}" if extended else ";\n"):
-            return False
-
-
-def _sed_is_safe(parts: list[str], segment: str) -> bool:
-    """`sed [флаги] 'скрипт' [файлы]`. Проверка идёт по токенам после снятия
-    кавычек: `'-i'`, `\\-i`, `'-e' 'w файл'` для bash те же флаги."""
-    if _has_unquoted_glob(segment):
-        return False
-    script = None
-    for p in parts[1:]:
-        if p.startswith("-") and p != "-":
-            if p in _SED_FLAGS:
-                continue
-            if not p.startswith("--") and all("-" + c in _SED_FLAGS for c in p[1:]):
-                continue
-            return False
-        if script is None:
-            script = p
-    return script is not None and _sed_script_ok(script)
-
-
-def _sed_args_read_ok(args: list[str]) -> bool:
-    """sed для чтения по разбору danger (`_read_program_ok`): аргументы уже
-    без кавычек. Скрипты из `-e`/`--expression` или первое слово, каждый
-    проверяет `_sed_script_ok`; флаги только списком. Регулярки danger не
-    видели `w` и `e` за адресом диапазоном, с `I` или `\\%re%`: проверено,
-    `sed -n '/a/,/b/wout' f` пишет файл, `sed '/x/Ie id' f` запускает id
-    (аудит 31.10.2026)."""
-    scripts: list[str] = []
-    positional: list[str] = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            positional += args[i + 1:]
-            break
-        if a in ("-e", "--expression"):
-            if i + 1 >= len(args):
-                return False
-            scripts.append(args[i + 1])
-            i += 2
-            continue
-        if a.startswith("--expression="):
-            scripts.append(a.split("=", 1)[1])
-        elif a.startswith("-e") and not a.startswith("--"):
-            scripts.append(a[2:])
-        elif a.startswith("-") and a != "-":
-            if a not in _SED_FLAGS and (a.startswith("--") or not all("-" + c in _SED_FLAGS for c in a[1:-1])):
-                return False
-            if a[-1] == "e" and not a.startswith("--"):  # склейка `-ne скрипт`
-                if i + 1 >= len(args):
-                    return False
-                scripts.append(args[i + 1])
-                i += 1
-            elif a not in _SED_FLAGS and "-" + a[-1] not in _SED_FLAGS:
-                return False
-        else:
-            positional.append(a)
-        i += 1
-    if not scripts:
-        if not positional:
-            return False
-        scripts = positional[:1]
-    return all(_sed_script_ok(s, extended=True) for s in scripts)
-
-
-# systemctl только для просмотра и только по списку флагов: `--host`/`-H`/
-# `-M` уводят команду на другую машину по ssh, а глагол-действие (restart,
-# stop, edit) меняет службы. Неизвестный флаг значит карточка.
-# `cat` и `show` без `-p` выводят `Environment=` со значениями, а там бывают
-# токены службы: `cat` карточкой, `show` только с названными свойствами без
-# секретных (`danger.systemctl_prop_secret`; ревью 29.10.2026, как `_READ_SUB`).
-_SYSTEMCTL_READ_VERBS = frozenset({
-    "status", "show", "list-units", "list-timers", "list-unit-files", "is-active",
-    "is-failed", "is-enabled",
-})
-_SYSTEMCTL_FLAGS = frozenset({
-    "--user", "--no-pager", "--all", "-a", "--full", "-l", "--value", "--plain",
-    "--no-legend", "-q", "--quiet",
-})
-_SYSTEMCTL_VALUE_FLAGS = frozenset({"--property", "-p", "--type", "-t", "--state", "--lines", "-n"})
-
-
-def _systemctl_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    verbs = []
-    props: list[str] = []
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        name = a.split("=", 1)[0]
-        if a in _SYSTEMCTL_FLAGS:
-            i += 1
-        elif name in _SYSTEMCTL_VALUE_FLAGS and "=" in a:
-            if name in ("--property", "-p"):
-                props += a.split("=", 1)[1].split(",")
-            i += 1
-        elif a in _SYSTEMCTL_VALUE_FLAGS:
-            if a in ("--property", "-p"):
-                props += (parts[i + 1] if i + 1 < len(parts) else "").split(",")
-            i += 2
-        elif a.startswith("-"):
-            return False
-        else:
-            verbs.append(a)
-            i += 1
-    if not verbs or verbs[0] not in _SYSTEMCTL_READ_VERBS:
-        return False
-    if verbs[0] == "show":
-        return bool(props) and not any(danger.systemctl_prop_secret(p) for p in props)
-    return True
-
-
-# gh только для чтения: пары «группа подкоманда» списком. Без `--web`/`-w`
-# (браузер; у `pr checks -w` это ожидание, тоже не нужно) и без
-# `--log`/`--log-failed` у `run view` (скачивает журналы в кэш). `gh api`,
-# расширения и алиасы не пропускаются: алиас может быть командой shell.
-# `gh api` разбирается отдельно в `_gh_api_read_ok`.
-_GH_READ = {
-    "pr": frozenset({"list", "view", "status", "diff", "checks"}),
-    "issue": frozenset({"list", "view", "status"}),
-    "run": frozenset({"list", "view"}),
-    "release": frozenset({"list", "view"}),
-    "repo": frozenset({"view"}),
-}
-_GH_BANNED_FLAGS = frozenset({"--web", "-w", "--log", "--log-failed"})
-
-
-def _gh_read_ok(parts: list[str], segment: str) -> bool:
-    if len(parts) < 3 or _has_unquoted_glob(segment):
-        return False
-    if parts[2] not in _GH_READ.get(parts[1], frozenset()):
-        return False
-    args = parts[3:]
-    for i, a in enumerate(args):
-        if a.split("=", 1)[0] in _GH_BANNED_FLAGS:
-            return False
-        if a.startswith("-") and not a.startswith("--") and "w" in a[1:]:
-            return False
-        # Репозиторий только `владелец/имя`: форма `сервер/владелец/имя` уводит
-        # запрос на произвольный сервер.
-        repo = None
-        if a in ("-R", "--repo") and i + 1 < len(args):
-            repo = args[i + 1]
-        elif a.startswith("--repo="):
-            repo = a.split("=", 1)[1]
-        elif a.startswith("-R") and len(a) > 2:
-            repo = a[2:]
-        if repo is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-            return False
-    return True
-
-
-# journalctl по списку флагов: getopt_long принимает сокращения (`--rot` это
-# `--rotate`, `--vacuum-t` это `--vacuum-time`), поэтому запрет по имени
-# не работает. `-f` и `-e` не пропускаем: бесконечное ожидание и пейджер.
-_JOURNAL_FLAGS = frozenset({
-    "--user", "--system", "--no-pager", "-r", "--reverse", "-q", "--quiet", "-a", "--all",
-    "-x", "--catalog", "-k", "--dmesg", "-m", "--merge", "--utc", "--no-hostname",
-    "--no-full", "--list-boots", "--disk-usage", "--case-sensitive",
-})
-_JOURNAL_VALUE_FLAGS = frozenset({
-    "-u", "--unit", "--user-unit", "-n", "--lines", "-S", "--since", "-U", "--until", "-p",
-    "--priority", "-o", "--output", "-b", "--boot", "-g", "--grep", "-t", "--identifier",
-    "--output-fields", "-T", "--exclude-identifier", "--facility",
-})
-_JOURNAL_SHORT_BOOL = frozenset("rqaxkm")
-
-
-def _journalctl_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        name = a.split("=", 1)[0]
-        if a in _JOURNAL_FLAGS:
-            i += 1
-        elif name in _JOURNAL_VALUE_FLAGS and "=" in a:
-            i += 1
-        elif a in _JOURNAL_VALUE_FLAGS:
-            i += 2
-        elif a.startswith("-") and not a.startswith("--") and len(a) > 2 and a[1] == "n" and a[2:].isdigit():
-            i += 1
-        elif a.startswith("-") and not a.startswith("--") and set(a[1:]) <= _JOURNAL_SHORT_BOOL:
-            i += 1
-        elif a.startswith("-"):
-            return False
-        elif re.fullmatch(r"_?[A-Z_]+=\S*", a):
-            i += 1
-        else:
-            return False
-    return True
-
-
-def _gh_api_read_ok(parts: list[str], segment: str) -> bool:
-    """`gh api <путь>` только GET: без `-X`, `--input` и полей (`-f`/`-F`
-    превращают запрос в POST), без `--hostname` и полного URL. GraphQL
-    пропускается с единственным полем `-f query=...` без слова mutation:
-    изменение в GraphQL без этого слова не записать."""
-    if _has_unquoted_glob(segment):
-        return False
-    endpoint = query = None
-    i = 2
-    while i < len(parts):
-        a = parts[i]
-        name = a.split("=", 1)[0]
-        if a in ("--paginate", "--slurp", "-i", "--include", "--silent"):
-            i += 1
-        elif a in ("-q", "--jq", "-t", "--template"):
-            if i + 1 >= len(parts):
-                return False
-            i += 2
-        elif name in ("--jq", "--template") and "=" in a:
-            i += 1
-        elif a in ("-f", "--raw-field") and query is None and i + 1 < len(parts) \
-                and parts[i + 1].startswith("query="):
-            query = parts[i + 1][len("query="):]
-            i += 2
-        elif a.startswith("-") or endpoint is not None:
-            return False
-        else:
-            endpoint = a
-            i += 1
-    if endpoint is None or "://" in endpoint:
-        return False
-    if endpoint == "graphql":
-        return query is not None and not re.search(r"mutation", query, re.IGNORECASE)
-    return query is None
-
-
-# awk без выхода наружу: без system(), getline, конвейеров (`|`, `|&`),
-# перенаправления вывода print/printf (`> файл`), директив gawk `@include`,
-# `@load` и косвенного вызова `@f()`. Флаги только -F и -v: `-f` берёт
-# программу из файла, `-e`/`-i`/`-l` у gawk подключают код.
-# Общий разбор сравнения и записи используется также в danger
-# (ревью 11.10.2026).
-_AWK_BANNED_RE = re.compile(r"system|getline|@|(?<!\|)\|(?!\|)")
-_AWK_INPUT_RE = re.compile(r"\b(?:ARGV|ARGC|ENVIRON|PROCINFO)\b")
-
-
-def _awk_program_ok(program: str) -> bool:
-    return not (_AWK_BANNED_RE.search(program) or _AWK_INPUT_RE.search(program)
-                or danger._awk_writes(program))
-
-
-def _awk_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        if a in ("-F", "-v"):
-            i += 2
-        elif a.startswith(("-F", "-v")) and len(a) > 2:
-            i += 1
-        elif a.startswith("-"):
-            return False
-        else:
-            break
-    if i >= len(parts):
-        return False
-    if not _awk_program_ok(parts[i]):
-        return False
-    return not any(p.startswith("-") for p in parts[i + 1:])
-
-
-# curl только на чтение внешнего адреса, по списку флагов: без записи файлов
-# (`-o` только /dev/null, без `-O`, `-c`, `--output-dir`), без чтения файлов
-# (`-K`, `-T`, `-F`, `@файл` в данных и заголовках, формат `-w @файл`), без
-# прокси, `--resolve` и `--unix-socket`. Только GET: данные (`-d`,
-# `--data-urlencode`) лишь вместе с `-G`, тогда они уходят в строку запроса.
-# Адрес только http(s) с доменным именем: IP-литералы, localhost (и с точкой
-# на конце), имена со встроенным IP и сервисы вида nip.io закрыты, чтобы не
-# стучаться в локальные службы. Публичное имя, которое само указывает в
-# домашнюю сеть, этим не отсечь; поэтому и только GET: approval-сервер на
-# GET отдаёт лишь /health. Без `-L`/`--location`: редирект с публичного
-# адреса на localhost или в домашнюю сеть обходил бы проверку адреса. WebFetch
-# без карточки проходит по той же проверке адреса (`_curl_url_ok`).
-_CURL_BOOL = frozenset({
-    "-s", "--silent", "-S", "--show-error", "-f", "--fail",
-    "-I", "--head", "-i", "--include", "--compressed", "-G", "--get", "-v", "--verbose",
-    "-g", "--globoff",
-})
-_CURL_SHORT_BOOL = frozenset("sSfIiGvg")
-_CURL_VALUE = frozenset({
-    "-m", "--max-time", "--connect-timeout", "-A", "--user-agent", "-H", "--header",
-    "-w", "--write-out", "-o", "--output", "-d", "--data", "--data-urlencode",
-    "--retry", "-e", "--referer",
-})
-
-
 # Публичные DNS-сервисы, которые отдают адрес из самого имени
 # (127.0.0.1.nip.io, 7f000001.nip.io, lvh.me в 127.0.0.1).
 _CURL_DNS_REBIND = (
@@ -1080,561 +538,11 @@ def _curl_url_ok(url: str) -> bool:
     return not re.fullmatch(r"[0-9.]+|0x[0-9a-f.x]+", host)
 
 
-def _curl_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    urls = 0
-    has_data = False
-    # `-G` считается только флагом, а не значением другого флага:
-    # `--user-agent -G --data x=1` это POST (ревью 11.10.2026).
-    get = False
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        if a in _CURL_BOOL or (
-            a.startswith("-") and not a.startswith("--") and len(a) > 1
-            and set(a[1:]) <= _CURL_SHORT_BOOL
-        ):
-            get = get or a == "--get" or (not a.startswith("--") and "G" in a[1:])
-            i += 1
-            continue
-        if a.startswith("--") and "=" in a:
-            name, val = a.split("=", 1)
-        elif a in _CURL_VALUE:
-            if i + 1 >= len(parts):
-                return False
-            name, val = a, parts[i + 1]
-            i += 1
-        elif a.startswith("-") and not a.startswith("--") and a[:2] in _CURL_VALUE and len(a) > 2:
-            name, val = a[:2], a[2:]
-        elif a.startswith("-"):
-            return False
-        else:
-            # curl сам раскрывает `{a,b}` и `[1-2]` в адресе, и кавычки shell
-            # этому не мешают: `{example.org,localhost}` дошёл бы до localhost
-            # (ревью 11.10.2026).
-            if any(c in a for c in "{}[]") or not _curl_url_ok(a):
-                return False
-            urls += 1
-            i += 1
-            continue
-        if name not in _CURL_VALUE:
-            return False
-        if name in ("-o", "--output") and val != "/dev/null":
-            return False
-        if name in ("-d", "--data", "--data-urlencode"):
-            if "@" in val.split("=", 1)[0]:
-                return False
-            has_data = True
-        if name in ("-H", "--header", "-w", "--write-out") and (val.startswith("@") or "%output{" in val):
-            return False
-        i += 1
-    return urls > 0 and (get or not has_data)
-
-
-# Обёртки, которые только запускают следующую команду: `rtk` и `rtk proxy`
-# (сжатие вывода, их подставляет хук rtk), `RTK_DISABLED=1`, `TZ=<зона>`,
-# `timeout <срок>`. Снимаются с начала сегмента как буквальный текст, дальше
-# проверяется то, что они запускают. Кавычки и двойные пробелы не снимаются:
-# такой сегмент ни с чем не совпадёт и уйдёт в карточку. `rtk run` (это
-# `sh -c`) после снятия становится `run ...` и тоже уходит в карточку.
-_WRAPPER_RE = re.compile(
-    r"(?:rtk(?: proxy)?|RTK_DISABLED=1|TZ=[A-Za-z0-9_/+-]+|timeout \d+(?:\.\d+)?[smh]?) "
-)
-# `git -C <каталог>` меняет только каталог: `git -C x log` проверяется как
-# `git log`. Опции перед -C (`git -c ...`) сюда не попадают.
-_GIT_C_RE = re.compile(r"git -C (?:'[^']*'|\"[^\"\\]*\"|[^\s'\"\\]+) ")
-# xargs допишет аргументы со stdin, которые здесь не видны, поэтому внутри
-# только команды, которым никакой аргумент не даёт писать или запускать.
-# Печатающих содержимое (cat, head, tail) нет: имя файла со stdin не
-# проверить на секрет. grep тоже читает содержимое неизвестных файлов
-# со stdin, поэтому требует карточку (ревью 11.10.2026).
-_XARGS_INNER = frozenset({
-    "ls", "wc", "basename", "dirname", "stat",
-    "realpath", "readlink", "echo", "du",
-})
-_XARGS_BOOL = frozenset({"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-x"})
-# Без `-a`/`--arg-file`: xargs читает строки из файла и отдаёт их команде,
-# а имя файла после снятия xargs уже не проверить на секрет (ревью 11.10.2026).
-_XARGS_VALUE = frozenset({"-I", "-n", "-L", "-P", "-d", "-s", "-E"})
-
-
-def _unwrap_segment(segment: str) -> str | None:
-    """Сегмент без обёрток из `_WRAPPER_RE`, без `git -C <каталог>` и без
-    `xargs [флаги]`. None, если обёртку не разобрать. `rtk grep` под капотом
-    это rg, поэтому дальше он проверяется как rg (флаг `--pre` запрещён).
-    `rtk proxy grep` запускает настоящий grep и остаётся grep: у rg `-E` это
-    кодировка, и поиск по одному файлу выглядел бы поиском по каталогу."""
-    s = segment
-    while m := _WRAPPER_RE.match(s):
-        rest = s[m.end():]
-        if m.group(0) == "rtk " and rest.startswith("grep "):
-            rest = "rg " + rest[len("grep "):]
-        # `rtk test x` запускает x оболочкой, а не встроенную `test` (аудит
-        # guard 31.10.2026): после снятия rtk совпало бы с `test .*`.
-        if m.group(0).startswith("rtk") and rest.split(" ", 1)[0] in danger._RTK_SHELL:
-            return None
-        s = rest
-    if s == "xargs" or s.startswith("xargs "):
-        try:
-            parts = shlex.split(s)
-        except ValueError:
-            return None
-        i = 1
-        while i < len(parts):
-            a = parts[i]
-            if a in _XARGS_BOOL:
-                i += 1
-            elif a in _XARGS_VALUE:
-                i += 2
-            elif a[:2] in _XARGS_VALUE and len(a) > 2:
-                i += 1
-            elif a.startswith("-"):
-                return None
-            else:
-                break
-        inner = parts[i:]
-        if not inner or inner[0] not in _XARGS_INNER:
-            return None
-        s = shlex.join(inner)
-    if m := _GIT_C_RE.match(s):
-        s = "git " + s[m.end():]
-    return s
-
-
-_SYSTEM_READ_RE = re.compile(r"systemctl(?: .*)?|journalctl(?: .*)?|gh (?:pr|issue|run|release|repo|api) .*")
-
-# Встроенный список чтения поверх APPROVE_BASH_AUTO_ALLOW_REGEX. sed, awk и
-# curl здесь любые: их пропускает только разбор аргументов в
-# `_segment_args_are_safe`. Остальное читает и ничего не меняет.
-_EXTRA_READ_RE = re.compile(
-    r"(?:sed|awk|gawk|mawk|curl) .+"
-    r"|git (?:rev-parse|blame|shortlog|rev-list|merge-base|show-ref|for-each-ref|cat-file"
-    r"|config --get(?:-all|-regexp)?)(?: .*)?"
-    r"|sleep \d+(?:\.\d+)?[smh]?"
-    r"|(?:pgrep|dig|host|diff|cmp|comm|nl|paste|join|fold|expand|rev|tac|seq|md5sum|sha1sum|sha256sum"
-    r"|id|groups|nproc|lsblk|ps|strings|od|hexdump|printf|test|getent)(?: .*)?"
-    r"|ping -c ?\d+(?: .*)?"
-    r"|command -v \S+(?: \S+)*"
-    r"|ip (?:-(?:4|6|br|brief|c|color|j|json|p|pretty|s|stats|d|details|o|oneline) )*"
-    r"(?:a|addr|address|r|route|l|link|neigh)(?: show(?: .*)?)?"
-    r"|python3 -m json\.tool(?: --[a-z-]+)*(?: [^\s-]\S*)?"
-)
-
-
-# uniq пишет во второй операнд: `uniq вход выход` перезаписывает файл, в том
-# числе модуль скилла, который потом идёт без карточки (ревью 11.10.2026).
-_UNIQ_VALUE = frozenset({"-f", "-s", "-w"})
-_UNIQ_LONG_VALUE = ("--skip-fields", "--skip-chars", "--check-chars")
-
-
-def _uniq_read_ok(parts: list[str], segment: str, cwd: str | None = None) -> bool:
-    if _has_unquoted_glob(segment):
-        # ./ не даст подставить флаг, но два совпадения дадут файл вывода
-        # (ревью 11.10.2026).
-        words = _bash_words(segment)
-        if words is None or cwd is None:
-            return False
-        expanded: list[str] = []
-        for word in words:
-            raw = "".join(ch for ch, _unused in word)
-            if any(ch in _GLOB_CHARS and not quoted for ch, quoted in word):
-                if not raw.startswith("./") or "{" in raw:
-                    return False
-                matches = glob.glob(raw, root_dir=cwd)
-                expanded.extend(matches or [raw])
-            else:
-                expanded.append(raw)
-        parts = expanded
-    operands = 0
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        if a == "--":
-            operands += len(parts) - i - 1
-            break
-        if a.startswith("--") and "=" not in a:
-            if any(o.startswith(a) for o in _UNIQ_LONG_VALUE):
-                i += 1
-        elif a.startswith("-") and len(a) > 1 and not a.startswith("--"):
-            # Значение слитно (`-f2`, `-cf2`) или следующим словом (`-cf 2`).
-            k = next((j for j, c in enumerate(a[1:], 1) if f"-{c}" in _UNIQ_VALUE), None)
-            if k is not None and k == len(a) - 1:
-                i += 1
-        elif not a.startswith("--"):
-            operands += 1
-        i += 1
-    return operands <= 1
-
-
-# `git branch` без карточки только просмотром: `-D`, `-f`, `-m`, `-c`,
-# `--set-upstream-to` и имя без режима списка меняют ветки (ревью 11.10.2026).
-_GIT_BRANCH_BOOL = frozenset({
-    "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "-l", "--list",
-    "--show-current", "-i", "--ignore-case", "--no-color", "--color", "--no-column",
-    "--column", "--omit-empty", "-q", "--quiet", "--no-abbrev", "--abbrev",
-})
-_GIT_BRANCH_VALUE = frozenset({"--sort", "--format"})
-_GIT_BRANCH_FILTER = frozenset({"--contains", "--no-contains", "--merged", "--no-merged",
-                                "--points-at"})
-_GIT_BRANCH_SHORT = frozenset("arvliq")
-
-
-def _git_branch_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    list_mode = False
-    positionals = False
-    i = 2
-    while i < len(parts):
-        a = parts[i]
-        name = a.split("=", 1)[0]
-        if name in _GIT_BRANCH_VALUE:
-            i += 1 if "=" in a else 2
-            continue
-        if name in _GIT_BRANCH_FILTER:
-            list_mode = True
-        elif a in ("-l", "--list") or (a.startswith("-") and not a.startswith("--")
-                                         and "l" in a[1:] and set(a[1:]) <= _GIT_BRANCH_SHORT):
-            list_mode = True
-        elif name in _GIT_BRANCH_BOOL and (a == name or name in ("--color", "--column", "--abbrev")):
-            pass
-        elif a.startswith("-") and not a.startswith("--") and len(a) > 1 \
-                and set(a[1:]) <= _GIT_BRANCH_SHORT:
-            pass
-        elif a.startswith("-"):
-            return False
-        else:
-            positionals = True
-        i += 1
-    return list_mode or not positionals
-
-
-def _planted_git_dir(start: str | None) -> bool:
-    """По пути поиска репозитория git (каталог и его родители) стоит
-    каталог, который git сам признает голым репозиторием: HEAD, objects/ и
-    refs/ без `.git`. Его config (core.fsmonitor, diff.external) запускает
-    команды уже на `git status` и `git diff`; такие файлы агент пишет Write
-    без карточки в путях из APPROVE_WHITELIST_PATHS, где закрыт только `.git`
-    (аудит 31.10.2026, проверено на git 2.43). Обычный репозиторий с `.git`
-    поиск останавливает раньше."""
-    try:
-        d = Path(start or os.getcwd()).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return True
-    for p in (d, *d.parents):
-        try:
-            if (p / ".git").exists():
-                return False
-            if (p / "HEAD").is_file() and (p / "objects").is_dir() and (p / "refs").is_dir():
-                return True
-        except OSError:
-            return True
-    return False
-
-
-def _git_start_dir(args: list[str], cwd: str | None) -> str | None:
-    """Каталог, откуда git ищет репозиторий: cwd и все `-C` до подкоманды."""
-    d = cwd or os.getcwd()
-    i = 0
-    while i < len(args) and args[i].startswith("-"):
-        if args[i] == "-C" and i + 1 < len(args):
-            d = os.path.join(d, os.path.expanduser(args[i + 1]))
-            i += 2
-            continue
-        i += 1
-    return d
-
-
-# Модуль запуска `python3 -m` ищется сначала в текущем каталоге: `json/`,
-# `argparse.py` или их `.pyc` там исполнятся вместо стандартных (аудит
-# 31.10.2026, проверено). Имена берутся из списка стандартной библиотеки.
-def _shadows_stdlib(cwd: str | None) -> bool:
-    try:
-        names = os.listdir(cwd or os.getcwd())
-    except OSError:
-        return True
-    stdlib = sys.stdlib_module_names
-    for name in names:
-        stem, dot, ext = name.partition(".")
-        if dot and ext.split(".")[-1] in ("py", "pyc", "so", "pyd") and stem in stdlib:
-            return True
-        if not dot and name in stdlib and os.path.exists(os.path.join(cwd or os.getcwd(), name, "__init__.py")):
-            return True
-    return False
-
-
-def _segment_args_are_safe(segment: str, cwd: str | None = None) -> bool:
-    """False, если сегмент зовёт команду из `_BASH_DANGEROUS_ARGS` с её
-    исполняющим или мутирующим флагом (`find -delete`, `fd --exec`).
-
-    Токены снимаются `shlex`, а не `str.split`: bash видит `find . '-delete'`,
-    `find . -de"lete"` и `find . -de\\lete` как один и тот же флаг `-delete`,
-    поэтому сырое разбиение по пробелам денилист обходило.
-    Проверяются три формы записи флага: точная (`-o`), `--flag=value`
-    (`--compress-program=/tmp/x`) и связка коротких (`sort -uo out`).
-    Шаблоны имён (`*`, `?`, `[`, `{`) вне кавычек у этих команд запрещены:
-    раскрытие идёт после проверки и может подставить файл с именем флага.
-    """
-    try:
-        parts = shlex.split(segment)
-    except ValueError:
-        return False  # незакрытая кавычка: решать нельзя, значит карточка
-    if not parts:
-        return True
-    if parts[0] == "git" and _planted_git_dir(_git_start_dir(parts[1:], cwd)):
-        return False
-    if parts[:3] == ["python3", "-m", "json.tool"] and _shadows_stdlib(cwd):
-        return False
-    if len(parts) == 2 and parts[1] == "--version":
-        return True  # `_INFO_READ` уже проверил имя; `rg` и `gh` иначе идут своим разбором
-    if parts[0] == "sed":
-        return _sed_is_safe(parts, segment)
-    if parts[0] == "printf" and (any(p == "-v" or (p.startswith("-") and not p.startswith("--") and "v" in p)
-                                     for p in parts[1:2]) or any(_PRINTF_ASSIGN_RE.search(p) for p in parts[1:])):
-        # `printf -v VAR` пишет переменную оболочки, в том числе таблицу
-        # команд BASH_CMDS: `ls` следующего сегмента станет `rm` (ревью Codex 13.10).
-        return False
-    if parts[0] in ("awk", "gawk", "mawk"):
-        return _awk_read_ok(parts, segment)
-    if parts[0] == "curl":
-        return _curl_read_ok(parts, segment)
-    if parts[0] in ("mkdir", "date", "hostname"):
-        return parts[0] != "mkdir" and danger._system_read_ok(parts[0], parts[1:])
-    if parts[:2] == ["git", "fetch"]:
-        return False
-    if parts[:2] == ["git", "diff"] and "--no-index" in parts:
-        # Ровно два названных файла сравнения, остальные флаги проверяются
-        # общим запретом ниже (ревью 11.10.2026).
-        operands = [a for a in parts[2:] if not a.startswith("-")]
-        if len(operands) != 2 or _has_unquoted_glob(segment):
-            return False
-        if any(Path(cwd or Path.cwd(), Path(p).expanduser()).is_dir() for p in operands):
-            return False
-    elif parts[0] == "git" and any(a.startswith("--no-index") for a in parts):
-        return False
-    if _is_remember_call(parts):
-        if parts[-2:] == ["remember", "--help"]:
-            return True
-        return _remember_args(parts, segment, None) is not None
-    if parts[0] == "systemctl":
-        return _systemctl_read_ok(parts, segment)
-    if parts[0] in (_TASKLIST, "tasklist.exe"):
-        return _tasklist_read_ok(parts, segment)
-    if parts[0] == "iconv":
-        return _iconv_read_ok(parts, segment)
-    if parts[0] == "journalctl":
-        return _journalctl_read_ok(parts, segment)
-    if parts[:2] == ["gh", "api"]:
-        return _gh_api_read_ok(parts, segment)
-    if parts[0] == "gh":
-        return _gh_read_ok(parts, segment)
-    if parts[0] == "uniq":
-        return _uniq_read_ok(parts, segment, cwd)
-    if parts[:2] == ["git", "branch"]:
-        return _git_branch_read_ok(parts, segment)
-    if parts[:2] == ["git", "remote"]:
-        return all(p in ("-v", "--verbose") for p in parts[2:])
-    banned = _BASH_DANGEROUS_ARGS.get(parts[0])
-    if banned is None:
-        return True
-    if _has_unquoted_glob(segment):
-        return False
-    banned_short = _BASH_DANGEROUS_SHORT.get(parts[0], frozenset())
-    for p in parts[1:]:
-        if p in banned:
-            return False
-        if p.split("=", 1)[0] in banned:
-            return False
-        # getopt_long и git parse-options принимают однозначное сокращение
-        # длинного флага: `sort --out=f` это `--output=f`, `git grep --open=x`
-        # это `--open-files-in-pager=x`. Поэтому запрещён и любой префикс.
-        if any(danger.long_flag(p, b) for b in banned):
-            return False
-        if banned_short and p.startswith("-") and not p.startswith("--"):
-            if any(c in banned_short for c in p[1:]):
-                return False
-    return True
-
-
 # Секреты, которые Bash без карточки не читает (ревью 07.10.2026): разрешённые
 # читалки (`cat`, `strings`, `od`, `sed -n p`, `diff` и т.п.) иначе выводили
 # бы их агенту, а `curl` GET без карточки уносил бы наружу. Слово команды
 # сверяется после снятия кавычек (`.en''v` это `.env`). `.env.example` не
 # секрет и остаётся читаемым.
-
-def _bash_words(segment: str) -> list[list[tuple[str, bool]]] | None:
-    """Слова сегмента посимвольно с пометкой «символ в кавычках или
-    экранирован». Шаблоны и скобки раскрывает только то, что вне кавычек."""
-    words: list[list[tuple[str, bool]]] = []
-    cur: list[tuple[str, bool]] = []
-    started = False
-    quote: str | None = None
-    i = 0
-    n = len(segment)
-    while i < n:
-        ch = segment[i]
-        if quote is None:
-            if ch == "\\" and i + 1 < n:
-                cur.append((segment[i + 1], True))
-                started = True
-                i += 2
-            elif ch in ("'", '"'):
-                quote = ch
-                started = True
-                i += 1
-            elif ch.isspace():
-                if started:
-                    words.append(cur)
-                    cur, started = [], False
-                i += 1
-            else:
-                cur.append((ch, False))
-                started = True
-                i += 1
-            continue
-        if ch == quote:
-            quote = None
-        elif quote == '"' and ch == "\\" and i + 1 < n and segment[i + 1] in '"\\$`':
-            cur.append((segment[i + 1], True))
-            i += 1
-        else:
-            cur.append((ch, True))
-        i += 1
-    if quote is not None:
-        return None
-    if started:
-        words.append(cur)
-    return words
-
-
-def _word_expands_to_secret(word: list[tuple[str, bool]]) -> bool:
-    """Скобки `{a,b}` и `{1..3}` вне кавычек собирают любое имя (`{.e,}nv`),
-    поэтому всегда карточка. Шаблон `*?[` опасен, если компонент пути
-    начинается с точки (`.en*`, `.e?v`, `.en[v]`: bash подставит `.env`, а
-    `*` скрытые файлы не берёт) или путь идёт в /proc (`/proc/*/environ`)."""
-    for k, (ch, q) in enumerate(word):
-        if ch == "{" and not q:
-            depth_text = ""
-            for ch2, q2 in word[k + 1:]:
-                if ch2 == "}" and not q2:
-                    if "," in depth_text or ".." in depth_text:
-                        return True
-                    break
-                depth_text += ch2 if not q2 else "\0"
-    if not any(ch in "*?[" and not q for ch, q in word):
-        return False
-    if "".join(ch for ch, _unused in word).startswith("/proc"):
-        return True
-    comp: list[tuple[str, bool]] = []
-    for ch, q in [*word, ("/", True)]:
-        if ch != "/":
-            comp.append((ch, q))
-            continue
-        if comp and comp[0][0] == "." and any(c in "*?[" and not cq for c, cq in comp):
-            return True
-        comp = []
-    return False
-
-
-def _segment_touches_secret(segment: str, cwd: str | None = None) -> bool:
-    """Секретные источники и цели ссылок проверяются без чтения содержимого
-    от каталога агента, как в danger (ревью 11.10.2026). grep с рекурсией и
-    rg по каталогу всегда идут на карточку (решение владельца 14.10.2026)."""
-    words = _bash_words(segment)
-    if words is None or any(_word_expands_to_secret(w) for w in words):
-        return True
-    try:
-        parts = shlex.split(segment)
-    except ValueError:
-        return True
-    for word in words:
-        raw = "".join(ch for ch, _unused in word)
-        if cwd and any(ch in "*?[" and not q for ch, q in word):
-            matches = glob.glob(raw, root_dir=cwd)
-            # Имя файла, похожее на ключ (`-r`), после раскрытия шаблона
-            # меняет смысл команды: `grep x *` становится рекурсивным
-            # (решение владельца 14.10.2026).
-            if any(m.startswith("-") for m in matches):
-                return True
-            if any(danger._secret_path(p, cwd) for p in matches) and not (
-                    parts and danger._program(parts[0]) in danger.METADATA_ONLY):
-                return True
-    return danger._reads_secret(parts, cwd) or danger._searches_tree(parts, cwd)
-
-
-def _bash_command_is_safe(command: str, *patterns: re.Pattern[str],
-                          cwd: str | None = None) -> bool:
-    """True если каждый сегмент команды fullmatch-ит хотя бы один из `patterns`,
-    не содержит опасных конструкций (substitution, redirection в файл), не
-    зовёт разрешённую команду с мутирующим флагом и не читает секрет
-    (`_segment_touches_secret`).
-
-    Безобидные standalone `2>/dev/null` / `2>&1` / `>/dev/null` стрипуются
-    до скана — они часто встречаются в диагностических командах.
-    `>/dev/null.evil` не стрипуется и остаётся запрещённым.
-    """
-    # Одна `;` в конце ничего не запускает, а пустой сегмент после неё слал
-    # карточкой целую читающую команду (разбор 20.10.2026). `\;` не снимается.
-    cmd = re.sub(r"(?<!\\);\s*$", "", command.strip()).rstrip()
-    # `\` с переводом строки bash склеивает по своим правилам: не разобрано.
-    if not cmd or danger.has_continuation(cmd):
-        return False
-    # Шаблон, ставший флагом, во всех каталогах, где команда может оказаться:
-    # сегменты ниже помнят один каталог после cd, а `(cd x); find *` идёт в
-    # исходном (ревью Codex 03.11.2026).
-    if _glob_hits_option(cmd, cwd or str(Path.cwd())):
-        return False
-    sanitized = _BASH_SAFE_REDIRECT_RE.sub("", cmd)
-    segments = _scan_bash_segments(sanitized)
-    if segments is None:
-        return False
-    current = cwd or str(Path.cwd())
-    moved = False
-    for seg in segments:
-        if not _segment_ok(seg, patterns, current):
-            return False
-        try:
-            parts = shlex.split(_unwrap_segment(seg.strip()) or "")
-        except ValueError:
-            return False
-        # После cd имена grep -r сверять не с чем: в `(cd x); grep -r k proj`
-        # bash каталог не сменил (ревью Opus 03.11.2026).
-        if moved and parts and danger._program(parts[0]) in _GREP_FAMILY \
-                and danger._searches_tree(["grep", *parts[1:]], None):
-            return False
-        if parts[:1] == ["cd"]:
-            moved = True
-            if len(parts) != 2 or parts[1].startswith("-"):
-                return False
-            current = str(Path(current, Path(parts[1]).expanduser()).resolve())
-    return True
-
-
-def _segment_ok(segment: str, patterns: tuple[re.Pattern[str], ...] | list[re.Pattern[str]],
-                cwd: str | None = None) -> bool:
-    """Сегмент без обёрток совпадает с одним из `patterns`, проходит разбор
-    аргументов и не трогает секретов."""
-    s = _unwrap_segment(segment.strip())
-    if not s:
-        return False
-    # После git -C пути чтения относятся к каталогу git, а не бота. Каталог
-    # берётся только у самого git после обёрток, а не у любого слова git
-    # в аргументах (ревью 11.10.2026).
-    head = segment.strip()
-    while m := _WRAPPER_RE.match(head):
-        head = head[m.end():]
-    if m := _GIT_C_RE.match(head):
-        try:
-            git_dir = shlex.split(m.group(0))[2]
-        except (ValueError, IndexError):
-            return False
-        cwd = str(Path(cwd or Path.cwd(), Path(git_dir).expanduser()).resolve())
-    return (
-        any(p.fullmatch(s) for p in patterns)
-        and _segment_args_are_safe(s, cwd)
-        and not _segment_touches_secret(s, cwd)
-    )
 
 
 # Вызов скилла бота из его же venv: `<repo>/.venv/bin/python -m
@@ -1644,10 +552,7 @@ def _segment_ok(segment: str, patterns: tuple[re.Pattern[str], ...] | list[re.Pa
 # сегментный разбор (`;`, `>`, `$(`, `$VAR`).
 # Скилл с внешним действием (письмо клиенту, сообщение от имени Ивана) в
 # claude_tg_bot.skills не класть: он прошёл бы без карточки.
-_SKILL_PYTHON = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"
-_SKILL_CALL_RE = re.compile(
-    re.escape(str(_SKILL_PYTHON)) + r" -m claude_tg_bot\.skills\.[a-z_]+(?: .*)?"
-)
+_SKILL_PYTHON = paths.VENV_PYTHON
 
 
 # Чтение общей памяти командой Свода. Без `remember` (пишет и публикует).
@@ -1657,172 +562,110 @@ _SKILL_CALL_RE = re.compile(
 # пропускаются только со штатным каталогом.
 _HOME_RE = rf"(?:~|{re.escape(str(Path.home()))})"
 _MEMORY_CONFIG_RE = rf"{_HOME_RE}/\.agent-memory-config/?"
-_MEMORY_READ_RE = re.compile(
-    rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/engine/bin/memory"
-    r" (?:(?:recall|search|why|index|explain)(?: .*)?|status(?: --(?:fetch|json))*"
-    r"|(?:[a-z]+ )?--help)"
-    rf"|export MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE}"
-)
 
 # Второе мнение Codex скиллом /2mind (решение Ивана 14.10.2026): остаток
 # лимита, имя модели и вызов обёрткой ask.py. Обёртка сама ставит Codex
-# песочницу `--sandbox read-only` и других его флагов не принимает. Прямой
-# `codex exec` без карточки только с `-s read-only` (serious._nested_agent,
-# guard3, Н1), прочие запуски Codex карточкой.
-# Скилл лежит в ~/.claude/skills, его правка идёт через карточку (danger).
+# песочницу `--sandbox read-only` и других его флагов не принимает. С
+# 04.11.2026 прочие запуски Codex и правка скилла идут без карточки (карточка
+# только на отправку людям); список нужен этапу плана и обдумыванию задачи.
 # Запрос к Codex только файлом прямо в state/2mind/ (туда Write без карточки,
 # `_whitelist_target_ok`): ответ и лог ask.py кладёт рядом с запросом, и
 # любой другой путь давал бы запись вне каталога (ревью Codex 14.10.2026).
 TWO_MIND_DIRNAME = "2mind"
-_TWO_MIND_RE = re.compile(
-    rf"python3 {_HOME_RE}/\.claude/skills/2mind/"
-    r"(?:codex_limits\.py|latest_sol\.py(?: --all)?"
-    rf"|ask\.py {re.escape(str(_SKILL_PYTHON.parents[2] / 'state' / TWO_MIND_DIRNAME))}/[A-Za-z0-9_-][A-Za-z0-9._-]*\.txt"
-    r"(?: --effort (?:medium|high|xhigh)| --fallback| --cd [^\s;&|<>`$]+)*)"
-)
-
-# Сетевая разведка без записи: состояние Tailscale и слушающие порты.
-_NET_READ_RE = re.compile(r"tailscale (?:status|ip|version)(?: .*)?|ss(?: -[ltunpaeHmio]+)*")
 
 
-def _bash_auto_allowed(command: str, bash_re: re.Pattern[str] | None,
-                       cwd: str | None = None) -> bool:
-    """Bash без карточки, пока человек в чате: сегменты из вызовов скиллов,
-    чтения памяти, встроенного списка чтения (`_EXTRA_READ_RE`) и команд
-    APPROVE_BASH_AUTO_ALLOW_REGEX (`bash_re`, если задан)."""
-    patterns = [_SKILL_CALL_RE, _MEMORY_READ_RE, _SYSTEM_READ_RE, _EXTRA_READ_RE, _NET_READ_RE,
-                _TWO_MIND_RE, _INFO_READ_RE]
-    if bash_re is not None:
-        patterns.append(bash_re)
-    return _bash_command_is_safe(command, *patterns, cwd=cwd)
+# Заявка на перезапуск бота из обдумывания темы задачи без карточки (решение
+# Ивана 04.11.2026). Сверка строки целиком, без разбора по сегментам и
+# срезания хвостов (совет Codex 04.11): `;`, `$(…)`, переменные впереди и
+# лишние флаги не проходят. Причина в двойных кавычках без `$`, обратной
+# кавычки, `\` и `"` либо в одинарных. Относительный `.venv/bin/python` только
+# после `cd` в репозиторий или из него. Полный путь ещё из каталога, где
+# python нечего импортировать: `python -m` ставит каталог запуска первым в
+# sys.path, и свой `httpx.py` или пакет `claude_tg_bot` рядом запустился бы
+# вместо бота (ревью Codex и /code-review 04.11). Путь к репозиторию
+# пишется полностью или через `~`, как в подсказке SELF_RESTART_HINT.
+_RESTART_ROOT = paths.BOT_ROOT
 
 
-# tasklist.exe Windows (из WSL) только про этот ПК: `/S`, `/U`, `/P` (чужая
-# машина, пароль в командной строке) и прочее идут карточкой. Разбор
-# 20.10.2026: обдумывание задачи слало карточкой каждый список процессов.
-_TASKLIST = "/mnt/c/Windows/System32/tasklist.exe"
-_TASKLIST_BOOL = frozenset({"/nh", "/v", "/svc", "/apps"})
-_TASKLIST_VALUE = frozenset({"/fi", "/fo"})
+def _home_forms(path: Path) -> str:
+    """Регулярка пути: полностью или через `~`, если путь в домашнем каталоге."""
+    forms = [re.escape(str(path))]
+    with contextlib.suppress(ValueError):
+        forms.append(re.escape("~/" + str(path.relative_to(Path.home()))))
+    return "(?:" + "|".join(forms) + ")"
 
 
-def _tasklist_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
-        return False
-    i = 1
-    while i < len(parts):
-        a = parts[i].lower()
-        if a in _TASKLIST_BOOL:
-            i += 1
-        elif a in _TASKLIST_VALUE and i + 1 < len(parts):
-            i += 2
-        elif a == "/m":
-            # `/M [модуль]`: необязательное имя модуля следующим словом.
-            i += 2 if i + 1 < len(parts) and not parts[i + 1].startswith("/") else 1
-        else:
-            return False
+# Причина отдельным словом или через `=`, в конце допускается ` 2>&1`;
+# `./.venv/bin/python` то же, что `.venv/bin/python` (ревью Opus 04.11.2026).
+_RESTART_TAIL = (r" -m claude_tg_bot\.restart_request --reason[ =]"
+                 r"""(?:"[^"$`\\\r\n]*"|'[^'\r\n]*')(?: 2>&1)?""")
+_RESTART_CD_RE = re.compile(
+    rf"cd {_home_forms(_RESTART_ROOT)}/? && "
+    rf"(?:(?:\./)?\.venv/bin/python|{_home_forms(_SKILL_PYTHON)}){_RESTART_TAIL}")
+_RESTART_REL_RE = re.compile(rf"(?:\./)?\.venv/bin/python{_RESTART_TAIL}")
+_RESTART_ABS_RE = re.compile(rf"{_home_forms(_SKILL_PYTHON)}{_RESTART_TAIL}")
+_IMPORTABLE_SUFFIXES = (".py", ".pyc", ".pyw", ".so", ".pyd")
+
+
+@functools.lru_cache(maxsize=1)
+def _shadowable_names() -> frozenset[str]:
+    """Имена верхнего уровня, которые заявка может импортировать: стандартная
+    библиотека, пакеты venv бота и сам `claude_tg_bot`. Свой `tests/` или
+    скрипт в чужом репозитории их не перекрывает и карточки не даёт (ревью Opus 04.11)."""
+    # Плюс то, что httpx и httpcore пробуют импортировать по желанию (ревью Opus 04.11).
+    names = set(sys.stdlib_module_names) | {"claude_tg_bot", "brotli", "brotlicffi", "zstandard",
+                                            "h2", "socksio", "trio", "click"}
+    for site in (_RESTART_ROOT / ".venv" / "lib").glob("python*/site-packages"):
+        with contextlib.suppress(OSError):
+            names.update(re.split(r"[.-]", p.name, maxsplit=1)[0] for p in site.iterdir())
+    return frozenset(names)
+
+
+def _nothing_to_import(here: Path) -> bool:
+    """В каталоге нет модуля или пакета, который `python -m` взял бы первым
+    вместо нужного заявке (sys.path начинается с каталога запуска)."""
+    shadowable = _shadowable_names()
+    with os.scandir(here) as entries:
+        for entry in entries:
+            name = entry.name
+            if name.startswith("claude_tg_bot"):
+                return False
+            if name.endswith(_IMPORTABLE_SUFFIXES):
+                module = name.split(".", 1)[0]
+            elif entry.is_dir() and any(init.endswith(_IMPORTABLE_SUFFIXES) for init in
+                                        glob.glob(glob.escape(entry.path) + "/__init__.*")):
+                module = name
+            else:
+                continue
+            if module in shadowable:
+                return False
     return True
 
 
-# iconv только в stdout: кодировки, `-c`, `-s`, `-l`. `-o`/`--output` пишет
-# файл, сокращения длинных флагов (`--out`, `--from`) и прочие флаги идут
-# карточкой. Входные файлы проверяет общий запрет секретов.
-_ICONV_BOOL = frozenset({"-c", "-s", "--silent", "-l", "--list", "--verbose"})
-_ICONV_VALUE = frozenset({"-f", "-t", "--from-code", "--to-code"})
-
-
-def _iconv_read_ok(parts: list[str], segment: str) -> bool:
-    if _has_unquoted_glob(segment):
+def _restart_request_ok(command: str, cwd: str | None) -> bool:
+    """Команда целиком это заявка на перезапуск бота в допустимой форме."""
+    if "\r" in command or "\n" in command:
         return False
-    i = 1
-    while i < len(parts):
-        a = parts[i]
-        if a == "--":
-            break
-        if a in _ICONV_BOOL:
-            i += 1
-        elif a.split("=", 1)[0] in ("--from-code", "--to-code") and "=" in a:
-            i += 1
-        elif a in _ICONV_VALUE:
-            i += 2
-        elif a[:2] in ("-f", "-t") and len(a) > 2:
-            i += 1
-        elif a.startswith("-") and a != "-":
-            return False
-        else:
-            i += 1
-    return True
-
-
-# Чтение этапа плана: свой неизменный список, без APPROVE_BASH_AUTO_ALLOW_REGEX
-# (настройка может разрешать и запись) и без вызовов скиллов бота (скилл
-# действует, а не читает). Ревью Codex 13.10.2026.
-# Сведения о программах и системе с разбором флагов: этап плана их пускает,
-# и в обычном чате они шли карточкой (аудит guard 31.10.2026).
-_INFO_READ = (
-    # Настройки serve/funnel только показом: `tailscale serve <порт>` публикует.
-    r"tailscale (?:serve|funnel) status(?: --json)?"
-    # Версия установленной программы: имя без пути, только `--version`
-    # (`npm version` и `-V` у части программ значат другое).
-    r"|[a-z][a-z0-9._+-]* --version"
-    # Справка верхнего уровня только у известных программ: произвольная
-    # программа или скрипт может не знать `--help` и сделать своё дело
-    # (`chrome-relay status --help` выполняет status, поэтому без подкоманд).
-    # Путь допустим только к каталогам установки, не к рабочим каталогам.
-    rf"|(?:(?:{_HOME_RE}/\.local|/usr(?:/local)?)/bin/)?"
-    r"(?:agent-browser|chrome-relay|tailscale|claude|codex|restic) --(?:help|version)"
-    # Список процессов Windows: флаги разбирает `_tasklist_read_ok`.
-    rf"|(?:{re.escape(_TASKLIST.rsplit('/', 1)[0])}/)?tasklist\.exe(?: .*)?"
-    # Перекодировка в stdout: флаги разбирает `_iconv_read_ok` (без `-o`).
-    r"|iconv(?: .*)?"
-)
-_INFO_READ_RE = re.compile(_INFO_READ)
-_PLAN_READ_RE = re.compile(
-    r"(?:ls|pwd|cd|find|fd|fdfind|tree|realpath|readlink|basename|dirname|whoami|date|hostname"
-    r"|uname|uptime|head|tail|wc|cat|grep|rg|jq|which|type|echo|file|stat|du|df|free|cut|sort"
-    r"|uniq|column|tr|true|false|journalctl)(?: .*)?"
-    r"|systemctl --user (?:status|is-active|is-failed|list-units|list-timers|cat)(?: .*)?"
-    r"|git (?:status|diff|log|show|branch|remote -v|ls-files|describe|stash list|grep)(?: .*)?"
-    r"|tailscale (?:status|ip|version)(?: .*)?|ss(?: -[ltunpaeHmio]+)*"
-    rf"|{_INFO_READ}"
-    # GitHub только чтением: подкоманды разбирают `_gh_read_ok` и
-    # `_gh_api_read_ok` (GET без полей и `--input`), как в обычном чате.
-    r"|gh (?:pr|issue|run|release|repo|api) .*"
-)
-
-
-# Читающий глагол первым словом (после имени сервиса): `mark_read` это
-# действие, `download_*` пишет файл, `export_chat_invite` создаёт ссылку.
-_PLAN_MCP_READ_RE = re.compile(
-    r"(?:(?:slack|github|grafana|gmail|notion|linear|jira|confluence|google)_)?"
-    r"(?:get|list|search|read|query|fetch|describe|find|view|show|count)(?:_[a-z0-9_]*)?"
-)
-
-
-def _plan_read_allowed(command: str, cwd: str | None = None, *, two_mind: bool = False) -> bool:
-    """Bash этапа плана: только чтение по `_PLAN_READ_RE` и чтению памяти.
-    Секреты и опасные аргументы (`find -delete`, `sort -o`) режет тот же разбор.
-    two_mind: ещё /2mind (`_TWO_MIND_RE`), у обдумывания темы задачи."""
-    patterns = [_PLAN_READ_RE, _MEMORY_READ_RE, _EXTRA_READ_RE] + ([_TWO_MIND_RE] if two_mind else [])
-    return _bash_command_is_safe(command, *patterns, cwd=cwd)
-
-
-# Отказ обдумывания темы задачи: запись файлов и отправка наружу до «Делай».
-_TASK_THINK_DENY = N_(
-    "обдумывание задачи: до «Делай» файлы не меняются и ничего не отправляется. Опиши "
-    "это действие в проекте решения, выполнение после «Делай» пойдёт в новой сессии по проекту."
-)
-
-# Запись файлов на этапе плана запрещена целиком, включая файл плана Claude
-# Code в ~/.claude/plans: план нужен ответом, а не файлом.
-_PLAN_WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+    if _RESTART_CD_RE.fullmatch(command):
+        return True
+    rel = bool(_RESTART_REL_RE.fullmatch(command))
+    if not cwd or not (rel or _RESTART_ABS_RE.fullmatch(command)):
+        return False
+    try:
+        here = Path(cwd).resolve()
+        if here == _RESTART_ROOT.resolve():
+            return True
+        return not rel and _nothing_to_import(here)
+    except (OSError, ValueError):
+        return False
 
 
 # Запись памяти Свода из рана с человеком в чате. Тело записи бот кладёт
 # файлом в state/memory-drafts/ (запись туда идёт по whitelist путей), а
 # здесь пропускается только `memory remember --file <черновик>`: тело через
 # `<<'EOF'` и `<(...)` разбор сегментов не принимает, и это к лучшему.
-# Область global (контракт всех сессий) остаётся на карточке: внедрённый
-# чужим текстом «закон» иначе молча попал бы в каждую будущую сессию.
+# Область global и манифест заметки не получают и идут обычным allow:default
+# (с 04.11.2026 карточка только на отправку людям).
 _MEMORY_WRITE_RE = re.compile(
     rf"(?:MEMORY_CONFIG_DIR={_MEMORY_CONFIG_RE} )?{_HOME_RE}/src/svod/engine/bin/memory remember(?: .*)?"
 )
@@ -1905,23 +748,18 @@ def _remember_args(parts: list[str], segment: str, drafts: Path | None) -> dict[
     }
 
 
-def memory_write_auto_allowed(
-    command: str, bash_re: re.Pattern[str] | None, drafts: Path,
-) -> list[dict[str, str]] | None:
-    """Команда с `memory remember`, которую можно пропустить без карточки:
+def memory_write_auto_allowed(command: str, drafts: Path) -> list[dict[str, str]] | None:
+    """Команда с `memory remember`, о которой бот пишет «💾 подаю в память»:
     каждый вызов remember подаёт черновик из `drafts` в personal или
-    clients/<имя>, а остальные сегменты проходят те же правила, что у
-    `_bash_auto_allowed`. Возвращает разобранные вызовы для уведомления,
-    иначе None."""
+    clients/<имя>. Прочие сегменты команды с 04.11.2026 не проверяются: без
+    карточки идёт всё, кроме отправки людям. Возвращает разобранные вызовы
+    для уведомления, иначе None (тогда обычный allow:default)."""
     cmd = command.strip()
     if not cmd:
         return None
     segments = _scan_bash_segments(_BASH_SAFE_REDIRECT_RE.sub("", cmd))
     if segments is None:
         return None
-    patterns = [_SKILL_CALL_RE, _MEMORY_READ_RE, _SYSTEM_READ_RE, _EXTRA_READ_RE]
-    if bash_re is not None:
-        patterns.append(bash_re)
     calls: list[dict[str, str]] = []
     for seg in segments:
         s = seg.strip()
@@ -1936,30 +774,7 @@ def memory_write_auto_allowed(
             if info is None:
                 return None
             calls.append(info)
-            continue
-        if not _segment_ok(s, patterns):
-            return None
     return calls or None
-
-
-# Чтение коннектора Todoist поимённо (24.10.2026): у него имена через дефис,
-# и общий глагольный шаблон их не узнаёт, а расширять его нельзя:
-# `analyze-project-health` с дефисом прошёл бы, а он пишущий (ревью Codex).
-# Только сервер claude_ai_Todoist; ран по чужому тексту Todoist не читает
-# (его нет в UNTRUSTED_MCP_READ_SERVERS).
-_TODOIST_SERVER = "claude_ai_Todoist"
-_TODOIST_READ_TOOLS = frozenset({
-    "find-activity", "find-comments", "find-completed-tasks", "find-filters", "find-labels",
-    "find-project-collaborators", "find-projects", "find-reminders", "find-sections",
-    "find-tasks", "find-tasks-by-date", "get-overview", "get-productivity-stats",
-    "get-project-activity-stats", "get-workspace-insights", "fetch", "fetch-object", "search",
-    "user-info", "list-workspaces", "view-attachment",
-})
-
-
-def _todoist_read(tool_name: str) -> bool:
-    parts = tool_name.split("__", 2)
-    return len(parts) == 3 and parts[0] == "mcp" and parts[1] == _TODOIST_SERVER and parts[2] in _TODOIST_READ_TOOLS
 
 
 # MCP-инструменты, где чтение от записи отличает аргумент, а не имя: Grafana
@@ -1983,16 +798,6 @@ def _untrusted_tool_allowed(tool_name: str, tool_input: dict[str, Any], mcp_re: 
         return False
     short_tool = tool_name.split("__", 2)[-1]
     return bool(mcp_re is not None and mcp_re.fullmatch(short_tool)) or _mcp_args_readonly(short_tool, tool_input)
-
-
-def _unattended_auto_allowed(is_unattended: bool, permission_mode: str) -> bool:
-    """Фоновый ран (/at, /event с wake, скилл по таймеру) решается без
-    карточки: её никто не ждёт, и ран упирается в свой таймаут (правило Ивана
-    14.09.2026). Plan-режим сюда не входит: /plan запускает человек у
-    телефона, и до ✅ действия идут через карточку, а плановому скиллу plan
-    служит песочницей, и неразрешённое ему отклоняется в конце handle_approve.
-    Пустой permission_mode (CLI его не прислал) не даёт отличить plan."""
-    return is_unattended and permission_mode not in ("", "plan")
 
 
 AGENT_MODELS = frozenset({"haiku", "sonnet", "opus"})
@@ -2090,445 +895,7 @@ def _chat_auto_allowed(
     return target is not None and target_key in keys
 
 
-# Чтение без карточки (решение Ивана 29.10.2026: карточка на изменение и
-# отправку, а не на чтение). Мало разбора danger.py: его обработчики пускают
-# незнакомые подкоманды (`git branch x`, `docker context use`, `env -S...`),
-# поэтому каждая программа команды ещё сверяется со списком читающих ниже
-# (ревью Codex 29.10). Незнакомое идёт карточкой, как раньше.
-_READ_PLAIN = frozenset({
-    "ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "wc", "cut", "tr", "sort",
-    "jq", "diff", "cmp", "stat", "du", "df", "free", "pwd", "cd", "date", "whoami",
-    "hostname", "uname", "uptime", "which", "type", "echo", "printf", "true", "false", "test",
-    "[", "realpath", "readlink", "basename", "dirname", "ps", "pgrep", "base64", "od",
-    "hexdump", "strings", "md5sum", "sha256sum", "column", "nl", "paste", "comm", "seq",
-    "find", "tree", "rtk", ":", "id", "groups", "nproc", "lscpu", "lsblk", "findmnt",
-    "locale", "getent", "zcat", "zgrep", "journalctl", "sleep",
-    # Аудит 31.10.2026: запись у xxd (второй операнд) и file -C разбор danger
-    # красит, они идут карточкой.
-    "file", "xxd", "lsof", "netstat",
-    # Сведения о системе (П2 из guard-2.md, задание guard2): только показ.
-    "w", "who", "last", "vmstat", "iostat", "lsusb", "lspci", "printenv",
-    # Обёртка: флаги разбирает danger._tracer_command, вложенную команду проверяет этот же список.
-    "strace", "ltrace",
-})
-# Пакеты и сеансы только показом, флаги списком: `--index-url`, `--registry`,
-# `--userconfig` уводят запрос или настройки, `-H` на другую машину.
-_READ_PKG = {
-    ("pip", "list"): frozenset({"-o", "--outdated", "-u", "--uptodate", "-l", "--local", "--user",
-                                "-e", "--editable", "--not-required", "--format=json",
-                                "--format=columns", "--format=freeze"}),
-    ("pip", "show"): frozenset({"-f", "--files", "-v", "--verbose"}),
-    ("pip", "freeze"): frozenset({"--all", "-l", "--local", "--user"}),
-    ("npm", "ls"): frozenset({"--all", "-a", "--json", "--long", "-l", "--parseable", "-p",
-                              "--global", "-g", "--depth=0", "--depth=1", "--depth=2"}),
-    ("npm", "list"): frozenset({"--all", "-a", "--json", "--long", "-l", "--parseable", "-p",
-                                "--global", "-g", "--depth=0", "--depth=1", "--depth=2"}),
-    ("npm", "view"): frozenset({"--json"}),
-    ("loginctl", "list-sessions"): frozenset({"--no-pager", "--no-legend"}),
-    ("loginctl", "list-users"): frozenset({"--no-pager", "--no-legend"}),
-    ("resolvectl", "status"): frozenset({"--no-pager"}),
-}
-# Присваивания перед командой, которые ничего не пишут и не запускают:
-# GIT_TRACE=файл пишет, HOME или XDG_CONFIG_HOME подменяют конфиг с командами.
-_READ_ASSIGN_OK = frozenset({"TZ", "LC_ALL", "LANG", "LC_MESSAGES", "RTK_DISABLED", "NO_COLOR"})
-# Секрет в выводе или в запросе: переменная с секретным именем и файлы с
-# ключами, которых разбор danger.py не знает (ревью 29.10.2026).
-_READ_SECRETISH_RE = re.compile(
-    r"\$\{?[A-Za-z_]*(?:TOKEN|KEY|SECRET|PASS|AUTH|CRED|COOKIE|SESSION)[A-Za-z_0-9]*"
-    r"|\.claude\.json|ssh_host_\w*key|wireguard|\.my\.cnf|bitwarden|\.age/|/sops/|k3s\.yaml"
-    r"|kubernetes/admin\.conf|k3s/server/token|\.msmtprc|gcloud|tfstate|service-account"
-    r"|\.netrc|\.pgpass|\.npmrc|\.pypirc|\.docker/config\.json|credentials|token\.json",
-    re.IGNORECASE)
-# Переменная в аргументах раскрывается после проверки: `sort $FLAGS f` при
-# FLAGS='-o x' пишет файл (ревью Codex 29.10). Пускаем только безобидные.
-_READ_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
-_READ_VARS_OK = danger.PLAIN_VARS
-# printf '%n' VAR присваивает переменной, как -v (ревью Codex 29.10).
-_PRINTF_ASSIGN_RE = re.compile(r"%[-+ #0-9.*]*n")
-_READ_SUB = {
-    "git": frozenset({"log", "status", "diff", "show", "blame", "rev-parse", "ls-files",
-                      "ls-tree", "cat-file", "grep", "describe", "shortlog", "rev-list",
-                      "merge-base", "show-ref", "count-objects"}),
-    # docker inspect и systemctl cat/show показывают окружение со значениями
-    # секретов, kubectl cluster-info dump пишет файлы (ревью 29.10.2026).
-    "docker": frozenset({"ps", "logs", "images", "version", "info", "port", "top"}),
-    "systemctl": frozenset({"status", "is-active", "is-enabled", "is-failed",
-                            "list-units", "list-timers", "list-unit-files"}),
-    "kubectl": frozenset({"get", "describe", "logs", "top", "version", "explain",
-                          "api-resources"}),
-}
-_DOCKER_COMPOSE_READ = frozenset({"ps", "logs", "ls", "version", "images", "top"})
-_GH_READ_GROUPS = frozenset({"pr", "issue", "run", "repo", "release", "workflow"})
-_GH_READ_ACTIONS = frozenset({"view", "list", "diff", "checks", "status"})
-# Флаги, которые у git запускают программы или пишут файлы.
-# `git -p` здесь не нужен: до подкоманды пускаем только -C и --no-pager, а
-# после неё -p это обычный `git log -p`.
-# `-c` до подкоманды отсекает проверка общих флагов ниже, после неё это
-# счёт и сводный дифф (аудит guard 31.10.2026).
-_GIT_UNSAFE = ("--config-env", "--exec-path", "--output", "-O", "--open-files-in-pager",
-               "--ext-diff", "--textconv", "--paginate")
-# `git ls-remote` только показывает ссылки; `--upload-pack` запускает программу.
-_GIT_LS_REMOTE_FLAGS = frozenset({"--heads", "--tags", "--refs", "--branches", "-h", "-t", "-b",
-                                  "-q", "--quiet", "--get-url", "--symref"})
-# git grep за пределами отслеживаемого читает `.env`, сокращения git принимает.
-_GIT_READS_UNTRACKED = ("--no-index", "--untracked")
-# curl без записи и отправки: только эти флаги (короткие можно склеивать).
-_READ_CURL_SAFE_SHORT = frozenset("sSLIifvk")
-_READ_CURL_SAFE_LONG = frozenset({"--silent", "--show-error", "--location", "--head", "--include",
-                             "--fail", "--verbose", "--insecure", "--compressed"})
-_READ_CURL_VALUE = frozenset({"-m", "--max-time", "--connect-timeout", "-w", "--write-out", "-H",
-                         "--header", "-A", "--user-agent", "--retry"})
-
-
-def _words(args: list[str], value_flags: frozenset[str] = frozenset()) -> list[str]:
-    out, skip = [], False
-    for a in args:
-        if skip:
-            skip = False
-        elif a in value_flags:
-            skip = True
-        elif not a.startswith("-"):
-            out.append(a)
-    return out
-
-
-def _curl_args_read_ok(args: list[str]) -> bool:
-    skip = False
-    for i, a in enumerate(args):
-        if skip:
-            skip = False
-        elif a in _READ_CURL_VALUE:
-            skip = True
-            if args[i + 1:i + 2] and args[i + 1].startswith("@"):
-                return False  # -w @файл, -H @файл: содержимое файла не проверено
-        elif a.startswith("--"):
-            name = a.split("=", 1)[0]
-            if name in _READ_CURL_VALUE and "=" in a:
-                if a.split("=", 1)[1].startswith("@"):
-                    return False
-                continue
-            if a not in _READ_CURL_SAFE_LONG:
-                return False
-        elif a.startswith("-") and len(a) > 1:
-            if not set(a[1:]) <= _READ_CURL_SAFE_SHORT:
-                return False
-        elif any(c in a for c in "{}[]") or not _curl_url_ok(a):
-            return False  # curl раскрывает `{a,localhost}` сам, как в `_curl_read_ok`
-    return True
-
-
-def _read_program_ok(prog: str, args: list[str]) -> bool:
-    if prog == "=":
-        return args[0].split("=", 1)[0] in _READ_ASSIGN_OK
-    if prog == "printf" and any(a.startswith("-v") or _PRINTF_ASSIGN_RE.search(a) for a in args):
-        return False  # printf -v 'BASH_CMDS[ls]' и %n присваивают (ревью Codex 13.10, 29.10)
-    if prog == "sort" and any(danger.long_flag(a, "--compress-program", 5)
-                              or danger.long_flag(a, "--temporary-directory", 4)
-                              or (a.startswith("-") and not a.startswith("--") and "T" in a)
-                              for a in args):
-        return False  # сокращение --compress-program и временные файлы в чужом каталоге
-    if prog in _READ_PLAIN:
-        return True
-    if prog == "uv" and args[:1] == ["pip"]:
-        prog, args = "pip", args[1:]
-    if prog in ("pip", "pip3", "npm", "loginctl", "resolvectl") and args:
-        allowed = _READ_PKG.get(("pip" if prog == "pip3" else prog, args[0]))
-        if prog == "npm" and args[0] == "view" and not all(
-                re.fullmatch(r"(?:@[\w.-]+/)?\w[\w.-]*(?:@[\w.^~<>=*-]+)?", a) for a in args[1:] if not a.startswith("-")):
-            return False  # адрес, путь или git вместо имени пакета: npm пойдёт туда
-        return allowed is not None and all(a in allowed or not a.startswith("-") for a in args[1:])
-    if prog in ("timedatectl", "hostnamectl"):
-        # Действия красит danger; `--host` и `--machine` уводят на другую машину.
-        return not any((a.startswith(("--h", "--m")) and a != "--help")
-                       or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & {"H", "M"})
-                       for a in args)
-    if prog == "sed":
-        return _sed_args_read_ok(args)
-    if prog == "git":
-        if any(a == f or a.startswith(f + "=") for a in args for f in _GIT_UNSAFE):
-            return False
-        if any(danger.long_flag(a, flag, 6) for a in args for flag in _GIT_READS_UNTRACKED):
-            return False
-        # До подкоманды только -C и --no-pager: прочие общие флаги берут
-        # значение (`git --namespace log config x y` выполняет config).
-        rest = list(args)
-        while rest and rest[0].startswith("-"):
-            if rest[0] == "-C" and len(rest) > 1:
-                rest = rest[2:]
-            elif rest[0] in ("--no-pager", "-P"):
-                rest = rest[1:]
-            else:
-                return False
-        if rest[:1] == ["ls-remote"]:
-            # Только имя настроенного удалённого: адрес в команде это сеть
-            # мимо `_curl_url_ok`, в том числе локальная (ревью слияния 01.11.2026).
-            # `--get-url` печатает адрес и в сеть не ходит.
-            words = [a for a in rest[1:] if not a.startswith("-") and "--get-url" not in rest]
-            return (all(a in _GIT_LS_REMOTE_FLAGS or a.startswith("--sort=") or not a.startswith("-")
-                        for a in rest[1:])
-                    and (not words or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", words[0]) is not None))
-        if rest[:1] in (["tag"], ["stash"], ["worktree"]):
-            return danger.git_listing(rest[0], rest[1:])
-        if rest[:1] == ["reflog"]:
-            # Только показ: подкоманды drop, write, expire, delete меняют журнал.
-            return rest[1:2] == ["show"] or not rest[1:] or rest[1].startswith("-")
-        return bool(rest) and rest[0] in _READ_SUB["git"]
-    if prog == "gh":
-        if any(a in ("-w", "--web") or a.startswith("--web=") for a in args):
-            return False
-        words = _words(args, frozenset({"-R", "--repo", "--jq", "-q", "-t", "--template",
-                                        "-H", "--header", "-L", "--limit", "-s", "--state",
-                                        "--json", "-A", "--author", "-b", "--branch"}))
-        if words[:1] == ["api"]:
-            return True
-        return len(words) >= 2 and words[0] in _GH_READ_GROUPS and words[1] in _GH_READ_ACTIONS
-    if prog == "docker" and any(a.startswith("--host") or (a.startswith("-H") and a != "-H") for a in args):
-        return False  # чужой демон
-    if prog == "docker" and _words(args)[:1] == ["compose"]:
-        if any("://" in a for a in args):
-            return False  # файл compose по адресу: чужое содержимое
-        words = _words(args, frozenset({"-f", "--file", "-p", "--project-name"}))
-        return len(words) >= 2 and words[1] in _DOCKER_COMPOSE_READ
-    if prog == "kubectl" and any(a.startswith(("--kubeconfig", "--raw", "--server"))
-                                 or (a.startswith("-s") and not a.startswith("--"))
-                                 or "secret" in a.lower() for a in args):
-        return False  # exec-плагин kubeconfig; секреты кластера; `--server` унёс бы токен на чужой адрес
-    if prog in _READ_SUB:
-        words = _words(args, frozenset({"-n", "--namespace", "-o", "--output", "-l",
-                                        "--selector", "--tail", "--since", "-p", "--property",
-                                        "--format", "-f"}) if prog != "git" else frozenset())
-        return bool(words) and words[0] in _READ_SUB[prog]
-    if prog == "curl":
-        return _curl_args_read_ok(args)
-    return False
-
-
-def _mask_single_quoted(command: str) -> str:
-    """Текст в одинарных кавычках заменён на `x`; в двойных `$` раскрывается
-    и остаётся как есть."""
-    out: list[str] = []
-    quote: str | None = None
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if quote == "'":
-            if ch == "'":
-                quote = None
-                out.append(ch)
-            else:
-                out.append("x")
-        elif ch == "\\" and i + 1 < len(command):
-            out.append(command[i:i + 2])
-            i += 2
-            continue
-        else:
-            if ch == '"':
-                quote = None if quote == '"' else '"'
-            elif ch == "'" and quote is None:
-                quote = "'"
-            out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _glob_hits_option(command: str, cwd: str | None) -> bool:
-    """Шаблон вне кавычек раскроется в имя, похожее на флаг: bash делает это
-    после проверки, и `find *` в каталоге с файлом `-fprint` затирает
-    соседний файл списком (аудит 31.10.2026, проверено). Без каталога агента
-    раскрытие не проверить, значит карточка. Операторы оболочки вне кавычек
-    заменены пробелами, чтобы `find *|head` дал слово `*`."""
-    mask = danger._quote_mask(command)
-    plain = "".join(" " if m == c and c in ";|&()<>" else c for m, c in zip(mask, command))
-    words = _bash_words(plain)
-    if words is None:
-        return True
-    # После `cd` bash раскрывает шаблон в другом каталоге: `cd sub; find *`
-    # с файлом `-delete` в sub (ревью Codex 03.11.2026, было и раньше).
-    # Проверяются все каталоги, где команда могла оказаться: удался cd или
-    # нет, в подоболочке он или нет. Каталог не узнать: карточка.
-    dirs = {cwd} if cwd else set()
-    unknown = not cwd
-    prev = ""
-    for word in words:
-        raw = "".join(ch for ch, _unused in word)
-        if prev in ("cd", "pushd"):
-            dirs.add(str(Path.home()))
-            # Кавычки, `~` и скобки bash раскрывает не так, как expanduser:
-            # `cd '~/sub'` и `cd {sub,}` (ревью Codex 03.11.2026).
-            if raw in ("-", "") or raw.startswith("-") or any(c in raw for c in "$`*?[~{},") \
-                    or any(quoted for _ch, quoted in word):
-                unknown = True
-            else:
-                dirs |= {os.path.normpath(os.path.join(d, os.path.expanduser(raw))) for d in dirs}
-        unknown = unknown or raw == "popd"
-        prev = raw
-        if not any(ch in "*?[" and not quoted for ch, quoted in word):
-            continue
-        if unknown:
-            return True
-        for d in dirs:
-            try:
-                matches = glob.glob(os.path.expanduser(raw), root_dir=d)
-            except (OSError, ValueError):
-                return True
-            if any(m.startswith("-") for m in matches):
-                return True
-    return False
-
-
-# Цикл целиком: `for x in слова; do тело; done`, за ним только конвейер. Слова
-# без подстановок, кавычки только парой вокруг всего слова. Разбор по маске
-# кавычек; перевод строки, `#` и `\\` разобрали бы оболочка и этот разбор
-# по-разному, такие циклы идут карточкой. Имя строчными: `for PATH in ./bin`
-# меняет, откуда запускаются программы тела.
-_FOR_LOOP_RE = re.compile(
-    r"for ([a-z]\w*) in ([^;]+?)\s*;\s*do\s+(.+?)\s*;\s*done"
-    r"(?:\s+2>/dev/null)?(?:\s*\|\s*(?P<pipe>.+))?")
-_FOR_WORD_RE = re.compile(r"[\w./@%+,:=-]+")
-_FOR_GLOB_RE = re.compile(r"[\w./@%+,:=*?-]+")
-# `cd` сдвинул бы каталог между проходами мимо проверки шаблонов; сеть вынесла бы
-# значения цикла (имена файлов) наружу обычным чтением.
-_FOR_INNER_RE = re.compile(r"\b(?:for|while|until|do|done|select|eval|cd|pushd|popd"
-                           r"|curl|wget|dig|host|nslookup|ping|gh|ssh|nc|ncat|kubectl|docker|git)\b")
-_FOR_MAX_STEPS = 64
-_FOR_ANY_RE = re.compile(r"\b(?:for|select)\s+\w+\s+in\b")
-
-
-def _for_loop_steps(command: str, cwd: str | None) -> list[str] | None:
-    """Цикл `for` с простым телом как обычные команды: тело с подставленным
-    значением на каждый проход и конвейер после `done`, каждую проверяет
-    `_danger_read_ok` как есть, с секретами и флагами в значениях. None: не
-    такой цикл, карточка. Значения только из безобидных знаков: подстановка
-    в кавычках и без них даёт одно и то же слово. Шаблон раскрывается здесь;
-    файл с другими знаками в имени цикл не пропускает. Имя переменной в теле
-    вне `$x` и `${x}` значит присваивание (`f=.env`, `read f`)."""
-    text = command.strip()
-    # В одинарных кавычках оболочка ничего не разбирает: `tr '\n' ' '` и `'#'`
-    # там просто знаки (карточка 03.11.2026).
-    if any(c in _mask_single_quoted(text) for c in "\n#\\"):
-        return None
-    m = _FOR_LOOP_RE.fullmatch(danger._quote_mask(text))
-    if m is None or m.group(1).endswith("_proxy") or _FOR_INNER_RE.search(m.group(3)):
-        return None
-    name, words, body = m.group(1), text[m.start(2):m.end(2)], text[m.start(3):m.end(3)]
-    use = re.compile(rf"\$(?:{name}\b|\{{{name}\}})")
-    if re.search(rf"\b{name}\b", use.sub("", body)):
-        return None
-    if len(use.findall(_mask_single_quoted(body))) != len(use.findall(body)):
-        return None  # `sed '$e'`: оболочка значение не подставит, проверка бы подставила
-    values: list[str] = []
-    for word in words.split():
-        quoted = len(word) > 2 and word[0] == word[-1] and word[0] in "'\""
-        if quoted:
-            word = word[1:-1]
-        if _FOR_WORD_RE.fullmatch(word):
-            values.append(word)
-        elif quoted or not _FOR_GLOB_RE.fullmatch(word):
-            return None
-        else:
-            values.extend(sorted(glob.glob(word, root_dir=cwd or os.getcwd())) or [word])
-    if not values or len(values) > _FOR_MAX_STEPS or not all(_FOR_GLOB_RE.fullmatch(v) for v in values):
-        return None
-    steps = [use.sub(value, body) for value in values]
-    return [*steps, text[m.start("pipe"):]] if m.group("pipe") else steps
-
-
-# Цикл звеном цепочки: `cd x; find . | head; for f in a b; do …; done; ls`.
-# До и после него только `;`, `&&` или край команды; конвейер после `done`
-# такой разбор не берёт.
-_FOR_IN_SEQ_RE = re.compile(
-    r"(?:^|(?<=;)|(?<=&&))\s*for [a-z]\w* in [^;]+?\s*;\s*do\s+.+?\s*;\s*done"
-    r"(?=\s*(?:;|&&|$))")
-
-
-def _unroll_loop_in_sequence(command: str, cwd: str | None) -> str | None:
-    """Первый цикл цепочки развёрнут в команды прохода (`_for_loop_steps`),
-    остальное как есть: проверка чтения смотрит цепочку целиком, с `cd` до
-    цикла и переменными. None: не такой цикл, карточка. Шаблон в значениях
-    после `cd` раскрылся бы не там, где проверяется, такое тоже None."""
-    mask = danger._quote_mask(command)
-    m = _FOR_IN_SEQ_RE.search(mask)
-    if m is None:
-        return None
-    loop = command[m.start():m.end()].strip()
-    if command[:m.start()].strip() == "" and command[m.end():].strip() == "":
-        return None  # цикл целиком: его разбирает _for_loop_steps
-    words = loop.split(";", 1)[0].split(" in ", 1)[1]
-    if re.search(r"\b(?:cd|pushd|popd)\b", mask[:m.start()]) and glob.has_magic(words):
-        return None
-    steps = _for_loop_steps(loop, cwd)
-    if not steps:
-        return None
-    # Скобки держат `&&` после done за всем циклом, как в bash (/code-review).
-    return f"{command[:m.start()]} {{ {' ; '.join(steps)} ; }} {command[m.end():]}"
-
-
-def _danger_read_ok(command: str, cwd: str | None = None) -> bool:
-    """Команда только читает: разбор danger.py не нашёл записи, запуска
-    незнакомого и отправки, секрет она не трогает, и каждая её программа из
-    списка читающих (`_read_program_ok`). Замер по 686 карточкам с апреля:
-    среди 198 команд уровня «опасного не нашёл» изменений и отправок нет."""
-    if danger.has_continuation(command):
-        return False
-    if _READ_SECRETISH_RE.search(command):
-        return False
-    loop = _for_loop_steps(command, cwd)
-    if loop:
-        return all(_danger_read_ok(step, cwd) for step in loop)
-    unrolled = _unroll_loop_in_sequence(command, cwd)
-    if unrolled is not None:
-        return _danger_read_ok(unrolled, cwd)
-    if _FOR_ANY_RE.search(danger._quote_mask(command)):
-        return False  # цикл, который разбор выше не взял: его переменные меняют чужое
-    # Внутри одинарных кавычек `$` не раскрывается: `sed -n '$p'` и
-    # `awk '{print $1}'` не переменные (аудит 31.10.2026).
-    unquoted = _mask_single_quoted(command)
-    used = {m.group(1) for m in _READ_VAR_RE.finditer(unquoted)}
-    if used - _READ_VARS_OK:
-        return False
-    # Значение задано в самой команде: `LANG=-delete; find . $LANG`,
-    # `for HOME in -delete; do find . $HOME; done` (ревью слияния 01.11.2026).
-    if used and re.search(rf"\b(?:{'|'.join(sorted(used))})=|\bfor\s+(?:{'|'.join(sorted(used))})\b", unquoted):
-        return False
-    # `${PWD@P}` раскрывает значение как приглашение, с $(…) из имени каталога;
-    # прочие операторы тоже не нужны чтению (аудит guard 31.10.2026).
-    if re.search(r"\$\{(?![A-Za-z_][A-Za-z0-9_]*\})", command):
-        return False
-    # ANSI-C и локализованные кавычки: shlex их не раскрывает (ревью Codex 29.10).
-    # По маске кавычек: `grep 'foo$' f` это конец шаблона, а не такая кавычка.
-    mask = danger._quote_mask(command)
-    if "$'" in mask or '$"' in mask:
-        return False
-    try:
-        verdict = danger.classify("Bash", {"command": command}, cwd)
-    except Exception:
-        log.exception("danger.classify failed in read check")
-        return False
-    if verdict.level != danger.YELLOW or verdict.secret or not verdict.programs:
-        return False
-    if {"strace", "ltrace"} & {prog for prog, _args in verdict.programs} and not all(
-            prog in _READ_PLAIN for prog, _args in verdict.programs):
-        return False  # в вывод попало бы чтение настроек: kubeconfig, .git/config
-    if _glob_hits_option(command, cwd):
-        return False
-    if _searches_tree(verdict, command, cwd):
-        return False  # обход дерева читает `.env` (решение владельца 14.10.2026)
-    if any(prog == "git" and _planted_git_dir(_git_start_dir(args, step_cwd))
-           for prog, args, step_cwd in _steps(verdict, cwd)):
-        return False
-    return all(_read_program_ok(prog, args) for prog, args in verdict.programs)
-
-
-def _touches_secret(tool_name: str, tool_input: dict, cwd: str | None) -> bool:
-    """Команда или правка может прочитать или записать секрет (danger.Verdict.secret).
-    Такое автоаппрув чата и выполнение задачи не пропускают: идёт карточкой
-    (находка Codex 15.10.2026: chat-auto стоял раньше проверок секретов)."""
-    if tool_name not in ("Bash", "Monitor", "Write", "Edit", "MultiEdit", "NotebookEdit"):
-        return False
-    return danger.classify(tool_name, tool_input, cwd).secret
-
-
-_BOT_ROOT = Path(__file__).resolve().parents[2]
+_BOT_ROOT = paths.BOT_ROOT
 
 
 def _whitelist_target_ok(target: Path, state_dir: Path) -> bool:
@@ -2628,156 +995,6 @@ def _whitelist_hit(tool_name: str, tool_input: dict[str, Any], cfg: Config) -> b
             and _whitelist_target_ok(target_path, cfg.state_dir))
 
 
-# Метки danger.py, с которыми действие и при одобренном плане идёт карточкой.
-_PLAN_CARD_TAGS = frozenset({danger.DELETE, danger.HISTORY, danger.PUBLISH, danger.POWER,
-                             danger.DISK, danger.GUARD, danger.FETCH_EXEC, danger.UNPARSED})
-
-
-def _absolute(word: str, cwd: str | None) -> str | None:
-    path = os.path.expanduser(danger._HOME_VAR_RE.sub(lambda _m: str(Path.home()), word))
-    if path.startswith("/"):
-        return path
-    return os.path.join(cwd, path) if cwd else None
-
-
-def _steps(verdict: danger.Verdict, cwd: str | None) -> Iterator[tuple[str, list[str], str | None]]:
-    """Программы команды с их каталогом: cd и pushd меняют его следующим звеньям."""
-    for prog, args in verdict.programs:
-        yield prog, args, cwd
-        if prog in ("cd", "pushd"):
-            target = next((a for a in args if a == "-" or not a.startswith("-")), "~")
-            cwd = None if target == "-" else _absolute(target, cwd)
-
-
-# rg без пути после конвейера читает поток, а не каталог: `ps aux | rg bot`.
-# `||` не конвейер: `true || rg foo` ищет по текущему каталогу (корпус guard2, 11.2026).
-_PIPED_RG_RE = re.compile(r"(?<!\|)\|(?!\|)&?\s*(?:rtk\s+(?:proxy\s+rg|rg|grep)|rg)\b")
-
-
-def _searches_tree(verdict: danger.Verdict, command: str, cwd: str | None) -> bool:
-    piped = len(_PIPED_RG_RE.findall(danger._quote_mask(command)))
-    moved = False
-    for prog, args, step_cwd in _steps(verdict, cwd):
-        if prog in ("rg", "ripgrep") and piped and danger._rg_roots(args) == ["."]:
-            piped -= 1
-        elif danger._searches_tree(
-                ["grep" if prog == "zgrep" else prog, *args],
-                # `(cd x); grep -r k proj` и `true || cd x; …`: bash каталог не
-                # сменил, а _steps сменил. После cd имена grep -r сверять не с
-                # чем (ревью Opus 03.11.2026).
-                None if moved and prog in _GREP_FAMILY else step_cwd):
-            return True
-        moved = moved or prog in ("cd", "pushd", "popd")
-    return False
-
-
-_GREP_FAMILY = frozenset({"grep", "egrep", "fgrep", "zgrep"})
-
-
-_SSH_VALUE_FLAGS = frozenset({"-p", "-i", "-l", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-b", "-c",
-                              "-E", "-e", "-I", "-m", "-O", "-Q", "-S", "-w", "-B"})
-_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", "(", ")", ";;"})
-
-
-def _ssh_stdin_hosts(command: str) -> set[str]:
-    """Хосты ssh, которым команда отдаёт данные на вход: конвейером (`tar …
-    | ssh host 'cat > f'`) или перенаправлением (`ssh host psql < dump.sql`).
-    Это то же копирование на хост, что scp, и по плану без карточки идёт
-    только на названный в нём хост (аудит 31.10.2026)."""
-    tokens = danger._tokenize(danger._newlines_to_separators(command))
-    if tokens is None:
-        return set()
-    hosts: set[str] = set()
-    seg: list[str] = []
-    fed_by_pipe = False
-    for tok in [*tokens, ";"]:
-        if tok not in _SHELL_SEPARATORS:
-            seg.append(tok)
-            continue
-        words = [t for t in seg if not danger._ASSIGN_RE.match(t)] if seg else []
-        has_input = any(t in ("<", "<<", "<<<", "<>") for t in seg)
-        # ssh не обязательно первым словом: `env ssh`, `timeout 5 ssh`. Разбирается
-        # каждое такое слово: в `env -u ssh ssh host` первое это значение флага.
-        starts = [k for k, w in enumerate(words) if danger._program(w) in ("ssh", "autossh")]
-        for start in starts if fed_by_pipe or has_input else ():
-            i = start + 1
-            while i < len(words):
-                a = words[i]
-                if a in _SSH_VALUE_FLAGS:
-                    i += 2
-                elif a.startswith("-"):
-                    i += 1
-                else:
-                    m = danger._REMOTE_RE.match(a + ":")
-                    hosts.add((m.group(1) if m else a).lower())
-                    break
-        fed_by_pipe = tok in ("|", "|&")
-        seg = []
-    return hosts
-
-
-def _named_in_plan(remote: str, plan_text: str) -> bool:
-    return bool(remote) and re.search(rf"(?<![\w.-]){re.escape(remote)}(?![\w-]|\.\w)", plan_text, re.IGNORECASE) is not None
-
-
-def _plan_card_tags(tool_name: str, tool_input: dict[str, Any], cwd: str | None,
-                    plan_text: str = "") -> set[str]:
-    """Почему действие при одобренном плане всё равно идёт карточкой; пусто:
-    шаг плана, без карточки. Действия во внешних сервисах (MCP) карточкой
-    всегда: письмо, приглашение, удаление там не отличить от шага работы.
-    Копирование на хост или в бакет, названные в тексте плана, это шаг работы,
-    на неназванные это отправка наружу.
-    Перечень не полон: программа или скрипт проекта могут удалить и
-    отправить что угодно, и разбор этого не увидит (ревью Codex 29.10)."""
-    if tool_name.startswith("mcp__"):
-        return {"mcp"}
-    if tool_name == "WebFetch":
-        # Адреса, которые и без плана идут карточкой: localhost, IP, служебные.
-        return set() if _curl_url_ok(str(tool_input.get("url", ""))) else {"url"}
-    try:
-        verdict = danger.classify(tool_name, tool_input, cwd)
-        tags = verdict.tags & _PLAN_CARD_TAGS
-        if tool_name in ("Bash", "Monitor") and verdict.level != danger.YELLOW and _names_guarded(verdict, cwd):
-            # Любая не читающая команда над кодом, ключами или настройками бота:
-            # `sed -i`, `perl -pi`, `git apply` разбор правкой не видит (ревью 29.10).
-            tags.add(danger.GUARD)
-        if tool_name in ("Bash", "Monitor") and _searches_tree(
-                verdict, str(tool_input.get("command", "")), cwd):
-            tags.add("tree")
-        remotes = set(verdict.remotes)
-        if tool_name in ("Bash", "Monitor"):
-            remotes |= _ssh_stdin_hosts(str(tool_input.get("command", "")))
-        if any(not _named_in_plan(r, plan_text) for r in remotes):
-            tags.add("remote")
-    except Exception:
-        log.exception("plan: danger.classify failed tool=%s", tool_name)
-        return {"error"}
-    return tags
-
-
-def _names_guarded(verdict: danger.Verdict, cwd: str | None) -> bool:
-    for _prog, args, step_cwd in _steps(verdict, cwd):
-        for arg in args:
-            for word in (arg, arg.split("=", 1)[-1]):
-                if not word or word.startswith("-"):
-                    continue
-                path = _absolute(word, step_cwd)
-                if path is not None and danger._protected_path(path):
-                    return True
-    return False
-
-
-def _calls_bot_skill(command: str) -> bool:
-    """Команда упоминает скилл бота после снятия кавычек оболочкой
-    (`ski""lls` иначе прошёл бы, ревью Codex 29.10). Неразборчивое считается
-    упоминанием."""
-    try:
-        words = shlex.split(command, comments=False)
-    except ValueError:
-        return True
-    return any("claude_tg_bot.skills" in w or "claude_tg_bot/skills" in w for w in words)
-
-
 CARD_SEND_TIMEOUT = 30
 
 
@@ -2793,13 +1010,10 @@ async def send_approval_request(
     plan = pending.tool_input.get(PLAN_CARD_KEY)
     if isinstance(plan, dict):
         text = (_("📋 <b>План</b>") + "\n\n" + _esc(str(plan.get("text") or "")) + "\n\n<i>"
-                + _("✅: остальные шаги этого запуска без карточек. Карточкой остаются удаление "
-                    "данных, история git и push, отправка наружу, секреты, перезагрузка, "
-                    "внешние сервисы и правка механизма подтверждений.") + "</i>")
+                + _("✅: остальные шаги этого запуска без карточек. Карточкой остаётся только "
+                    "отправка людям.") + "</i>")
     else:
         text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
-    if pending.customer == "change":
-        text = _("✏️ <b>изменение на сервере заказчика</b>: окно ⏩ его не пропускает") + "\n" + text
     if pending.origin_key:
         text = _("🛠 <b>Мастерская</b>") + "\n" + text
     try:
@@ -2822,30 +1036,29 @@ async def send_approval_request(
         # ли ещё вопрос, и узнавал о сроке новым сообщением (ux.md 10).
         mins = max(1, round((pending.deadline - time.time()) / 60))
         text += "\n\n" + _("⌛ жду до {until} ({mins} мин), потом отказ").format(
-            until=time.strftime("%H:%M", time.localtime(pending.deadline)), mins=mins)
+            until=clock(pending.deadline), mins=mins)
     rows = [[
-        InlineKeyboardButton("✅ Approve", callback_data=f"appr:{pending.approval_id}:allow"),
-        InlineKeyboardButton("❌ Deny", callback_data=f"appr:{pending.approval_id}:deny"),
+        {"text": "✅ Approve", "data": f"appr:{pending.approval_id}:allow"},
+        {"text": "❌ Deny", "data": f"appr:{pending.approval_id}:deny"},
     ]]
     if isinstance(plan, dict):
         rows = [[
-            InlineKeyboardButton(_("✅ Делай план"), callback_data=f"appr:{pending.approval_id}:allow"),
-            InlineKeyboardButton(_("❌ Не надо"), callback_data=f"appr:{pending.approval_id}:deny"),
+            {"text": _("✅ Делай план"), "data": f"appr:{pending.approval_id}:allow"},
+            {"text": _("❌ Не надо"), "data": f"appr:{pending.approval_id}:deny"},
         ]]
     # ⏩ burst-кнопки показываем для всех инструментов (см. _BURST_DENY_TOOLS):
     # окно auto-approve по решению Ивана покрывает любые действия.
     # Отправке от имени Ивана окно не положено: каждая идёт своей карточкой.
     if (pending.tool_name not in _BURST_DENY_TOOLS and not outbound.is_send(pending.tool_name)
             and outbound.MAILSEND_CARD_KEY not in pending.tool_input and not isinstance(plan, dict)
-            and pending.customer != "change" and not pending.sends):
+            and not pending.sends):
         rows.append([
-            InlineKeyboardButton("⏩ 15m", callback_data=f"appr:{pending.approval_id}:auto15"),
-            InlineKeyboardButton("⏩ 1h", callback_data=f"appr:{pending.approval_id}:auto60"),
+            {"text": "⏩ 15m", "data": f"appr:{pending.approval_id}:auto15"},
+            {"text": "⏩ 1h", "data": f"appr:{pending.approval_id}:auto60"},
         ])
     if needs_full_view(pending.tool_input, pending.tool_name):
-        rows.append([InlineKeyboardButton(
-            _("📄 Полностью"), callback_data=f"apprfull:{pending.approval_id}")])
-    kb = InlineKeyboardMarkup(rows)
+        rows.append([{"text": _("📄 Полностью"), "data": f"apprfull:{pending.approval_id}"}])
+    kb = buttons.markup(rows)
     pending.card_keyboard = keyboard_rows(kb)
     # Текст и разметка до ответа Telegram: если ответа нет (таймаут чтения),
     # на ✅ сверка идёт с ними, сущности из этой разметки допустимы
@@ -2947,20 +1160,10 @@ async def _mark_card_timeout(application: Application, pending: Pending, chat_id
     тихим сообщением ответом на карточку."""
     line = _("⌛ без ответа {mins} мин: отказ").format(mins=max(1, round(wait_sec / 60)))
     mid = pending.telegram_message_id
-    card = pending.card_html
-    if mid is not None and card and len(card) + len(line) + 2 <= TELEGRAM_TEXT_LIMIT:
-        try:
-            await application.bot.edit_message_text(
-                chat_id=chat_id, message_id=mid, text=f"{card}\n\n{line}",
-                parse_mode="HTML", reply_markup=None)
-            return
-        except Exception:
-            log.warning("approval card timeout edit failed aid=%s, reply instead",
-                        pending.approval_id, exc_info=True)
+    if mid is not None and await buttons.note_on_card(
+            application.bot, pending.card_html, line, f"timeout aid={pending.approval_id}", chat_id, mid):
+        return
     try:
-        if mid is not None:
-            await application.bot.edit_message_reply_markup(
-                chat_id=chat_id, message_id=mid, reply_markup=None)
         await application.bot.send_message(
             chat_id=chat_id, text=line, message_thread_id=thread_id,
             disable_notification=True,
@@ -3016,14 +1219,6 @@ CARD_TIMEOUT_HINT = N_("Иван не ответил на карточку за 
 CARD_CHANGED = "deny:card-changed"
 CARD_CHANGED_HINT = N_("карточка в Telegram изменена не ботом (текст или кнопки), ✅ не принят: не правь "
                        "сообщения бота, повтори вызов, если он нужен")
-# Изменение на сервере заказчика без пояснения: отказ без карточки (проект 03.11.2026, п. 6).
-CUSTOMER_DESCRIPTION_MIN = 40
-CUSTOMER_DESCRIPTION_HINT = N_("на сервере заказчика опиши в description, что меняешь, зачем и как откатить "
-                               "(не короче {n} знаков), и повтори вызов")
-# Изменение на сервере заказчика из фонового рана: отказ без карточки, как
-# отправка. Известное чтение причины не даёт и в фоне идёт без карточки.
-CUSTOMER_UNATTENDED_HINT = N_("фоновый ран: изменения у заказчика не делай, опиши в отчёте, что и зачем; "
-                              "сделает живой ран после «ок» Ивана")
 
 
 def _self_restart_refusal(tool_name: str, tool_input: dict) -> str | None:
@@ -3144,7 +1339,12 @@ async def handle_approve(request: web.Request) -> web.Response:
     # отказы по виду команды к нему не относятся (_plan_request проверил форму).
     plan_req = _plan_request(tool_name, tool_input)
     plan_call = plan_req is not None and plan_req[0] == "ok"
+    # Заявка в допустимой форме ничего, кроме себя, не запускает: слова
+    # `systemctl restart claude-tg-bot` в её причине не повод для отказа (ревью Codex 04.11).
     self_stop = None if plan_call else _self_restart_refusal(tool_name, tool_input)
+    if self_stop and tool_name == "Bash" and await asyncio.to_thread(
+            _restart_request_ok, str(tool_input.get("command", "")), cwd):
+        self_stop = None
     if self_stop:
         aid = uuid.uuid4().hex[:12]
         log.info("approve deny aid=%s tool=%s target=%s (self-restart)", aid, tool_name, target_key)
@@ -3171,15 +1371,8 @@ async def handle_approve(request: web.Request) -> web.Response:
         return web.json_response({"decision": "deny", "reason": guarded})
     # Отправка от имени Ивана мимо всех автоаппрувов ниже: решает outbound.decide.
     sending = outbound.is_send(tool_name)
-    # Этап плана (/plan и задачи до ✅): только чтение. Признак берётся и из
-    # режима, присланного хуком, и из метки бота на сессии (plan_stage_sids):
-    # режим CLI может прийти пустым. Читающее разрешается здесь, остальное
-    # отказом, без карточки и мимо всех автоаппрувов ниже: в сессии плана
-    # бывает чужой текст источника (ревью Codex 13.10.2026).
-    plan_sids: set[str] = application.bot_data.get("plan_stage_sids") or set()
-    plan_stage = permission_mode == "plan" or (bool(session_id) and session_id in plan_sids)
     exec_sids: set[str] = application.bot_data.get("task_exec_sids") or set()
-    # Запрос карточки плана: раньше этапа плана и всех автоаппрувов, иначе вызов
+    # Запрос карточки плана: раньше всех автоаппрувов, иначе вызов
     # скилла прошёл бы без карточки (_SKILL_CALL_RE, окно ⏩). Сам вызов прав
     # не даёт; где план не положен, отказ с пояснением (ревью Codex 29.10).
     plan_text = ""
@@ -3188,12 +1381,11 @@ async def handle_approve(request: web.Request) -> web.Response:
         if plan_req[0] == "bad":
             why_not = plan_req[1]
         elif not cfg.plan_cards:
-            why_not = _("план не нужен: шаги идут без карточек, карточка только на опасное "
-                        "(удаление каталогов, отправка людям, серверы заказчиков, защита бота). "
-                        "Делай, что просил Иван")
-        elif not run_id or target is None or is_unattended or plan_stage:
+            why_not = _("план не нужен: шаги идут без карточек, карточка только на отправку "
+                        "людям. Делай, что просил Иван")
+        elif not run_id or target is None or is_unattended:
             why_not = _("карточка плана здесь не выдаётся (фоновый ран, этап плана или режим "
-                        "выключен): действуй по обычным правилам, каждое изменение карточкой")
+                        "выключен): действуй по обычным правилам, карточка только на отправку людям")
         elif (session_id in exec_sids
               or _chat_auto_allowed(target, target_key, cfg.approve_auto_chat_keys)):
             why_not = _("план не нужен: в этом чате действия уже разрешены")
@@ -3206,56 +1398,6 @@ async def handle_approve(request: web.Request) -> web.Response:
             )
             return web.json_response({"decision": "deny", "reason": why_not})
         plan_text = plan_req[1]
-    # Обдумывание темы задачи с Иваном у карточек (переделка 18.10.2026): то
-    # же чтение, плюс /2mind; прочее, кроме записи файлов и отправки наружу,
-    # идёт карточкой мимо всех автоаппрувов ниже (force_card), а не отказом;
-    # открытое Иваном окно ⏩ её пускает (решение Ивана 29.10.2026).
-    # В сессии бывает чужой текст: whitelist путей, вызов скиллов, окно ⏩ и
-    # regex Bash его обходили бы (ревью Codex 18.10).
-    think_sids: set[str] = application.bot_data.get("task_think_sids") or set()
-    task_think = (plan_stage and bool(session_id) and session_id in think_sids
-                  and not is_unattended and target is not None)
-    force_card = False
-    if plan_stage:
-        if tool_name == "Bash":
-            command = str(tool_input.get("command", ""))
-            ok = await asyncio.to_thread(_plan_read_allowed, command, cwd)
-            if not ok and task_think:
-                ok = await asyncio.to_thread(_plan_read_allowed, command, cwd, two_mind=True)
-            if not ok and not is_unattended:
-                ok = await asyncio.to_thread(_danger_read_ok, command, cwd)
-        elif tool_name == "Write" and task_think:
-            # Только новый файл запроса: Edit по нему уже не /2mind (ревью Codex 18.10).
-            target_path = _target_path(tool_name, tool_input)
-            ok = target_path is not None and _two_mind_request(target_path, cfg.state_dir)
-        elif tool_name == "WebFetch":
-            ok = _curl_url_ok(str(tool_input.get("url", "")))
-        elif tool_name.startswith("mcp__") and not sending:
-            # Свой список читающих глаголов: настройка MCP_AUTO_ALLOW_REGEX
-            # может разрешать и запись (ревью Codex 13.10).
-            short_tool = tool_name.split("__", 2)[-1]
-            ok = (bool(_PLAN_MCP_READ_RE.fullmatch(short_tool)) or _mcp_args_readonly(short_tool, tool_input)
-                  or _todoist_read(tool_name))
-        else:
-            ok = False
-        force_card = not ok and task_think and tool_name not in _PLAN_WRITE_TOOLS and not sending
-    if plan_stage and not force_card:
-        aid = uuid.uuid4().hex[:12]
-        log.info("approve %s aid=%s tool=%s (plan-stage)", "allow" if ok else "deny", aid, tool_name)
-        await asyncio.to_thread(
-            _audit, audit_path, approval_id=aid, tool_name=tool_name,
-            tool_input=tool_input, decision="allow:plan-read" if ok else "deny:plan-stage",
-        )
-        if ok:
-            return web.json_response({"decision": "allow", "reason": "plan:read"})
-        if task_think:
-            return web.json_response({"decision": "deny", "reason": _(_TASK_THINK_DENY)})
-        return web.json_response({
-            "decision": "deny",
-            "reason": _("этап плана: до одобрения плана только чтение. Файлы не меняются, "
-                        "команды с записью не выполняются; план пиши в ответ. Если для плана "
-                        "нужна эта команда, назови её владельцу словами."),
-        })
     # Письмо модулем mailsend: карточка отправки, как у Gmail MCP
     # (outbound.MAILSEND_CARD_KEY). Снимок письма считает только бот, поле из входа
     # агента отбрасывается.
@@ -3267,47 +1409,29 @@ async def handle_approve(request: web.Request) -> web.Response:
                 outbound.mailsend_check, str(tool_input.get("command", "")), cwd)
         if mail_kind in ("card", "mention", "deny"):
             sending = True
-            if force_card and mail_kind != "deny":
-                # Письмо распознаётся только здесь: до «Делай» отправки нет и
-                # карточкой (ревью Codex 18.10).
-                return web.json_response({"decision": "deny", "reason": _(_TASK_THINK_DENY)})
-    # Модель «разрешено всё, кроме опасного» (решение Ивана 03.11.2026): без
-    # карточки любое действие, кроме пяти классов serious.py; опасное идёт
-    # карточкой мимо всех автоаппрувов ниже, кроме окна ⏩. Чужой текст, этап
-    # плана, перезапуск бота и общие данные решены выше и сюда не доходят.
-    # На обдумывании задачи (force_card) тоже: вид сервера заказчика и отправка
-    # мимо карточки отправки решают окно ⏩ и пояснение (ревью 03.11.2026).
+    # Карточка только на отправку людям (решение Ивана 04.11.2026,
+    # docs/design-2026-11-04-system-boundaries.md): удаление, push, сервер
+    # заказчика, вложенный агент, правка защиты и секрет без карточки; причина
+    # отправки идёт карточкой мимо всех автоаппрувов ниже. Чужой текст,
+    # перезапуск бота и общие данные решены выше и сюда не доходят. С
+    # 04.11.2026 замка «только чтение» нет нигде: ни в обдумывании задачи, ни в
+    # /plan (Write и Edit там не выполняет сам CLI), ни в проверке «позже».
     danger_why: set[str] = set()
     if not sending and not plan_text:
         danger_why = await asyncio.to_thread(
-            serious.reasons, tool_name, tool_input, cwd,
-            customer_hosts=getattr(cfg, "approve_customer_hosts", ()),
+            serious.send_reasons, tool_name, tool_input, cwd,
             telegram_port=getattr(cfg, "telegram_mcp_port", 8770))
-    customer = serious.customer_kind(danger_why)
     # Отправка людям мимо карточки отправки (сервер Telegram на loopback,
-    # внешний сервис) и сервер заказчика из фонового рана: отказ сразу,
-    # карточка ждала бы без человека весь срок (решение Ивана 03.11.2026).
-    # Известное чтение у заказчика причины не даёт и сюда не попадает.
+    # внешний сервис) из фонового рана: отказ сразу, карточка ждала бы без
+    # человека весь срок (решение Ивана 03.11.2026).
     outward = serious.sends(danger_why)
-    if is_unattended and (outward or customer == "change"):
-        decision = "deny:outbound-unattended" if outward else "deny:customer-unattended"
+    if is_unattended and outward:
         aid = uuid.uuid4().hex[:12]
-        log.info("approve deny aid=%s tool=%s target=%s (%s)", aid, tool_name, target_key, decision)
+        log.info("approve deny aid=%s tool=%s target=%s (deny:outbound-unattended)", aid, tool_name, target_key)
         await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
-                                tool_input=tool_input, decision=decision, why=sorted(danger_why))
-        return web.json_response({"decision": "deny", "reason": _(outbound.UNATTENDED_HINT) if outward
-                                  else _(CUSTOMER_UNATTENDED_HINT)})
-    # Изменение на сервере заказчика: карточка показывает пояснение агента,
-    # без него Иван решать не должен. Короткое или пустое: отказ без карточки.
-    if customer == "change" and len(str(tool_input.get("description") or "").strip()) < CUSTOMER_DESCRIPTION_MIN:
-        aid = uuid.uuid4().hex[:12]
-        log.info("approve deny aid=%s tool=%s target=%s (customer change without description)",
-                 aid, tool_name, target_key)
-        await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
-                                tool_input=tool_input, decision="deny:customer-description",
+                                tool_input=tool_input, decision="deny:outbound-unattended",
                                 why=sorted(danger_why))
-        return web.json_response({"decision": "deny", "reason": _(CUSTOMER_DESCRIPTION_HINT).format(
-            n=CUSTOMER_DESCRIPTION_MIN)})
+        return web.json_response({"decision": "deny", "reason": _(outbound.UNATTENDED_HINT)})
     # Отправка от имени Ивана: себе без карточки, отказ с причиной (пересылка,
     # письмо не уйдёт, фоновый ран, путь файла) или карточка мимо всех
     # автоаппрувов ниже (outbound.decide).
@@ -3322,20 +1446,12 @@ async def handle_approve(request: web.Request) -> web.Response:
                                     tool_input=tool_input, decision=verdict.audit)
             return web.json_response({"decision": verdict.decision, "reason": verdict.reason})
     with_human = target is not None and not is_unattended
-    secret = await asyncio.to_thread(_touches_secret, tool_name, tool_input, cwd)
-    if (not sending and not force_card and not plan_text and not danger_why
-            # Фоновый ран секрет по-прежнему не трогает без карточки: человека рядом
-            # нет, а ключ в заголовке ушёл бы куда угодно (ревью Opus 03.11.2026).
-            # Живой чат, в том числе чат Домового, читает секрет без карточки:
-            # принятый риск (guard3, Н6, docs/audit-2026-11/guard3-decisions.md).
-            and not (is_unattended and secret)
-            and (with_human or _unattended_auto_allowed(is_unattended, permission_mode))
+    if (not sending and not plan_text and not danger_why
             # Запись в whitelist идёт своей веткой ниже, с заметкой «✍️» в футере хода.
             and not (with_human and _whitelist_hit(tool_name, tool_input, cfg))
             # Запись в память идёт своей веткой ниже, с уведомлением «💾 подаю в память».
             and not (tool_name == "Bash" and not is_unattended and memory_write_auto_allowed(
-                str(tool_input.get("command", "")), cfg.bash_auto_allow_re,
-                cfg.state_dir / MEMORY_DRAFTS_DIRNAME))):
+                str(tool_input.get("command", "")), cfg.state_dir / MEMORY_DRAFTS_DIRNAME))):
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (default)", aid, tool_name, target_key)
         await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
@@ -3345,12 +1461,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # Чат с автоаппрувом по умолчанию (APPROVE_AUTO_CHAT_KEYS): без карточек
     # вообще, включая unattended-раны. Только для зарегистрированной сессии
     # (target известен): primary-fallback чужой сессии сюда не попадает.
-    # Живой ран такого чата с секретом сюда не доходит: allow:default выше
-    # пускает чтение секрета в любом живом чате (решение Ивана по guard3, Н6,
-    # docs/audit-2026-11/guard3-decisions.md); вынести его можно только
-    # отправкой людям или в сеть, а это причины serious.py. Здесь остаётся
-    # фоновый ран этого чата: секрет у него идёт дальше, на карточку.
-    if not force_card and not sending and not secret and not straight and _chat_auto_allowed(
+    if not sending and not straight and _chat_auto_allowed(
             target, target_key, cfg.approve_auto_chat_keys):
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (chat-auto)", aid, tool_name, target_key)
@@ -3364,10 +1475,10 @@ async def handle_approve(request: web.Request) -> web.Response:
         )
         return web.json_response({"decision": "allow", "reason": "chat:auto"})
     # Ран выполнения задачи после «Делай» Ивана: права выдаются этому рану, а
-    # не теме (bot.py ставит и снимает метку по sid). Секреты, отправка от
+    # не теме (bot.py ставит и снимает метку по sid). Отправка от
     # имени Ивана и перезапуск бота идут своими путями выше и ниже (ревью
     # Codex 15.10: опасный шаг получает свою карточку, остальное идёт).
-    if not sending and not secret and not straight and target is not None and session_id and session_id in exec_sids:
+    if not sending and not straight and target is not None and session_id and session_id in exec_sids:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-allow aid=%s tool=%s target=%s (task-exec)", aid, tool_name, target_key)
         await asyncio.to_thread(
@@ -3380,54 +1491,12 @@ async def handle_approve(request: web.Request) -> web.Response:
         )
         return web.json_response({"decision": "allow", "reason": "task:exec"})
 
-    # Одобренный план этого запуска (runs.plan_for): шаг работы без карточки.
-    # Отправка от имени Ивана, секреты и действия с метками _plan_card_tags идут
-    # дальше, на карточку; запрос нового плана тоже (ревью Codex 29.10).
-    grant = (runs.plan_for(session_id)
-             if target is not None and not is_unattended and not force_card and not plan_text
-             and not straight else None)
-    if grant is not None and tool_name == "Bash" and memory_write_auto_allowed(
-            str(tool_input.get("command", "")), cfg.bash_auto_allow_re, cfg.state_dir / MEMORY_DRAFTS_DIRNAME):
-        # Запись в память идёт своей веткой ниже, с уведомлением «💾 подаю в память».
-        grant = None
-    if grant is not None and not sending and not secret:
-        card_tags = await asyncio.to_thread(_plan_card_tags, tool_name, tool_input, cwd, grant.text)
-        if not card_tags:
-            aid = uuid.uuid4().hex[:12]
-            log.info("approve auto-allow aid=%s tool=%s target=%s (plan %s)",
-                     aid, tool_name, target_key, grant.plan_aid)
-            await asyncio.to_thread(
-                _audit, audit_path, approval_id=aid, tool_name=tool_name,
-                tool_input=tool_input, decision="allow:plan", plan=grant.plan_aid,
-            )
-            return web.json_response({"decision": "allow", "reason": "plan"})
-
-    # Фоновый ран (/at, /event с wake, скилл по таймеру): без карточки, см.
-    # _unattended_auto_allowed. Источники свои: /at пишет сам Иван, /event
-    # принимается только с loopback и только JSON (_reject_browser_forgery), с
-    # X-Approve-Token при секрете, скилл запускает код бота (SCHEDULED_ENV).
-    if not sending and not secret and not straight and _unattended_auto_allowed(is_unattended, permission_mode):
-        aid = uuid.uuid4().hex[:12]
-        log.info("approve auto-allow aid=%s tool=%s target=%s (unattended)", aid, tool_name, target_key)
-        await asyncio.to_thread(
-            _audit,
-            audit_path,
-            approval_id=aid,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            decision="allow:unattended",
-        )
-        return web.json_response({"decision": "allow", "reason": "unattended"})
-
     burst_eligible = (
         target is not None and not is_unattended and tool_name not in _BURST_DENY_TOOLS
         and not sending
-        # Скиллы бота (task_new заводит тему и запускает ран) до «Делай» только
-        # карточкой: окно обдумывания для проверок, не для действий бота.
-        and not (force_card and _calls_bot_skill(str(tool_input.get("command", ""))))
         and not plan_text
-        # Изменение на сервере заказчика и отправку людям окно не пропускает.
-        and customer != "change" and not outward
+        # Отправку людям окно не пропускает.
+        and not outward
     )
     if burst_eligible and time.time() < burst_until:
         aid = uuid.uuid4().hex[:12]
@@ -3441,7 +1510,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             approval_id=aid,
             tool_name=tool_name,
             tool_input=tool_input,
-            decision="allow:burst:secret" if secret else "allow:burst",
+            decision="allow:burst",
         )
         return web.json_response({"decision": "allow", "reason": "burst"})
 
@@ -3454,7 +1523,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     # допускает запись аргументами внешне безобидных команд (`sort -o`,
     # `git branch -D`). Пока человек в чате — это осознанный размен на удобство;
     # для /at, /event и plan-ранов размена нет, там всё через карточку.
-    whitelist = () if is_unattended or force_card or straight else cfg.approve_whitelist_paths
+    whitelist = () if is_unattended or straight else cfg.approve_whitelist_paths
     if whitelist:
         target_path = _target_path(tool_name, tool_input)
         if (
@@ -3491,44 +1560,10 @@ async def handle_approve(request: web.Request) -> web.Response:
                 log.exception("failed to send whitelist auto-approve notification")
             return web.json_response({"decision": "allow", "reason": "whitelist"})
 
-    # Bash auto-allow по regex: пользователь явно разрешил readonly-команды,
-    # чтобы не получать approve-карточки на каждый ls/grep/journalctl. Pattern
-    # настраивается через APPROVE_BASH_AUTO_ALLOW_REGEX. Mutating-команды
-    # (restart/push/rm и т.п.) специально не покрываются — они продолжают идти
-    # через approve. Notification в чат намеренно НЕ шлём: цель именно убрать
-    # шум; видимость сохраняется через audit decision="allow:bash-safe".
-    # Сюда же вызовы скиллов бота (_SKILL_CALL_RE). Для plan-рана ничего из этого.
-    if tool_name == "Bash" and not is_unattended and not sending and not force_card and not plan_text \
-            and not straight:
+    # Запись в память: без карточки, с уведомлением «💾 подаю в память».
+    if tool_name == "Bash" and not is_unattended and not sending and not plan_text and not straight:
         cmd = str(tool_input.get("command", ""))
-        # Проверка раскрывает шаблоны и смотрит файлы: в отдельном потоке,
-        # чтобы медленная файловая система не держала остальные запросы бота.
-        if await asyncio.to_thread(_bash_auto_allowed, cmd, cfg.bash_auto_allow_re, cwd=cwd):
-            aid = uuid.uuid4().hex[:12]
-            log.info("approve auto-allow aid=%s tool=Bash cmd=%s (regex)", aid, cmd[:80])
-            await asyncio.to_thread(
-                _audit,
-                audit_path,
-                approval_id=aid,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                decision="allow:bash-safe",
-            )
-            return web.json_response({"decision": "allow", "reason": "bash:safe"})
-        if await asyncio.to_thread(_danger_read_ok, cmd, cwd):
-            aid = uuid.uuid4().hex[:12]
-            log.info("approve auto-allow aid=%s tool=Bash cmd=%s (danger-read)", aid, cmd[:80])
-            await asyncio.to_thread(
-                _audit,
-                audit_path,
-                approval_id=aid,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                decision="allow:danger-read",
-            )
-            return web.json_response({"decision": "allow", "reason": "bash:read"})
-        calls = memory_write_auto_allowed(
-            cmd, cfg.bash_auto_allow_re, cfg.state_dir / MEMORY_DRAFTS_DIRNAME)
+        calls = memory_write_auto_allowed(cmd, cfg.state_dir / MEMORY_DRAFTS_DIRNAME)
         if calls:
             aid = uuid.uuid4().hex[:12]
             log.info("approve auto-allow aid=%s tool=Bash cmd=%s (memory-write)", aid, cmd[:80])
@@ -3561,54 +1596,9 @@ async def handle_approve(request: web.Request) -> web.Response:
                     log.exception("failed to send memory-write notification")
             return web.json_response({"decision": "allow", "reason": "memory:write"})
 
-    # MCP auto-allow: read-only инструменты (get/list/search/read/query...)
-    # проходят без карточки — иначе mcp__* в hook-matcher душил бы карточками
-    # и чтение из чата, и unattended-скиллы (Gmail/Slack-чекеры по таймеру).
-    # Мутирующие (send/create/delete/update...) не матчатся и идут через
-    # approve. Notification не шлём (как у bash-safe): видимость через audit.
-    # MCP-чтение оставляем и для unattended: разбор внешнего события без
-    # чтения бесполезен, а мутирующие MCP под дефолтный regex не подпадают.
-    mcp_re = cfg.mcp_auto_allow_re
-    if tool_name.startswith("mcp__") and mcp_re is not None and not sending and not force_card and not straight:
-        # Имя без префикса mcp__<server>__: сервер-часть содержит UUID/дефисы
-        # и в regex ей делать нечего.
-        short_tool = tool_name.split("__", 2)[-1]
-        if mcp_re.fullmatch(short_tool) or _mcp_args_readonly(short_tool, tool_input) or _todoist_read(tool_name):
-            aid = uuid.uuid4().hex[:12]
-            log.info("approve auto-allow aid=%s tool=%s (mcp-readonly)", aid, tool_name)
-            await asyncio.to_thread(
-                _audit,
-                audit_path,
-                approval_id=aid,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                decision="allow:mcp-readonly",
-            )
-            return web.json_response({"decision": "allow", "reason": "mcp:readonly"})
-
-    # WebFetch auto-allow: пользователь явно разрешил поиск в интернете глобально.
-    # Read-only по природе (никаких записей/команд). Notification в чат намеренно
-    # НЕ шлём: при многошаговом research'е (3-5 fetch'ей подряд) уведомления
-    # спамят. Видимость через audit decision="allow:webfetch". Адрес тот же,
-    # что у curl без карточки (`_curl_url_ok`): публичное доменное имя по
-    # http(s); localhost, IP-литералы и имена вида nip.io идут на карточку.
-    if tool_name == "WebFetch" and not straight and _curl_url_ok(str(tool_input.get("url", ""))):
-        aid = uuid.uuid4().hex[:12]
-        url = str(tool_input.get("url", "?"))
-        log.info("approve auto-allow aid=%s tool=WebFetch url=%s (always)", aid, url)
-        await asyncio.to_thread(
-            _audit,
-            audit_path,
-            approval_id=aid,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            decision="allow:webfetch",
-        )
-        return web.json_response({"decision": "allow", "reason": "webfetch:auto"})
-
     # Плановый ран скилла карточку не получает никогда: его сессию бот не знает
-    # и ответа никто не ждёт. Сюда он доходит только в plan-режиме (или без
-    # permission_mode), где действие заранее не разрешено: отказ сразу.
+    # и ответа никто не ждёт. Сюда он доходит только с причиной карточки
+    # (публикация, письмо): отказ сразу.
     if scheduled:
         aid = uuid.uuid4().hex[:12]
         log.info("approve auto-deny aid=%s tool=%s (scheduled, mode=%s)", aid, tool_name, permission_mode or "?")
@@ -3639,7 +1629,6 @@ async def handle_approve(request: web.Request) -> web.Response:
         origin_key=origin_key,
         run_id=run_id,
     )
-    pending.customer = customer
     pending.sends = outward
     log.info("approve request aid=%s tool=%s sid=%s", pending.approval_id, tool_name, (session_id or "?")[:8])
     # 2-3 попытки: секундный лаг Telegram/502 не должен молча превращаться в
@@ -3664,7 +1653,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             await send_approval_request(application, cfg, pending)
             send_ok = True
             break
-        except TimedOut as e:
+        except NetworkError as e:
             # PTB зовёт TimedOut и таймауты соединения и пула, где запрос не
             # ушёл: им повтор (ревью Codex 29.10).
             if not needs_message_id and is_unconfirmed(e):
@@ -3938,13 +1927,17 @@ async def _handle_event_admitted(
                 with contextlib.suppress(OSError):
                     events.drop(store, event_id)
             raise
-        except Exception:
-            log.exception("event notice failed source=%s", source)
-            if event_id is not None:
-                # Не принято: повтор с тем же ключом должен пройти.
-                with contextlib.suppress(OSError):
-                    events.drop(store, event_id)
-            return web.json_response({"error": "telegram send failed"}, status=502), False
+        except Exception as e:
+            if not is_unconfirmed(e):
+                log.exception("event notice failed source=%s", source)
+                if event_id is not None:
+                    # Не принято: повтор с тем же ключом должен пройти.
+                    with contextlib.suppress(OSError):
+                        events.drop(store, event_id)
+                return web.json_response({"error": "telegram send failed"}, status=502), False
+            # Уведомление обычно дошло: 502 дал бы повтор отправителя и второе
+            # уведомление (ревью Codex 05.11.2026).
+            log.warning("event notice unconfirmed by Telegram, accepted source=%s", source)
         if event_id is not None:
             try:
                 if events.update(store, event_id, status="accepted") is None:

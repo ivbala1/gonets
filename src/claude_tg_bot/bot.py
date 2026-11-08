@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import tempfile
 import time
 import uuid
@@ -18,8 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Collection
 
-from telegram import (Chat, InlineKeyboardButton, InlineKeyboardMarkup,
-                      LinkPreviewOptions, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+from telegram import (Chat, LinkPreviewOptions, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
                       ReplyParameters, Update)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Forbidden
@@ -58,13 +56,15 @@ from .burst import (
     format_burst_local,
     parse_duration,
 )
-from .claude_runner import ClaudeResult, SessionStore, _reap_proc, kill_process_tree, run_claude
+from .claude_runner import ClaudeResult, SessionStore, kill_process_tree, run_claude  # noqa: F401 (kill_process_tree: lifecycle и тесты через bot)
 from .overrides import PersistentDict
-from .config import Config, EFFORT_LEVELS, agent_env, local_zone
-from . import bigfile, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, tasks, transcripts
+from .config import Config, EFFORT_LEVELS, agent_env, local_zone, now_local
+from . import procs as procs_mod
+from . import bigfile, buttons, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, tasks, tg_api, transcripts
 from .skills.news_digest import core as news
 from .replies import (
     extract_ask_marker,
+    extract_later_marker,
     extract_loud_marker,
     extract_quiet_marker,
     extract_send_file_markers,
@@ -84,7 +84,8 @@ from .replies import (
     with_counter,
 )
 from .dashes import soften_dashes
-from .voice import BILLING_URL, quota_exhausted, synthesize, transcribe
+from .voice import (BILLING_URL, local_stt_ready, quota_exhausted, synthesize, transcribe,
+                    transcribe_local)
 from .i18n import _, N_
 from .compose import (  # noqa: F401  перенесено из bot.py
     ComposeBuffer, Reservation, _compose_add, _compose_buffers, _compose_cancelled,
@@ -115,6 +116,7 @@ from .tg_tasks import (  # noqa: F401  перенесено из bot.py
 )
 from .tg_at import (  # noqa: F401  перенесено из bot.py
     _at_fire, _at_fire_dispatch, _at_fire_running, on_at, _parse_at_when, _schedule_at_job,
+    schedule_later,
 )
 from .tg_quick import (  # noqa: F401  реакции, геометка, проверка Кодексом
     codex_check_markup, drop_reaction_notes, on_codex_check, on_location, on_reaction, reaction_note_text,
@@ -126,7 +128,7 @@ from .tg_warm import (  # noqa: F401  перенесено из bot.py
 )
 from .tg_download import (  # noqa: F401  перенесено из bot.py
     _DOWNLOAD_READ_TIMEOUT, _DOWNLOAD_RETRY_DELAYS, _download_retrying, DownloadJob,
-    _downloads_cancel, _fetch_attachment, _fetch_big, _mtproto, _PROGRESS_EVERY_SEC,
+    _downloads_cancel, _fetch_attachment, _fetch_big, _media_busy, _mtproto, _PROGRESS_EVERY_SEC,
     _progress_ticker, _quiet_edit, _slot_holders,
 )
 from .tg_login import (  # noqa: F401  перенесено из bot.py
@@ -418,31 +420,20 @@ async def _cleanup_abandoned_approvals(
     for p in abandoned:
         chat_id = p.target_chat_id if p.target_chat_id is not None else cfg.primary_chat_id
         thread_id = p.target_thread_id
-        card = getattr(p, "card_html", "")
-        if p.telegram_message_id is not None and card and len(card) + len(notice) + 2 <= TELEGRAM_MESSAGE_LIMIT:
-            # Пометка в самой карточке той же правкой, что снимает кнопки: без
-            # нового сообщения, и видно, какая карточка снята (ux2, 01.11.2026).
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=chat_id, message_id=p.telegram_message_id,
-                    text=f"{card}\n\n{notice}", parse_mode="HTML", reply_markup=None)
-                log.info("abandoned approval aid=%s %s (card edited)", p.approval_id, reason_tag)
-                continue
-            except Exception:
-                log.warning("abandoned card edit failed aid=%s, reply instead", p.approval_id, exc_info=True)
+        # Пометка в самой карточке той же правкой, что снимает кнопки: без
+        # нового сообщения, и видно, какая карточка снята (ux2, 01.11.2026).
+        if p.telegram_message_id is not None and await buttons.note_on_card(
+                ctx.bot, getattr(p, "card_html", ""), notice, f"abandoned aid={p.approval_id}",
+                chat_id, p.telegram_message_id):
+            log.info("abandoned approval aid=%s %s (noted on card)", p.approval_id, reason_tag)
+            continue
         try:
             # Номера нет после таймаута отправки карточки: кнопки не снять,
             # но пояснение всё равно нужно.
-            if p.telegram_message_id is not None:
-                await ctx.bot.edit_message_reply_markup(
-                    chat_id=chat_id,
-                    message_id=p.telegram_message_id,
-                    reply_markup=None,
-                )
-                if reason_tag == "deny:cancelled-by-user":
-                    # Число снятых карточек называет ответ /cancel: отдельное
-                    # сообщение на каждую лишнее (аудит удобства 31.10.2026).
-                    continue
+            if p.telegram_message_id is not None and reason_tag == "deny:cancelled-by-user":
+                # Число снятых карточек называет ответ /cancel: отдельное
+                # сообщение на каждую лишнее (аудит удобства 31.10.2026).
+                continue
             # PTB сам опускает message_thread_id=None — танец с kwargs не нужен.
             log.info("abandoned approval aid=%s %s", p.approval_id, reason_tag)
             await ctx.bot.send_message(
@@ -621,11 +612,13 @@ def _scope_note(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> str | None:
 
 
 async def _workshop_forward(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
-                            thread_id: int | None, reply: str, failed: bool, question: str = "") -> None:
+                            thread_id: int | None, reply: str, failed: bool, question: str = "",
+                            loud: bool = False) -> None:
     """Итог рана мастерской в личку: первая строка итога и суть, ссылка на тему
     за подробностями; вопрос мастерской отдельной строкой в конце, обрезка
-    его не съедает. Сбой рана со звуком, даже если ран тихий (поиск, наряд),
-    обычный итог без."""
+    его не съедает. Сбой рана со звуком, даже если ран тихий (поиск, наряд);
+    итог с меткой <<LOUD>> тоже со звуком (сторож билетов на подтверждённую
+    цену, 05.11.2026), обычный итог без."""
     text = reply.strip() or _("(пустой ответ)")
     cap = cfg.telegram_text_limit - 200 - len(question)
     if len(text) > cap:
@@ -633,9 +626,10 @@ async def _workshop_forward(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_ke
     if question:
         text += "\n\n" + question
     head = _("🛠 Мастерская: сбой") if failed else _("🛠 Мастерская")
-    token = _SILENT_RUN.set(not failed)
+    quiet = not (failed or loud)
+    token = _SILENT_RUN.set(quiet)
     try:
-        await ctx.bot.send_message(cfg.primary_chat_id, f"{head}\n{text}", disable_notification=not failed,
+        await ctx.bot.send_message(cfg.primary_chat_id, f"{head}\n{text}", disable_notification=quiet,
                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception:
         log.warning("workshop forward failed chat=%s", chat_key, exc_info=True)
@@ -688,12 +682,17 @@ async def _wait_note(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, msg: Any, pa
         await msg.reply_text(_("⏳ жду: {what}, «!» прервёт").format(what=what), disable_notification=True)
 
 
+def _workshop_since(run: dict) -> str:
+    """С какого времени занята мастерская, в поясе бота; «?» без отметки."""
+    return limits.clock(run["since"]) if run.get("since") else "?"
+
+
 def _cost_day_add(ctx: ContextTypes.DEFAULT_TYPE, cost: float | None) -> None:
     """Сумма ранов за день (state/cost_by_day.json, 14 дней)."""
     days = ctx.application.bot_data.get("cost_by_day")
     if days is None or not cost or cost <= 0:
         return
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_local().strftime("%Y-%m-%d")
     try:
         days[today] = f"{float(days.get(today) or 0) + cost:.4f}"
         for old in sorted(days)[:-14]:
@@ -705,7 +704,7 @@ def _cost_day_add(ctx: ContextTypes.DEFAULT_TYPE, cost: float | None) -> None:
 def _cost_day_line(ctx: ContextTypes.DEFAULT_TYPE) -> str:
     days = ctx.application.bot_data.get("cost_by_day") or {}
     try:
-        today = float(days.get(datetime.now().strftime("%Y-%m-%d")) or 0)
+        today = float(days.get(now_local().strftime("%Y-%m-%d")) or 0)
     except ValueError:
         return ""
     return _("💸 сегодня: ${cost:.2f}").format(cost=today) + "\n"
@@ -735,7 +734,7 @@ def _workshop_status(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config) -> str:
     waiting = ctx.application.bot_data.get("lock_waiting", {}).get(key, 0)
     if run:
         line = _("🛠 мастерская: занята с {since}, «{what}»; ждёт ещё {waiting}; /cancel мастерская прервёт").format(
-            since=datetime.fromtimestamp(run["since"]).strftime("%H:%M"), what=run["what"], waiting=waiting)
+            since=_workshop_since(run), what=run["what"], waiting=waiting)
     elif waiting:
         line = _("🛠 мастерская: ждёт очереди {waiting}").format(waiting=waiting)
     else:
@@ -925,10 +924,7 @@ async def on_handoff_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             or msg is None or msg.message_id != rec.get("message_id")
             or msg.chat_id != rec.get("chat_id")):
         await _answer_quietly(query, _("Кнопка устарела: экран уже закрыт"), show_alert=True)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        await buttons.strip_buttons(query)
         return
     action = parsed[1]
     try:
@@ -949,8 +945,16 @@ async def on_handoff_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text(handoff.render(done), reply_markup=None,
                                           link_preview_options=LinkPreviewOptions(is_disabled=True))
         handoff.mark_notified(base, done["id"])
+    except BadRequest as e:
+        if tg_api.not_modified_text(str(e)):
+            handoff.mark_notified(base, done["id"])  # итог уже в сообщении
+        else:
+            # Итог не встал: хотя бы снять кнопки, как в buttons (ревью 08.11.2026).
+            log.warning("handoff edit failed: %s", e)
+            await buttons.strip_buttons(query)
     except Exception:
-        log.debug("handoff edit failed (ignored)", exc_info=True)
+        log.warning("handoff edit failed", exc_info=True)
+        await buttons.strip_buttons(query)
 
 
 async def _handoff_reply(ctx: ContextTypes.DEFAULT_TYPE, msg) -> bool:
@@ -1007,10 +1011,8 @@ def _news_context(cfg: Config, msg: Message, text: str) -> str:
     Ручной вызов Codex («gpt: …») идёт как есть: пометка спереди сломала бы префикс."""
     if (msg.text or "").lstrip().lower().startswith(cfg.codex_trigger_prefix.lower()):
         return text
-    try:
-        chat_id = int(os.environ.get("NEWS_TG_CHAT_ID", "").strip())
-        thread_id = int(os.environ.get("NEWS_TG_THREAD_ID", "").strip())
-    except ValueError:
+    chat_id, thread_id = cfg.news_tg_chat_id, cfg.news_tg_thread_id
+    if chat_id is None or thread_id is None:
         return text
     if msg.chat_id != chat_id or msg.message_thread_id != thread_id:
         return text
@@ -1126,26 +1128,21 @@ async def on_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     note = await msg.reply_text(_("⏳ считаю (ccusage)…"))
     async with lock:
+        # Своя группа: на таймауте и отмене гаснут npx и его дети (procs.run_bounded).
         try:
-            proc = await asyncio.create_subprocess_exec(
-                npx, "-y", "ccusage@latest", "blocks", "--active", "--json",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,  # своя pgroup — чтобы убить всё дерево
+            rc, stdout, stderr = await procs_mod.run_bounded(
+                [npx, "-y", "ccusage@latest", "blocks", "--active", "--json"],
+                timeout=180, err_tail_chars=None,  # в ответ начало stderr, как было
                 env=agent_env(),  # пакету из npm секреты бота не нужны
             )
         except OSError as e:
             await note.edit_text(_("⚠️ ccusage не запустился: {error}").format(error=type(e).__name__))
             return
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-        except asyncio.TimeoutError:
-            # Без kill npx и его дети остались бы жить после таймаута.
-            kill_process_tree(proc, signal.SIGKILL)
-            await _reap_proc(proc)
+        except TimeoutError:
             await note.edit_text(_("⚠️ ccusage не отработал за 180с — прибил"))
             return
-    if proc.returncode != 0:
-        await note.edit_text(_("⚠️ ccusage rc={rc}\n{stderr}").format(rc=proc.returncode, stderr=stderr.decode(errors='replace')[:300]))
+    if rc != 0:
+        await note.edit_text(_("⚠️ ccusage rc={rc}\n{stderr}").format(rc=rc, stderr=stderr[:300]))
         return
     try:
         parsed = json.loads(stdout)
@@ -1311,13 +1308,11 @@ async def on_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for s in sessions:
         token = uuid.uuid4().hex[:8]
         options[token] = (chat_key, s.session_id)
-        rows.append([InlineKeyboardButton(
-            f"{s.when} · {s.preview[:40]}", callback_data=f"resume:{token}",
-        )])
+        rows.append([{"text": f"{s.when} · {s.preview[:40]}", "data": f"resume:{token}"}])
     ctx.application.bot_data["resume_options"] = options
     await msg.reply_text(
         _("Какую сессию подцепить в эту тему?"),
-        reply_markup=InlineKeyboardMarkup(rows),
+        reply_markup=buttons.markup(rows),
     )
 
 
@@ -1563,16 +1558,16 @@ async def on_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             options[token] = (target_key, m)
             text = f"{m} ({newest[m]})" if m in newest else m
             label = f"✅ {text}" if m == cur else text
-            rows.append([InlineKeyboardButton(label, callback_data=f"model:{token}")])
+            rows.append([{"text": label, "data": f"model:{token}"}])
         session_model = _session_model(ctx, target_key)
         if session_model:
             token = uuid.uuid4().hex[:16]
             options[token] = (target_key, session_model)
-            rows.append([InlineKeyboardButton(
-                _("📌 закрепить {model} за темой").format(model=session_model), callback_data=f"modelpin:{token}")])
+            rows.append([{"text": _("📌 закрепить {model} за темой").format(model=session_model),
+                          "data": f"modelpin:{token}"}])
         token = uuid.uuid4().hex[:16]
         options[token] = (target_key, "")
-        rows.append([InlineKeyboardButton(_("↩️ сбросить к дефолту"), callback_data=f"model:{token}")])
+        rows.append([{"text": _("↩️ сбросить к дефолту"), "data": f"model:{token}"}])
         ctx.application.bot_data["model_options"] = options
         pinned_line = (
             _("закреплена за темой: {model}\n").format(model=overrides[target_key])
@@ -1588,7 +1583,7 @@ async def on_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
               "вручную: /model <имя>, /model pin [имя], сброс: /model default.").format(
                 label=_model_label(ctx, cfg, target_key), pinned_line=pinned_line,
                 default=default_disp, origin=origin),
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=buttons.markup(rows),
         )
         return
 
@@ -1650,8 +1645,7 @@ async def on_model_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pin_token = uuid.uuid4().hex[:16]
         options[pin_token] = (target_key, model)
         ctx.application.bot_data["model_options"] = options
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
-            _("📌 закрепить за темой"), callback_data=f"modelpin:{pin_token}")]])
+        markup = buttons.markup([[{"text": _("📌 закрепить за темой"), "data": f"modelpin:{pin_token}"}]])
     else:
         had_session = _clear_session_model(ctx, target_key)
         had_pin = overrides.pop(target_key, None)
@@ -1706,8 +1700,8 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         _("Привет. user_id={user_id}, ты в whitelist.\n"
         "Чтение идёт без карточек. Перед изменениями агент присылает одну карточку «📋 План», "
-        "после ✅ шаги этого запуска идут без карточек. Отдельной карточкой всегда: удаление "
-        "данных, push, отправка от твоего имени, секреты. Codex (`gpt:` и запасной путь) "
+        "после ✅ шаги этого запуска идут без карточек. Отдельной карточкой всегда: отправка "
+        "от твоего имени людям. Codex (`gpt:` и запасной путь) "
         "работает в своей песочнице без карточек.\n\n"
         "Пока идёт ответ:\n"
         "«стоп» или /cancel: остановить; «ничего не отправляй»: остановить и ждать\n"
@@ -1856,9 +1850,9 @@ async def on_key_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat_key, _session_epoch(ctx, chat_key), pid)
     await update.message.reply_text(
         _("Сейчас идёт ответ. Прервать и начать заново?"),
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(_("⛔ Прервать и начать заново"), callback_data=f"keys:reset:{token}"),
-            InlineKeyboardButton(_("Нет"), callback_data=f"keys:keep:{token}"),
+        reply_markup=buttons.markup([[
+            {"text": _("⛔ Прервать и начать заново"), "data": f"keys:reset:{token}"},
+            {"text": _("Нет"), "data": f"keys:keep:{token}"},
         ]]))
 
 
@@ -1918,6 +1912,7 @@ async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, nosend: b
         dropped = (_gather_cancel(ctx, chat_key) + _pack_cancel(ctx, chat_key)
                    + _prestart_cancel(ctx, chat_key) + _drained_cancel(ctx.application, chat_key))
         downloads = _downloads_cancel(ctx.application, chat_key)
+        local_stt = _local_stt_cancel(ctx.application, chat_key)
         tail = _nosend_tail() if nosend else ""
         if dropped:
             await update.message.reply_text(
@@ -1925,6 +1920,9 @@ async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, nosend: b
             return True
         if downloads:
             await update.message.reply_text(_("🗑 загрузка файла отменена") + tail)
+            return True
+        if local_stt:
+            await update.message.reply_text(_("🗑 распознавание голосового отменено") + tail)
             return True
         await update.message.reply_text(_("Сейчас ничего не идёт, останавливать нечего."))
         return False
@@ -1959,6 +1957,7 @@ async def _cancel_running(
     dropped = (_gather_cancel(ctx, chat_key) + _pack_cancel(ctx, chat_key)
                + _drained_cancel(ctx.application, chat_key))
     _downloads_cancel(ctx.application, chat_key)
+    _local_stt_cancel(ctx.application, chat_key)
 
     # Гасим все pending approvals, принадлежащие убитой сессии: их кнопки
     # уже бессмысленны (hook ушёл вместе с claude-процессом). Без этого
@@ -2011,29 +2010,18 @@ async def _memory_status_line() -> str:
     if not _MEMORY_CLI.is_file():
         return "unavailable"
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(_MEMORY_CLI),
-            "status",
-            "--nudge",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        rc, stdout, _unused = await procs_mod.run_bounded(
+            [str(_MEMORY_CLI), "status", "--nudge"],
+            timeout=_MEMORY_STATUS_TIMEOUT_SEC, stderr=asyncio.subprocess.DEVNULL,
             env={**agent_env(),
                  "MEMORY_CONFIG_DIR": str(_MEMORY_CONFIG_DIR)},
         )
-        stdout, _unused = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=_MEMORY_STATUS_TIMEOUT_SEC,
-        )
     except TimeoutError:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
         return "timeout"
     except OSError:
         return "unavailable"
-    if proc.returncode != 0:
-        return f"error rc={proc.returncode}"
+    if rc != 0:
+        return f"error rc={rc}"
     # `status --nudge` молчит, когда разбирать нечего, и всегда возвращает 0:
     # пустой вывод это норма, а не сорванный вызов.
     return stdout.decode("utf-8", errors="replace").strip() or _("ок, разбирать нечего")
@@ -2321,9 +2309,12 @@ async def _inflight_announce(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except (BadRequest, Forbidden, KeyError):
             log.warning("inflight: notice %s refused, dropped", rid, exc_info=True)
-        except Exception:
-            log.warning("inflight: notice %s not delivered", rid, exc_info=True)
-            continue
+        except Exception as e:
+            if not is_unconfirmed(e):
+                log.warning("inflight: notice %s not delivered", rid, exc_info=True)
+                continue
+            # Весть обычно дошла: повтор был бы дублем (ревью Codex 05.11.2026).
+            log.warning("inflight: notice %s unconfirmed by Telegram, not repeated", rid)
         lost.pop(rid, None)
         inflight.remove(state_dir, rid)
     tries = app.bot_data.get("inflight_tries", 0) + 1
@@ -2511,8 +2502,7 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
             # Нет места или прав: серия уходит без кнопки (ревью Codex 21.10.2026).
             log.exception("full text for voice button not saved")
         else:
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton(
-                _("📄 Полный текст"), callback_data=f"vtext:{token}")]])
+            markup = buttons.markup([[{"text": _("📄 Полный текст"), "data": f"vtext:{token}"}]])
     jobs = [asyncio.create_task(synthesize(openai_client, cfg, s)) if s.strip() else None
             for s in spoken[:n_voice]]
     sent = 0
@@ -2576,20 +2566,46 @@ async def _send_voice_series(cfg: Config, ctx: ContextTypes.DEFAULT_TYPE, update
                   "Весь ответ по кнопке.").format(parts=", ".join(unconfirmed)) if n_voice > 1 else
                 _("⚠️ Telegram не подтвердил голосовое: могло прийти позже или потеряться. "
                   "Весь ответ по кнопке."))
+        if not token:
+            try:
+                token = save_full_text(cfg.state_dir, reply, chat_id)
+            except OSError:
+                log.exception("full text for unconfirmed voice not saved")
+        button = buttons.markup([[{"text": _("📄 Полный текст"), "data": f"vtext:{token}"}]]) if token else None
+        if button is None:
+            # Кнопки нет: без последней фразы «Весь ответ по кнопке».
+            note = note.rsplit(". ", 1)[0] + "."
         try:
-            token = token or save_full_text(cfg.state_dir, reply, chat_id)
-            await msg.reply_text(note, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                _("📄 Полный текст"), callback_data=f"vtext:{token}")]]))
+            await msg.reply_text(note, reply_markup=button)
         except Exception as e:
             if not is_unconfirmed(e):
-                # Нет ни записки, ни кнопки: ответ важнее дубля.
-                log.exception("unconfirmed voice note failed")
-                await send_reply_text(cfg, update, reply)
-                return True
+                # Ответ текстом не повторяем: голосовое обычно доходит, текст
+                # был бы дублем (ревью Codex 05.11.2026). Потеря видна в журнале.
+                log.exception("unconfirmed voice note failed, reply not repeated")
     rest = "\n\n".join(chunks[sent:] + fences)
     if rest:
         await send_reply_text(cfg, update, rest)
     return True
+
+
+def _later_refusal(*, untrusted: bool, task: dict | None, deal: dict | None, workshop: bool,
+                   plan: bool, gpt: bool, error: bool) -> str:
+    """Почему маркер <<LATER:...>> здесь не ставится; пусто, если ставится."""
+    if untrusted:
+        return _("ран по чужому тексту (untrusted)")
+    if task is not None:
+        return _("в теме задачи не работает")
+    if deal is not None:
+        return _("в ходе дела не работает")
+    if workshop:
+        return _("в мастерской не работает")
+    if plan:
+        return _("на этапе /plan не работает")
+    if gpt:
+        return _("ответ GPT, а не claude")
+    if error:
+        return _("ответ с ошибкой")
+    return ""
 
 
 async def _dispatch_to_claude_impl(
@@ -2617,6 +2633,10 @@ async def _dispatch_to_claude_impl(
     turn_notes: list[str] | None = None,
     rids: list[str | None] | None = None,
     carried: str | None = None,
+    read_only: bool = False,
+    step_note: str = "",
+    later_about: str = "",
+    at_jid: str | None = None,
 ) -> bool | None:
     """unattended=True — запуск без человека за клавиатурой (/at, /event, /plan-режим):
     ручной триггер «gpt:» игнорируется (Codex не проходит через approve-hook и
@@ -2661,7 +2681,13 @@ async def _dispatch_to_claude_impl(
     _dispatch_to_claude отпускает её присоединённых в конце.
     rids: записи state/inflight.json этого запроса (_drain_defer).
     carried: запись отложенного, чей текст уже в начале prompt_text
-    (_drained_claim); снимается стартом рана."""
+    (_drained_claim); снимается стартом рана.
+    read_only: повторная проверка, которую агент назначил себе сам
+    (<<LATER:...>>). С 04.11.2026 это обычный фоновый ран без замка «только
+    чтение» (решение Ивана); флаг нужен переносу лимитом и счёту шагов.
+    later_about: текст такой проверки, перенос лимитом его сохраняет.
+    at_jid: запись /at, которая везёт этот запрос: перенос лимитом до старта
+    снимает её (и увезённое carried) той же записью файла, что пишет повтор."""
     cfg: Config = ctx.application.bot_data["cfg"]
     store: SessionStore = ctx.application.bot_data["sessions"]
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
@@ -2680,6 +2706,12 @@ async def _dispatch_to_claude_impl(
         and not limit_retry and still_wanted is None and ask_ref is None
         and permission_mode == "bypassPermissions" and allow_codex_fallback
     )
+    # Перенос лимитом в /at сохраняет пометку проверки агента: по ней считаются
+    # шаги без слова Ивана и текст проверки (с 04.11.2026 права те же, что
+    # у любого фонового рана).
+    limit_ref = ({**(event_ref or {}), "later": True, "hops": max(1, _LATER_HOPS.get()),
+                  **({"about": later_about} if later_about else {})}
+                 if read_only else event_ref)
 
     # Мгновенный ack: реакция переживает долгий ран (typing гаснет через ~5 с),
     # видно «сообщение принято» даже если ран займёт минуты. Фоном, как и
@@ -2847,7 +2879,9 @@ async def _dispatch_to_claude_impl(
                 ctx, cfg, msg, chat_key, chat_id, thread_id, prompt_text,
                 unattended=unattended, untrusted=untrusted,
                 movable=_limit_movable(task, exec_task, from_callback, permission_mode) and deal is None,
-                limit_retry=limit_retry, event_ref=event_ref, on_moved=limit_moved)
+                limit_retry=limit_retry, event_ref=limit_ref, on_moved=limit_moved,
+                # Повтор и снятие везущих запрос записей одной записью файла.
+                replaces=(*carried_jids, *((at_jid,) if at_jid else ())))
         except Exception:
             # Учёт лимита вспомогательный: его сбой не останавливает сообщение.
             log.exception("limit: reserve check failed chat=%s", chat_key)
@@ -2876,10 +2910,11 @@ async def _dispatch_to_claude_impl(
             return
         if task is not None and exec_task is None:
             # В теме задачи всё, кроме выполнения одобренного проекта, идёт
-            # обдумыванием, то есть только чтением: до одобрения там бывает
-            # чужой текст источника (ревью Codex 13.10), а после выполнения
-            # новая просьба снова требует «Делай» (переделка 16.10.2026).
-            permission_mode, forced_codex = "plan", False
+            # обдумыванием (переделка 16.10.2026). С 04.11.2026 без замка
+            # «только чтение» (решение Ивана): обычный режим, правило «сначала
+            # обдумай, крупное предложи проектом и жди «Делай»» в промте темы.
+            # Фоновый ран в теме задачи остаётся в режиме plan CLI (ниже).
+            forced_codex = False
             if expect_epoch is not None and _session_epoch(ctx, chat_key) != expect_epoch:
                 # Кнопка прежней сессии: отказ ниже, проект и очередь задачи
                 # не трогаются (ревью /2mind 25.10.2026).
@@ -2895,9 +2930,9 @@ async def _dispatch_to_claude_impl(
                 if think_rev is not None and tasks.DO_MARK not in prompt_text:
                     prompt_text = f"{prompt_text}\n\n{tasks.think_note()}"
         if task is not None and unattended:
-            # Фоновый ран (/event с wake, /at) в теме задачи: человека у карточек
-            # нет. Всегда только чтение и без fresh: сессия задачи не
-            # обрывается чужим запросом (проект шага 3, 1.8).
+            # Фоновый ран (/event с wake, /at) в теме задачи: человека нет. Режим
+            # plan CLI (Write и Edit он не выполняет) и без fresh: сессия задачи
+            # не обрывается чужим запросом (проект шага 3, 1.8).
             permission_mode, forced_codex, fresh = "plan", False, False
         agent_context = _persona_for(ctx, cfg, chat_key)
         memory_scope_hint = _memory_scope_hint(ctx, cfg, chat_key)
@@ -2963,10 +2998,10 @@ async def _dispatch_to_claude_impl(
                 store.remove(chat_key)
                 _bump_session_epoch(ctx, chat_key)
                 log.info("fresh session by request chat=%s", chat_key)
-            if unattended and not untrusted and permission_mode != "plan":
-                # Фоновый ран с полными правами (/event wake, /at, кнопки
-                # фонового рана) не продолжает сессию, где был чужой текст.
-                # Сообщения человека и plan-раны (там карточки) продолжают.
+            if unattended and not untrusted:
+                # Фоновый ран (/event wake, /at, кнопки фонового рана, /plan) не
+                # продолжает сессию, где был чужой текст: с 04.11.2026 хук не
+                # ограничивает и режим plan. Сообщения человека продолжают.
                 _drop_untrusted_session(ctx, store, chat_key)
             if side is None and cfg.session_idle_ttl_sec > 0 and store.get(chat_key):
                 last = store.last_used(chat_key)
@@ -3007,12 +3042,7 @@ async def _dispatch_to_claude_impl(
                 # Новый план гасит карточки прежних (ревью 11.10.2026).
                 _bump_plan_generation(ctx, chat_key)
 
-            plan_run_sids: list[str] = []
             exec_run_sids: list[str] = []
-            # Обдумывание темы задачи с Иваном у карточек (переделка 18.10.2026):
-            # чтение без карточки, остальное карточкой, а не молчаливым отказом,
-            # субагенты разрешены. Фоновый ран в теме задачи остаётся строгим.
-            task_think = task is not None and exec_task is None and permission_mode == "plan" and not unattended
 
             run_sid: list[str] = []
 
@@ -3026,17 +3056,9 @@ async def _dispatch_to_claude_impl(
                 # /resume (ревью 12.10.2026).
                 if untrusted:
                     _mark_untrusted_session(ctx, chat_key, sid)
-                if permission_mode == "plan":
-                    # Метка этапа плана на стороне бота: хук пускает только
-                    # чтение, даже если CLI не пришлёт режим (ревью Codex 13.10).
-                    ctx.application.bot_data.setdefault("plan_stage_sids", set()).add(sid)
-                    if task_think:
-                        ctx.application.bot_data.setdefault("task_think_sids", set()).add(sid)
-                    plan_run_sids.append(sid)
-                elif exec_task is not None:
-                    # Права выдаются рану выполнения, а не теме: хук пускает
-                    # без карточки всё, кроме секретов и отправки наружу (ревью
-                    # Codex 15.10). Снимается по своим sid после рана.
+                if exec_task is not None:
+                    # Ран выполнения задачи: метка нужна автоаппруву (approval,
+                    # allow:task-exec) и снимается по своим sid после рана.
                     ctx.application.bot_data.setdefault("task_exec_sids", set()).add(sid)
                     exec_run_sids.append(sid)
                 _note_session_scope(ctx, sid, memory_scope_hint)
@@ -3209,7 +3231,6 @@ async def _dispatch_to_claude_impl(
                     progress_cb=status.on_tool,
                     activity_cb=status.on_event,
                     permission_mode=permission_mode,
-                    plan_agents=task_think,
                     unattended_sids=(
                         ctx.application.bot_data.setdefault("unattended_sids", set())
                         if unattended else None
@@ -3258,15 +3279,12 @@ async def _dispatch_to_claude_impl(
                 # Под замком темы: следующий ран этого чата не начался, его
                 # попытки отправки откликов мертвы (ревью Codex 22.10.2026).
                 # До finish: отмена на его await не пропустит закрытие.
-                await _otklik_close_attempts(ctx, cfg, chat_key)
-                await status.finish()
-                for run_sid in plan_run_sids:
-                    # Снимается по своим sid, а не по текущей сессии темы: у
-                    # новой упавшей сессии её уже нет ни там, ни там (ревью Codex 13.10).
-                    ctx.application.bot_data.setdefault("plan_stage_sids", set()).discard(run_sid)
-                    ctx.application.bot_data.setdefault("task_think_sids", set()).discard(run_sid)
+                # Снимается по своим sid, а не по текущей сессии темы, и до
+                # await ниже: отмена не оставит метку навсегда (ревью Codex 04.11.2026).
                 for run_sid in exec_run_sids:
                     ctx.application.bot_data.setdefault("task_exec_sids", set()).discard(run_sid)
+                await _otklik_close_attempts(ctx, cfg, chat_key)
+                await status.finish()
                 if untrusted:
                     # Чужой текст теперь в истории этой сессии.
                     _mark_untrusted_session(ctx, chat_key, run_store.get(chat_key))
@@ -3305,7 +3323,7 @@ async def _dispatch_to_claude_impl(
                     ctx, cfg, result, chat_key, chat_id, thread_id, prompt_text,
                     unattended=unattended, untrusted=untrusted, limit_retry=limit_retry,
                     movable=_limit_movable(task, exec_task, from_callback, permission_mode) and deal is None,
-                    agent_context=agent_context, procs=procs, unexited=unexited, event_ref=event_ref)
+                    agent_context=agent_context, procs=procs, unexited=unexited, event_ref=limit_ref)
             # Авто-фоллбэк: claude недоступен (401/429/5xx) — отвечаем через codex.
             elif (
                 result.is_error
@@ -3344,9 +3362,12 @@ async def _dispatch_to_claude_impl(
                         # План только читает и у GPT (ревью Codex 13.10). Песочница
                         # из настройки только у текста Ивана: фон и кнопки (вопрос,
                         # план, отклик) всегда на чтение (проект шага 1, 2.1).
+                        # Обдумывание задачи у GPT на чтение, как раньше в режиме
+                        # plan: у него нет правила промта темы (ревью 04.11.2026).
                         sandbox=(cfg.codex_fallback_sandbox
                                  if permission_mode != "plan" and not unattended and not from_callback
-                                 and expect_epoch is None and expect_plan is None else "read-only"),
+                                 and expect_epoch is None and expect_plan is None
+                                 and not (task is not None and exec_task is None) else "read-only"),
                         chat_key=chat_key, process_registry=procs,
                         should_stop=lambda: bool(ctx.application.bot_data.get("stopping")),
                         unexited=unexited)
@@ -3418,7 +3439,8 @@ async def _dispatch_to_claude_impl(
         earlier = list(texts)
         if not codex_fallback and earlier[-1] == result.text:
             earlier.pop()
-        earlier = [extract_quiet_marker(extract_loud_marker(extract_ask_marker(tasks.extract_do(t)[1])[1])[1])[1]
+        earlier = [extract_later_marker(extract_quiet_marker(extract_loud_marker(
+                       extract_ask_marker(tasks.extract_do(t)[1])[1])[1])[1])[1]
                    for t in earlier]
         reply = tasks.run_reply(earlier + [reply], reply)
     if think_rev is not None:
@@ -3440,6 +3462,7 @@ async def _dispatch_to_claude_impl(
     ask, reply = extract_ask_marker(reply)
     loud, reply = extract_loud_marker(reply)
     quiet, reply = extract_quiet_marker(reply)
+    later, reply = extract_later_marker(reply)
     # Тире на дефис здесь, а не хуком: строка «Исправлено» хука подменяла
     # ответ, ведь в чат уходит только последний текст рана (решение 22.10.2026).
     reply = soften_dashes(reply)
@@ -3450,12 +3473,43 @@ async def _dispatch_to_claude_impl(
     if quiet_stop:
         log.info("reply of user-stopped run not sent chat=%s", chat_key)
         return
+    if later is not None:
+        # Повторная проверка, которую агент назначил себе сам: итог строкой футера.
+        refusal = _later_refusal(untrusted=untrusted, task=task, deal=deal, workshop=workshop,
+                                 plan=permission_mode == "plan",
+                                 gpt=codex_fallback or forced_codex, error=result.is_error)
+        if refusal:
+            log.info("later marker dropped chat=%s: %s", chat_key, refusal)
+            later_note = _("⏰ «позже» не поставлено: {reason}").format(reason=refusal)
+        else:
+            try:
+                later_note = schedule_later(ctx.application, chat_key, chat_id, thread_id,
+                                            later[0], later[1], _LATER_HOPS.get() + 1,
+                                            silent=_SILENT_RUN.get())[1]
+            except Exception:
+                # Сбой постановки не отнимает готовый ответ.
+                log.exception("later: schedule failed chat=%s", chat_key)
+                later_note = _("⏰ «позже» не поставлено: сбой записи задания, смотри журнал бота")
+        if turn_notes is not None:
+            turn_notes.append(later_note)
+        else:
+            with contextlib.suppress(Exception):
+                await msg.reply_text(later_note, disable_notification=True)
     if (quiet and not reply.strip() and not loud and not result.is_error and ask is None
             and not files_to_send and (untrusted or _SILENT_RUN.get())):
         # Только весь ответ целиком и только в ране без звука: метка рядом с
         # текстом или в разговоре ответ не глотает.
         log.info("quiet run: no message chat=%s", chat_key)
         return
+    if step_note:
+        # Шаг проверки «позже» (tg_at): первой из служебных строк футера ответа,
+        # а не отдельным сообщением до рана. Ран не состоялся или промолчал
+        # меткой QUIET: строки нет.
+        if turn_notes is not None:
+            turn_notes.insert(0, step_note)
+        else:
+            with contextlib.suppress(Exception):
+                await msg.reply_text(step_note, disable_notification=True)
     if (workshop or untrusted) and ask is not None:
         # Тема мастерской заглушена, кнопки там никто не увидит: вопрос текстом
         # в ответ, ответ пересылается в личку (проект Домового 22.10.2026).
@@ -3493,10 +3547,12 @@ async def _dispatch_to_claude_impl(
         # Codex 16.10).
         reply_sink.append((full_reply, plan_snapshot, not result.is_error and not codex_fallback))
     if workshop and (unattended or from_callback):
-        # Наряд, поиск, ✅: Ивана в теме нет, итог тихо в личку, сбой со звуком.
-        # До отправки в тему: её сбой итог не съест.
+        # Наряд, поиск, ✅: Ивана в теме нет, итог тихо в личку; сбой и итог с
+        # меткой <<LOUD>> (снята с текста выше) со звуком. До отправки в тему:
+        # её сбой итог не съест.
         await _workshop_forward(ctx, cfg, chat_key, thread_id,
-                                reply[:-len(ws_question)] if ws_question else reply, result.is_error, ws_question)
+                                reply[:-len(ws_question)] if ws_question else reply, result.is_error, ws_question,
+                                loud=loud)
     voiced = False
     # Метка звука: в тихом ране со звуком только сам ответ, файлы, футер и
     # кнопки остаются тихими (replies.extract_loud_marker).
@@ -3719,6 +3775,34 @@ def _pending_text_swap(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, message_id
     return False
 
 
+# Свайп этими словами на своё сообщение с файлом качает его заново: файл
+# лежит у Telegram, а бот после сбоя скачивания к сообщению сам не вернётся
+# (решение Ивана 07.11.2026, раньше только пересылка в тот же чат).
+_MEDIA_RETRY_WORDS = frozenset({"еще раз", "повтори", "скачай", "скачай заново", "перекачай"})
+
+
+def _media_retry_handler(msg: Any) -> Any:
+    """Обработчик для повтора: msg это свайп словом повтора на своё же
+    сообщение с фото, файлом или голосовым. None, если это не такой свайп."""
+    word = " ".join((msg.text or "").lower().replace("ё", "е").split()).rstrip(" .!")
+    quoted = _real_reply(msg)
+    if word not in _MEDIA_RETRY_WORDS or quoted is None:
+        return None
+    me, author = getattr(msg, "from_user", None), getattr(quoted, "from_user", None)
+    if me is None or author is None or author.id != me.id:
+        return None  # только своё: чужое и сообщения бота так не перекачиваем
+    if getattr(quoted, "voice", None) is not None:
+        return on_voice
+    doc = getattr(quoted, "document", None)
+    if getattr(quoted, "photo", None) or (
+            doc is not None and (getattr(doc, "mime_type", None) or "").startswith("image/")):
+        return on_photo
+    if doc is not None or any(getattr(quoted, k, None) is not None
+                              for k in ("video", "audio", "video_note", "animation")):
+        return on_file
+    return None
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     user = update.effective_user
@@ -3733,6 +3817,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if await _handoff_reply(ctx, msg):
         # Буквы капчи для ждущего агента: в Claude не идут.
+        return
+    retry = _media_retry_handler(msg)
+    if retry is not None:
+        if _media_busy(ctx.application, msg.reply_to_message):
+            await msg.reply_text(_("⏳ этот файл ещё качается, подожди"))
+        else:
+            log.info("media retry chat=%s message=%s", msg.chat_id, msg.reply_to_message.message_id)
+            # Повтор идёт обычным ходом: если оригинал сам был свайпом на дело
+            # или задачу, этого Bot API во вложенном сообщении не передаёт.
+            await retry(Update(update.update_id, message=msg.reply_to_message), ctx)
         return
     urgent = _urgent_word(msg)
     if urgent is not None and _something_to_stop(ctx, _chat_key(update)[0]):
@@ -4141,6 +4235,71 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _deliver_piece(update, ctx, chat_key, prompt, gslot, slot, work)
 
 
+class _LocalSttCancelled(Exception):
+    """Локальное распознавание остановлено /cancel или остановкой бота."""
+
+
+@dataclass
+class _LocalSttJob:
+    chat_key: str
+    cancelled: bool = False
+
+
+def _local_stt_cancel(app: Any, chat_key: str | None = None) -> int:
+    """Отменить локальные распознавания темы (или все). Сколько. Признак
+    cancelled ставится и уже завершённой задаче, чей обработчик ещё не забрал
+    результат: иначе отменённое уходило бы в Claude (ревью 04.11.2026)."""
+    jobs: dict[asyncio.Task, _LocalSttJob] = app.bot_data.get("local_stt") or {}
+    n = 0
+    for task, job in list(jobs.items()):
+        if (chat_key is None or job.chat_key == chat_key) and not job.cancelled:
+            job.cancelled = True
+            task.cancel()
+            n += 1
+    return n
+
+
+async def _transcribe_local_held(
+    ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
+    gslot: GatherSlot | None, slot: Reservation | None, audio: Path, duration: float | None,
+) -> str:
+    """Локальное распознавание длинного голосового идёт дольше 30 с, которые
+    пачка и /go ждут неготовый слот: держателей помечаем slow, как при
+    скачивании. И держим единицу active_work: перезапуск дождётся распознавания,
+    а не оборвёт его. Задача видна /cancel (_local_stt_cancel): отменённая
+    гасит процесс модели и даёт _LocalSttCancelled (ревью 04.11.2026)."""
+    marked = tuple(h for h in _slot_holders(ctx, chat_key, gslot, slot) if h is not None)
+    bd = ctx.application.bot_data
+    jobs: dict[asyncio.Task, _LocalSttJob] = bd.setdefault("local_stt", {})
+    task = asyncio.create_task(transcribe_local(cfg, audio, duration), name=f"local-stt:{chat_key}")
+    job = jobs[task] = _LocalSttJob(chat_key)
+    for h in marked:
+        h.slow += 1
+    bd["active_work"] = bd.get("active_work", 0) + 1
+    try:
+        try:
+            text = await task
+        except asyncio.CancelledError:
+            # Отменили сам обработчик: задачу модели await уже отменил,
+            # отмена идёт дальше. Иначе это /cancel или остановка бота.
+            if _current_task_cancelling():
+                raise
+            raise _LocalSttCancelled() from None
+        if job.cancelled:
+            raise _LocalSttCancelled()
+        return text
+    finally:
+        jobs.pop(task, None)
+        bd["active_work"] = bd.get("active_work", 0) - 1
+        for h in marked:
+            h.slow -= 1
+
+
+def _current_task_cancelling() -> bool:
+    cur = asyncio.current_task()
+    return bool(cur is not None and cur.cancelling())
+
+
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     openai_client = ctx.application.bot_data.get("openai")
@@ -4159,7 +4318,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Проект темы задачи на момент отправки голосового: «делай» одобрит только
     # его, а не проект, появившийся за время расшифровки (ревью Codex 19.10).
     seen_sha = _task_seen_sha(ctx, update)
-    if openai_client is None:
+    local_ok = local_stt_ready(cfg)
+    if openai_client is None and not local_ok:
         await msg.reply_text(_("⚠️ голос выключен (пустой OPENAI_API_KEY в .env)"))
         return
     if msg.voice.duration and msg.voice.duration > cfg.voice_max_duration_sec:
@@ -4182,37 +4342,64 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     fd, tmp_name = tempfile.mkstemp(suffix=".oga", prefix="tg-voice-")
     os.close(fd)
     tmp = Path(tmp_name)
+    # Повтор свайпом ждёт и распознавания, не только скачивания (ревью 07.11.2026).
+    busy: set = ctx.application.bot_data.setdefault("media_busy", set())
+    media_key = (msg.chat_id, msg.message_id)
+    busy.add(media_key)
     try:
         # get_file + download под одним try: сетевой сбой Telegram не должен
         # превращаться в молчание (по образцу on_file).
         # Длительность не ограничивает размер в байтах: голосовое больше
         # 20 МБ идёт через MTProto, как документ (hold=False: распознавание
-        # дальше короткое, единицу работы держать не нужно).
-        voice_size = getattr(msg.voice, "file_size", None)
-        if bigfile.needs_mtproto(voice_size):
-            got = await _fetch_big(
-                update, ctx, size=voice_size, target=tmp, label=_("голосовое"),
-                chat_key=chat_key, gslot=gslot, slot=slot, hold=False)
-            if got is None:
-                _compose_release(ctx, chat_key, slot)
-                _gather_release(gslot)
-                return
-        else:
-            try:
-                await _download_retrying(msg.voice, tmp, _slot_holders(ctx, chat_key, gslot, slot))
-            except Exception:
-                log.exception("voice download failed user=%s", user.id if user else None)
-                _compose_release(ctx, chat_key, slot)
-                _gather_release(gslot)
-                await msg.reply_text(_("⚠️ не удалось скачать голосовое"))
-                return
-        try:
-            heard = await transcribe(openai_client, cfg, tmp)
-        except Exception as e:
-            log.exception("STT failed")
+        # через OpenAI короткое, единицу работы держать не нужно; долгое
+        # локальное держит свою, см. _transcribe_local_held).
+        got = await _fetch_attachment(
+            update, ctx, file_obj=msg.voice, size=getattr(msg.voice, "file_size", None),
+            target=tmp, label=_("голосовое"), chat_key=chat_key, gslot=gslot, slot=slot,
+            hold=False, fail_text=_("⚠️ не удалось скачать голосовое"))
+        if got is None:
             _compose_release(ctx, chat_key, slot)
             _gather_release(gslot)
-            if quota_exhausted(e):
+            return
+        heard: str | None = None
+        stt_err: Exception | None = None
+        if openai_client is not None:
+            try:
+                heard = await transcribe(openai_client, cfg, tmp)
+            except Exception as e:
+                log.exception("STT failed")
+                stt_err = e
+        # Запасной путь: GigaAM на машине бота, когда OpenAI не распознал
+        # (пустой баланс 02.11.2026, сбой сети) или ключа нет.
+        local_label = None
+        if not heard and local_ok:
+            try:
+                heard = await _transcribe_local_held(ctx, cfg, chat_key, gslot, slot, tmp, msg.voice.duration)
+            except _LocalSttCancelled:
+                # /cancel уже ответил сам; голосовое не идёт никуда.
+                log.info("local STT cancelled user=%s", user.id)
+                _compose_release(ctx, chat_key, slot)
+                _gather_release(gslot)
+                return
+            except Exception:
+                log.exception("local STT failed")
+            else:
+                log.info("voice transcribed locally user=%s openai_failed=%s",
+                         user.id, stt_err is not None)
+                if stt_err is not None and quota_exhausted(stt_err):
+                    local_label = _("распознал локально: кончились деньги на OpenAI или достигнут "
+                                    "лимит расходов проекта, пополнить или поднять лимит {url}").format(
+                                        url=BILLING_URL)
+                elif stt_err is not None or openai_client is not None:
+                    # Сбой или пустой текст от OpenAI (ревью 04.11.2026).
+                    local_label = _("распознал локально: OpenAI не распознал")
+                else:
+                    local_label = _("распознал локально")
+        if heard is None:
+            # Без ответа ни от OpenAI, ни локально; пустой текст идёт ниже.
+            _compose_release(ctx, chat_key, slot)
+            _gather_release(gslot)
+            if stt_err is not None and quota_exhausted(stt_err):
                 await msg.reply_text(_("⚠️ Голос не распознан: кончились деньги на OpenAI или достигнут "
                                        "лимит расходов проекта: пополнить или поднять лимит {url}").format(
                                            url=BILLING_URL))
@@ -4220,6 +4407,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await msg.reply_text(_("⚠️ не удалось распознать голос"))
             return
     finally:
+        busy.discard(media_key)
         try:
             tmp.unlink()
         except FileNotFoundError:
@@ -4228,7 +4416,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not heard:
         _compose_release(ctx, chat_key, slot)
         _gather_release(gslot)
-        await msg.reply_text(_("⚠️ пусто после распознавания"))
+        # Причина локального пути (пустой баланс и где пополнить) не теряется.
+        await msg.reply_text(_("⚠️ пусто после распознавания ({how})").format(how=local_label) if local_label
+                             else _("⚠️ пусто после распознавания"))
         return
 
     log.info("voice transcribed user=%s chat=%s len=%d", user.id, msg.chat_id, len(heard))
@@ -4250,7 +4440,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # расшифровка (больше 4096) или сбой отправки теряли голосовое целиком
     # (ревью 12.10.2026).
     try:
-        for chunk in split_for_telegram(_("🎙 Услышал: {heard}").format(heard=heard), cfg.telegram_text_limit):
+        echo = (_("🎙 Услышал ({how}): {heard}").format(how=local_label, heard=heard) if local_label
+                else _("🎙 Услышал: {heard}").format(heard=heard))
+        for chunk in split_for_telegram(echo, cfg.telegram_text_limit):
             await msg.reply_text(chunk, disable_notification=True)
     except Exception:
         log.exception("voice transcript echo failed")
@@ -4334,11 +4526,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if burst_duration is not None:
             log.warning("approve: aid=%s окно ⏩ для отправки не открывается", approval_id)
             return
-    # Изменение на сервере заказчика и отправка людям мимо карточки отправки:
-    # кнопок окна на карточке нет, окно не открывается.
-    if (pending_now is not None and (pending_now.customer == "change" or getattr(pending_now, "sends", False))
+    # Отправка людям мимо карточки отправки: кнопок окна на карточке нет, окно
+    # не открывается.
+    if (pending_now is not None and getattr(pending_now, "sends", False)
             and burst_duration is not None):
-        log.warning("approve: aid=%s окно ⏩ для изменения у заказчика или отправки не открывается", approval_id)
+        log.warning("approve: aid=%s окно ⏩ для отправки не открывается", approval_id)
         return
     # ✅ только по карточке, которую нарисовал бот: текст, кнопки и сущности
     # текста. Агент знает ключ бота и мог переписать карточку или подписи
@@ -4348,16 +4540,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("approve: aid=%s карточка в Telegram не та, что отправил бот", approval_id)
         registry.resolve(approval_id, CARD_CHANGED)
         line = _("⚠️ карточка изменена не ботом (текст или кнопки): ✅ не принят, вызов отклонён")
-        card = pending_now.card_html
-        if card and len(card) + len(line) + 2 <= TELEGRAM_MESSAGE_LIMIT:
-            # Карточка снова с текстом, который отправил бот.
-            try:
-                await query.edit_message_text(f"{card}\n\n{line}", parse_mode="HTML", reply_markup=None)
-                return
-            except Exception:
-                log.warning("approval card restore failed aid=%s, reply instead", approval_id, exc_info=True)
+        # Карточка снова с текстом, который отправил бот.
+        if await buttons.note_on_card(query, pending_now.card_html, line, f"restore aid={approval_id}"):
+            return
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(line)
         except Exception:
             log.exception("failed to report changed approval card")
@@ -4365,13 +4551,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     decision_for_hook = "allow" if burst_duration is not None else decision
     resolved = registry.resolve(approval_id, decision_for_hook)
     if resolved is None:
+        # Кнопок уже нет (второе нажатие той же карточки) или снять не
+        # вышло: молча, как раньше.
+        if not await buttons.strip_buttons(query):
+            return
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
                 _("⚠️ карточка уже закрыта: истёк срок, ран закончился или её уже нажали")
             )
         except Exception:
-            pass
+            log.warning("closed approval card reply failed aid=%s", approval_id, exc_info=True)
         return
     if burst_duration is not None:
         chat = update.effective_chat
@@ -4399,14 +4588,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # сообщение «✅ allow · aid=…» со звуком приходило на каждое нажатие.
     # Не вышло (карточка у предела длины, сбой правки): прежним сообщением.
     card_html = getattr(query.message, "text_html", None) or ""
-    if card_html and len(card_html) + len(line) + 2 <= TELEGRAM_MESSAGE_LIMIT:
-        try:
-            await query.edit_message_text(f"{card_html}\n\n{line}", parse_mode="HTML")
-            return
-        except Exception:
-            log.warning("approval card edit failed aid=%s, reply instead", approval_id, exc_info=True)
+    if await buttons.note_on_card(query, card_html, line, f"decision aid={approval_id}"):
+        return
     try:
-        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(line, disable_notification=True)
     except Exception:
         log.exception("failed to finalise approval message")
@@ -4560,12 +4744,15 @@ async def _attachment_cleanup_loop(cfg: Config) -> None:
 # теряет. asyncio.create_task копирует контекст в момент создания, поэтому
 # задачи, созданные до рана, флаг не видят. Обработчик /approve живёт в задаче
 # HTTP-сервера и флага не видит, но фоновому рану /event с wake хук ничего в
-# чат не шлёт: ранние ветки handle_approve (untrusted, автоаппрув чата,
-# _unattended_auto_allowed) отвечают раньше карточки и уведомлений.
+# чат не шлёт: ранние ветки handle_approve (untrusted, allow:default)
+# отвечают раньше карточки и уведомлений.
 _SILENT_RUN: contextvars.ContextVar[bool] = contextvars.ContextVar("silent_run", default=False)
 # Ран пробуждения с флагом "asks": "deal" (утро Домового): его вопросы
 # становятся делами (опыт В1, docs/design-2026-10-26-v1.md).
 _DEAL_ASKS: contextvars.ContextVar[bool] = contextvars.ContextVar("deal_asks", default=False)
+# Шаг цепочки повторных проверок агента (<<LATER:...>>, tg_at.schedule_later):
+# ставит ран такой проверки, у рана по слову Ивана 0, и счёт идёт заново.
+_LATER_HOPS: contextvars.ContextVar[int] = contextvars.ContextVar("later_hops", default=0)
 # Ран по чужому тексту (untrusted): сообщения без превью ссылок. Превью
 # заставляет сервер Telegram сходить по адресу из ответа, а в адрес ран мог
 # положить прочитанное из почты или файлов по указанию из письма: это его
@@ -4599,18 +4786,19 @@ class _SilentAwareBot(ExtBot):
 # ждать незачем: неподтверждённое уже не считается сбоем (replies.is_unconfirmed).
 TELEGRAM_READ_TIMEOUT = 30
 ALLOWED_UPDATES = [Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY, Update.MESSAGE_REACTION]
-# Предел текста одного сообщения Telegram.
-TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 def build_app(cfg: Config) -> Application:
+    base_url, base_file_url = tg_api.ptb_urls(cfg.telegram_bot_api_url)
     app = (
         Application.builder()
         # Свой класс бота ради ранов без звука. Пул соединений задан явно, как
         # у ApplicationBuilder с .token() (256): с .bot() пул ставит не builder,
         # и так он не зависит от умолчания HTTPXRequest в другой версии PTB.
-        .bot(_SilentAwareBot(cfg.telegram_bot_token, request=HTTPXRequest(
-            connection_pool_size=256, read_timeout=TELEGRAM_READ_TIMEOUT)))
+        # Адрес сервера Bot API общий с notify и прочими (tg_api, TELEGRAM_BOT_API_URL).
+        .bot(_SilentAwareBot(cfg.telegram_bot_token, base_url=base_url, base_file_url=base_file_url,
+                             request=HTTPXRequest(connection_pool_size=256,
+                                                  read_timeout=TELEGRAM_READ_TIMEOUT)))
         .concurrent_updates(True)
         .post_init(_on_post_init)
         .post_stop(_on_post_stop)
@@ -4721,7 +4909,7 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_voice_full_text, pattern=r"^vtext:"))
     app.add_handler(CallbackQueryHandler(on_resume_pick, pattern=r"^resume:"))
     app.add_handler(CallbackQueryHandler(on_ask_pick, pattern=r"^ask:"))
-    app.add_handler(CallbackQueryHandler(on_deal_pick, pattern=r"^deal:[0-9a-f]{8}:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_deal_pick, pattern=r"^deal:[0-9a-f]{8}:\d+(?::\d+)?$"))
     app.add_handler(CallbackQueryHandler(on_run_watch_pick, pattern=r"^runwatch:"))
     app.add_handler(CallbackQueryHandler(on_news_pick, pattern=r"^news:"))
     app.add_handler(CallbackQueryHandler(on_restart_pick, pattern=r"^rst:"))

@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
 
+from ...config import local_zone
 from ...i18n import N_, _
 
 SECTION_SEP = "-----"
@@ -154,7 +156,7 @@ def format_message(topic: TopicUnread, m: Message) -> str:
     if m.reply_to and m.reply_to != topic.topic_id:
         extra.append(_("(ответ на {id})").format(id=m.reply_to))
     text = m.text.replace("\n", " ⏎ ")
-    return f"{m.id} {m.date} {m.sender}: {' '.join(extra)} {text}".rstrip()
+    return f"{m.id} {_local_stamp(m.date)} {m.sender}: {' '.join(extra)} {text}".rstrip()
 
 
 def format_topic(topic: TopicUnread) -> str:
@@ -249,8 +251,27 @@ def split_sections(digest: str) -> list[str]:
     return [part.strip() for part in _SEP_RE.split(digest) if part.strip()]
 
 
+def _local_day(stamp: str, zone) -> str:
+    """День сообщения в поясе бота: m.date пишется в UTC, иногда без смещения."""
+    try:
+        t = datetime.fromisoformat(stamp)
+    except ValueError:
+        return stamp[:10]
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(zone).date().isoformat()
+
+
+def _local_stamp(stamp: str) -> str:
+    """Время сообщения для модели в поясе бота (до минут, со смещением)."""
+    try:
+        t = datetime.fromisoformat(stamp)
+    except ValueError:
+        return stamp
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(local_zone()).isoformat(timespec="minutes")
+
+
 def period_label(chat: ChatUnread) -> str:
-    dates = sorted(m.date[:10] for t in chat.topics for m in t.messages)
+    zone = local_zone()
+    dates = sorted(_local_day(m.date, zone) for t in chat.topics for m in t.messages)
     if not dates:
         return ""
     first, last = dates[0], dates[-1]

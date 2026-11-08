@@ -29,7 +29,6 @@ Usage (агент, из корня репозитория бота, в свое�
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import hmac
 import json
@@ -47,7 +46,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import jsonstore
+from .config import agent_env
 from .i18n import N_, _
+from .limits import clock
 
 HANDOFF_DIRNAME = "handoff"
 CALLBACK_PREFIX = "ho"
@@ -90,34 +92,21 @@ def record_path(base: Path, hid: str) -> Path:
 
 def load(base: Path, hid: str) -> dict[str, Any] | None:
     try:
-        return json.loads(record_path(base, hid).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        path = record_path(base, hid)
+    except ValueError:  # чужой id (из кнопки или аргумента): записи нет
         return None
+    return jsonstore.read_dict(path, keep_corrupt=False) or None
 
 
 def save(base: Path, rec: dict[str, Any]) -> None:
-    base.mkdir(parents=True, exist_ok=True)
-    path = record_path(base, rec["id"])
-    fd, tmp = tempfile.mkstemp(dir=base, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    jsonstore.write_json(record_path(base, rec["id"]), rec, indent=2)
 
 
 @contextmanager
 def locked(base: Path):
     """Общая блокировка записей передачи между процессами."""
-    base.mkdir(parents=True, exist_ok=True)
-    with open(base / ".lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    with jsonstore.file_lock(base / ".lock"):
+        yield
 
 
 def finish(base: Path, hid: str, status: str, by: str, *, require_live: bool = True
@@ -313,7 +302,7 @@ def crop_image(data: bytes, region: list[int], pad: int = 16) -> bytes:
         try:
             res = subprocess.run([ffmpeg, "-v", "error", "-y", "-i", str(src), "-vf",
                                   f"crop=min({w}\\,iw-{x}):min({h}\\,ih-{y}):{x}:{y}", str(dst)],
-                                 capture_output=True, timeout=20)
+                                 capture_output=True, timeout=20, env=agent_env())
         except (OSError, subprocess.TimeoutExpired):
             return data
         return dst.read_bytes() if res.returncode == 0 and dst.is_file() else data
@@ -343,7 +332,7 @@ def buttons(rec: dict[str, Any], url: str = "") -> list[list[dict[str, str]]]:
 
 
 def render(rec: dict[str, Any]) -> str:
-    until = datetime.fromtimestamp(float(rec["expires"])).astimezone().strftime("%H:%M")
+    until = clock(float(rec["expires"]))
     parts = [_("🖥 Нужна твоя помощь в браузере: {reason}").format(reason=rec["reason"])]
     if rec.get("site"):
         parts.append(_("Сайт: {site}").format(site=rec["site"]))
@@ -369,7 +358,9 @@ def _agent_browser() -> str:
 
 
 def _ab(session: str, *args: str) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ, **{SESSION_ENV: session})
+    # Без секретов бота: agent-browser и его фоновый процесс токен не получают,
+    # а потолок кадра трансляции STREAM_CAP_ENV получают (config.agent_env).
+    env = {**agent_env(), SESSION_ENV: session}
     return subprocess.run([_agent_browser(), *args], env=env, capture_output=True, text=True,
                           timeout=30)
 
@@ -427,29 +418,48 @@ def _bot_api(method: str, payload: dict[str, Any],
              photo: tuple[str, bytes, str] | None = None) -> dict[str, Any] | None:
     import httpx
 
+    from . import tg_api
     from .config import load_config
     cfg = load_config(skip_hook_validation=True)
-    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/{method}"
+    # Неушедшее и 429 повторяются сами; правка повторяется при любом сбое
+    # связи, уже применённая (not modified) успех. Неподтверждённая отправка
+    # остаётся отказом: без номера сообщения кнопки не прикрепить.
+    edit = method.startswith("edit")
     try:
         if photo is None:
-            r = httpx.post(url, json=payload, timeout=10.0)
+            r = tg_api.post(cfg.telegram_bot_token, method, json=payload, timeout=10.0,
+                            retry_not_sent=True, retry_any=edit)
         else:
             form = {k: v if isinstance(v, str) else json.dumps(v) for k, v in payload.items()}
-            r = httpx.post(url, data=form, files={"photo": photo}, timeout=30.0)
+            r = tg_api.post(cfg.telegram_bot_token, method, data=form, files={"photo": photo}, timeout=30.0,
+                            retry_not_sent=True)
     except httpx.HTTPError as e:
-        print(f"handoff: HTTP error: {type(e).__name__}", file=sys.stderr)
+        if tg_api.is_unconfirmed(e) and not edit:
+            print(_("handoff: Telegram не подтвердил {method}: сообщение могло дойти без кнопок, "
+                    "передача закрыта").format(method=method), file=sys.stderr)
+            if int(payload.get("chat_id") or 0) < 0:
+                # Группа: второе сообщение туда было бы дублем людям.
+                print(_("handoff: это группа, заново не вызывай, скажи Ивану"), file=sys.stderr)
+        else:
+            print(f"handoff: HTTP error: {type(e).__name__}", file=sys.stderr)
         return None
+    if edit and tg_api.not_modified(r):
+        return {"ok": True, "result": True}
     if r.status_code != 200:
         # Без URL: в нём токен бота.
         print(f"handoff: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
         return None
-    return r.json()
+    res = r.json()
+    if not edit:
+        from . import reactions
+        reactions.remember_sent(res, payload.get("text") or payload.get("caption"), cfg.state_dir)
+    return res
 
 
 def markup(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
-    return {"inline_keyboard": [[{"text": b["text"], **({"url": b["url"]} if "url" in b
-                                                       else {"callback_data": b["data"]})}
-                                 for b in row] for row in rows]}
+    from .buttons import keyboard
+
+    return keyboard(rows)
 
 
 def _cmd_ask(args: argparse.Namespace, base: Path, primary_chat_id: int) -> int:

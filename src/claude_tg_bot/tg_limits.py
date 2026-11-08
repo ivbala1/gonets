@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 from telegram.ext import ContextTypes
 
@@ -40,8 +40,11 @@ def _limit_retry_pending(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
 
 
 def _limit_defer(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, chat_id: int, thread_id: int | None,
-                 prompt: str, fire_at: float, retry: int, event_ref: dict | None = None) -> bool:
-    """Отложенный промпт, как /at: переживает рестарт, уходит фоновым раном."""
+                 prompt: str, fire_at: float, retry: int, event_ref: dict | None = None,
+                 replaces: Collection[str] = ()) -> bool:
+    """Отложенный промпт, как /at: переживает рестарт, уходит фоновым раном.
+    replaces: запись /at, которая везла запрос: снимается той же записью
+    файла, иначе авария до её снятия дала бы после рестарта два рана."""
     store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
     if store is None or getattr(ctx.application, "job_queue", None) is None:
         return False
@@ -55,12 +58,14 @@ def _limit_defer(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, chat_id: int, th
     # Событие с диска передаёт заданию id, срок и тишину: после рестарта оно не
     # будится второй раз, а задание само проверит срок (ревью Codex 22.10.2026).
     payload.update({k: v for k, v in (event_ref or {}).items() if v is not None})
+    popped = {old: store.data.pop(old) for old in replaces if old in store.data}
     try:
         store.set(jid, json.dumps(payload, ensure_ascii=False))
         _b._schedule_at_job(ctx.application, jid, payload)
     except Exception:
         # Готовый ответ важнее отложенного задания: он уходит с пометкой.
         log.exception("limit: deferral failed chat=%s", chat_key)
+        store.data.update(popped)  # исходное снимет его владелец, как без переноса
         with contextlib.suppress(Exception):
             store.remove(jid)
         return False
@@ -82,7 +87,8 @@ async def _limit_hold(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, msg: Any, cha
                       chat_id: int, thread_id: int | None, prompt: str, *,
                       unattended: bool, untrusted: bool, movable: bool, limit_retry: int,
                       event_ref: dict | None = None,
-                      on_moved: Callable[[], None] | None = None) -> bool:
+                      on_moved: Callable[[], None] | None = None,
+                      replaces: Collection[str] = ()) -> bool:
     """Резерв лимита Claude (limits.py): с 97% пятичасового или 99% недельного
     окна идёт только разговор Ивана в чате Домового. Остальное откладывается до
     сброса, а что ждать не может, пропускается с уведомлением. True: ран не
@@ -103,7 +109,7 @@ async def _limit_hold(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, msg: Any, cha
             if _limit_note_once(ctx, chat_key, until) else ""
     elif movable and limit_retry < limits.MAX_RETRIES \
             and _limit_defer(ctx, chat_key, chat_id, thread_id, prompt, fire_at, limit_retry + 1,
-                             event_ref):
+                             event_ref, replaces):
         if on_moved is not None:
             on_moved()
         text = head + _(": запрос отложен до {when} и уйдёт сам фоновым раном.").format(

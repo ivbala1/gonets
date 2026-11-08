@@ -41,11 +41,12 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
-from ...config import local_zone
+from ... import paths
+from ...config import _int_env, agent_env, local_zone
 from ...i18n import _
 from ...notify import send_message
-from ...dashes import soften_dashes
-from .._oneshot import resolve_claude_bin, run_claude_oneshot
+from ... import procs
+from .._oneshot import resolve_claude_bin, run_claude_json
 from .core import (
     NOTHING,
     Candidate,
@@ -70,11 +71,8 @@ from .core import (
 )
 
 SKILL_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SKILL_DIR.parents[3]
-HOOK_SETTINGS = REPO_ROOT / "claude-hook-settings.json"
 SOURCES_FILE = SKILL_DIR / "sources.json"
 PROFILE_FILE = SKILL_DIR / "profile.md"
-TZ = local_zone()
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) claude-tg-bot news-digest"
 DEFAULT_MODEL = "sonnet"
 DEFAULT_TIMEOUT_SEC = 600
@@ -84,14 +82,8 @@ INPUT_BUDGET = 60_000
 FAIL_NOTICE_STREAK = 3
 
 
-def _int_env(name: str) -> int | None:
-    raw = os.environ.get(name, "").strip()
-    return int(raw) if raw else None
-
-
 def state_root() -> Path:
-    raw = os.environ.get("CLAUDE_TG_BOT_STATE_DIR", "").strip()
-    return news_dir(Path(raw) if raw else REPO_ROOT / "state")
+    return news_dir(paths.state_dir())
 
 
 def fetch(client: httpx.Client, src: dict, state: State, now: datetime) -> tuple[list[Candidate], list[str] | None]:
@@ -136,47 +128,22 @@ def installed_summary() -> str:
     with contextlib.suppress(OSError):
         skills = sorted(p.name for p in (home / ".claude/skills").iterdir() if (p / "SKILL.md").is_file())
         lines.append(_("Свои скиллы: {skills}").format(skills=", ".join(skills)))
-    for name, cmd in (("Claude Code", "claude"), ("Codex CLI", "codex")):
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            out = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+    # claude тем же путём, что и ран (CLAUDE_BIN, затем PATH); нет его: строки нет.
+    for name, cmd in (("Claude Code", None), ("Codex CLI", "codex")):
+        with contextlib.suppress(OSError, RuntimeError, subprocess.SubprocessError):
+            argv = [cmd or resolve_claude_bin(), "--version"]
+            # Без секретов бота: main уже загрузил .env в окружение.
+            out = procs.run_bounded_sync(argv, text=True, timeout=30, env=agent_env()).stdout.strip()
             if out:
                 lines.append(f"{name}: {out.splitlines()[0]}")
     return "\n".join(lines)
 
 
 def run_claude(prompt: str, timeout: int, model: str) -> str:
-    """Ран без единого инструмента и MCP, как у chat_digest: во входе чужой
-    текст из интернета, читать и писать claude здесь нечего."""
-    args = [
-        resolve_claude_bin(), "-p",
-        "--output-format", "json",
-        "--permission-mode", "plan",
-        "--tools", "",
-        "--no-session-persistence",
-        "--settings", str(HOOK_SETTINGS),
-        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-        "--model", model,
-    ]
-    try:
-        proc = run_claude_oneshot(args, input=prompt.encode("utf-8"), timeout=timeout, cwd=str(REPO_ROOT))
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(_("claude не уложился в {seconds} с").format(seconds=timeout)) from None
-    except OSError as e:
-        raise RuntimeError(_("claude не запустился: {error}").format(error=type(e).__name__)) from None
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        kind = (_("лимит или доступ") if any(k in stderr for k in ("429", "401", "rate", "limit"))
-                else _("ошибка запуска"))
-        raise RuntimeError(_("claude exit {rc}: {kind}").format(rc=proc.returncode, kind=kind))
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(_("claude stdout не JSON: {error}").format(error=e)) from e
-    if payload.get("is_error"):
-        raise RuntimeError(_("claude вернул is_error=true"))
-    # Тире на дефис здесь: хук против тире в плановых ранах бота молчит, его
-    # строка «Исправлено» подменила бы сводку (решение Ивана 22.10.2026).
-    return soften_dashes((payload.get("result") or "").strip())
+    """Ран без единого инструмента и MCP (_oneshot.run_claude_json): во входе
+    чужой текст из интернета."""
+    return run_claude_json(prompt, timeout=timeout, model=model)
+
 
 
 def _send(chat: int, thread: int, text: str, rows: list | None = None, *, html: bool = False) -> int | None:
@@ -187,7 +154,8 @@ def _send(chat: int, thread: int, text: str, rows: list | None = None, *, html: 
     if rows:
         argv += ["--buttons", json.dumps(rows, ensure_ascii=False)]
     rc, mid = send_message([*argv, "--", text])
-    return mid if rc == 0 else None
+    # rc 0 без номера: отправка не подтверждена, но пункт считается доставленным (0).
+    return (mid or 0) if rc == 0 else None
 
 
 def _fail_line(reason: str) -> str:
@@ -216,8 +184,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="отправить в тему по-настоящему, но не отмечать виденным (проба вида)")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    load_dotenv(REPO_ROOT / ".env")
-    chat, thread = _int_env("NEWS_TG_CHAT_ID"), _int_env("NEWS_TG_THREAD_ID")
+    load_dotenv(paths.ENV_FILE)
+    chat, thread = _int_env("NEWS_TG_CHAT_ID", None), _int_env("NEWS_TG_THREAD_ID", None)
     if not args.dry_run and (chat is None or thread is None):
         # Fail-closed: не в личку и не в чужую тему.
         print(_("news_digest: нужны NEWS_TG_CHAT_ID и NEWS_TG_THREAD_ID в .env (пара)"), file=sys.stderr)
@@ -229,9 +197,10 @@ def main(argv: list[str] | None = None) -> int:
         if not locked:
             print(_("news_digest: другой прогон ещё идёт, этот пропущен"))
             return 0
-        state = load_state(state_file)
+        state = load_state(state_file, keep_corrupt=not args.dry_run)
         now = datetime.now(timezone.utc)
-        now_local = now.astimezone(TZ)
+        tz = local_zone()  # после load_dotenv: CLAUDE_TG_BOT_TZ может быть только в .env
+        now_local = now.astimezone(tz)
         hours = args.since if args.since is not None else (FIRST_RUN_HOURS if state.first_run else WINDOW_DAYS * 24)
         floor = now - timedelta(hours=hours)
 
@@ -261,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             новые строки пропали бы навсегда."""
             if args.dry_run or args.preview:
                 return
-            mark_seen(state, picked, now_local.date().isoformat(), now)
+            mark_seen(state, picked, now_local.date().isoformat(), now_local)
             keep_old = held | lost_sources
             state.snapshots.update({k: v for k, v in snapshots.items() if k not in keep_old})
             state.fail_streak = {n: k for n, k in streaks.items() if k}
@@ -292,11 +261,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         prompt = build_prompt(PROFILE_FILE.read_text(encoding="utf-8"), installed_summary(),
-                              picked, floor, f"{now_local:%Y-%m-%d}", recent_feedback(base))
+                              picked, floor.astimezone(tz), f"{now_local:%Y-%m-%d}", recent_feedback(base))
         if args.dry_run and args.print_prompt:
             print(prompt + "\n\n=====\n")
         model = os.environ.get("NEWS_DIGEST_MODEL", "").strip() or DEFAULT_MODEL
-        timeout = _int_env("NEWS_DIGEST_TIMEOUT_SEC") or DEFAULT_TIMEOUT_SEC
+        timeout = _int_env("NEWS_DIGEST_TIMEOUT_SEC", None) or DEFAULT_TIMEOUT_SEC
         try:
             raw = run_claude(prompt, timeout, model)
             items = [] if raw.strip() == NOTHING else parse_answer(raw, picked)
@@ -324,13 +293,14 @@ def main(argv: list[str] | None = None) -> int:
                 count=len(items), dropped=len(dropped)))
             return 0
         # Выпуск пишется до отправки: кнопку могут нажать сразу после первого сообщения.
-        save_digest(base, digest_id, items, dropped, now)
+        save_digest(base, digest_id, items, dropped, now_local)
         delivered = []
         for item in items:
             mid = _send(chat, thread, render_item(item), item_buttons(item, digest_id), html=True)
             if mid is None:
                 break
-            set_message_id(base, digest_id, item.n, mid)
+            if mid:
+                set_message_id(base, digest_id, item.n, mid)
             delivered.append(item)
         write_last(base, digest_id, delivered, dropped, items[len(delivered):])
         if len(delivered) < len(items):

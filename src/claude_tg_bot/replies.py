@@ -18,12 +18,11 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-import httpx
 from telegram import MessageEntity, ReplyParameters, Update
-from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
-from . import reactions
+from . import jsonstore, reactions, tg_api
 from .claude_runner import ClaudeResult
 from .config import Config
 from .i18n import _
@@ -35,8 +34,9 @@ log = logging.getLogger(__name__)
 # которых запрос точно не ушёл (соединение или TLS не установлены, пул занят),
 # поэтому дубля не будет. Тайм-аут чтения не повторяем: сообщение могло дойти.
 # Случай 13.10.2026: ConnectError на TLS, готовый ответ Claude потерян.
-_SEND_RETRY_DELAYS = (2.0, 5.0)
-_NOT_SENT_CAUSES = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Признаки и паузы общие с прямыми вызовами Bot API (tg_api).
+_SEND_RETRY_DELAYS = tg_api.RETRY_DELAYS
+_NOT_SENT_CAUSES = tg_api.NOT_SENT
 # 429 (RetryAfter): Telegram запрос не выполнил, пережидаем его паузу и шлём
 # снова, дубля нет. Случай 14.10.2026: две темы задач завелись подряд,
 # группа упёрлась в лимит, итоговый план с кнопками потерялся.
@@ -50,8 +50,10 @@ _SLOW_SEND_SEC = 3.0
 def is_unconfirmed(e: BaseException) -> bool:
     """Запрос ушёл, ответа Telegram не дождались: сообщение обычно доходит,
     иногда минуты спустя (случаи 30-31.10.2026: 1, 5 и 125 с после таймаута).
-    Это не отказ, и слать то же самое заново значит слать дубль."""
-    return isinstance(e, TimedOut) and isinstance(e.__cause__, httpx.ReadTimeout)
+    Это не отказ, и слать то же самое заново значит слать дубль. ReadError сюда
+    не входит: httpcore глушит сбой записи запроса и отдаёт его как ReadError,
+    то есть запрос мог не дойти (ревью 05.11.2026)."""
+    return isinstance(e, TimedOut) and e.__cause__ is not None and tg_api.is_unconfirmed(e.__cause__)
 
 
 async def _send_retrying(send: Callable[[], Awaitable[Any]]) -> Any:
@@ -87,7 +89,7 @@ async def _send_once(send: Callable[[], Awaitable[Any]]) -> Any:
     уходит дальше, а вызывающие не шлют уже ушедшее заново."""
     try:
         return await _send_retrying(send)
-    except TimedOut as e:
+    except NetworkError as e:
         if not is_unconfirmed(e):
             raise
         log.warning("reply send unconfirmed by Telegram, not repeated")
@@ -171,17 +173,20 @@ def _quote_of(msg) -> ReplyParameters | None:
 async def send_voice_caption(msg, audio: bytes, caption: str, reply_markup=None) -> Any:
     """Голосовой ответ с подписью; разметка в подписи та же, что в тексте."""
     log.info("voice send bytes=%d", len(audio))
+    # Случаи 07.11.2026: ответ Telegram на голосовое 100-450 КБ не приходил за
+    # общие 30 с, при живой сети; ждём, как файл (_SEND_FILE_TIMEOUT).
+    wait = {"read_timeout": _SEND_FILE_TIMEOUT, "write_timeout": _SEND_FILE_TIMEOUT}
     plain, entities = render_markup(caption)
     if not entities:
         return await _send_retrying(lambda: msg.reply_voice(
-            voice=audio, caption=caption, reply_markup=reply_markup))
+            voice=audio, caption=caption, reply_markup=reply_markup, **wait))
     try:
         return await _send_retrying(lambda: msg.reply_voice(
-            voice=audio, caption=plain, caption_entities=entities, reply_markup=reply_markup))
+            voice=audio, caption=plain, caption_entities=entities, reply_markup=reply_markup, **wait))
     except BadRequest:
         log.exception("markup entities rejected in caption, sending raw")
         return await _send_retrying(lambda: msg.reply_voice(
-            voice=audio, caption=caption, reply_markup=reply_markup))
+            voice=audio, caption=caption, reply_markup=reply_markup, **wait))
 
 
 # Ссылки в голос не идут: «эйч-ти-ти-пи двоеточие слэш слэш» слушать незачем.
@@ -243,7 +248,7 @@ _SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
 def _rendered_len(text: str) -> int:
-    return _utf16_len(render_markup(text)[0])
+    return utf16_len(render_markup(text)[0])
 
 
 def _pack(pieces: list[str], sep: str, budget: int) -> list[str]:
@@ -283,7 +288,7 @@ def _hard_cut(text: str, budget: int) -> list[str]:
     parts: list[str] = []
     cur, used = "", 0
     for ch in text:
-        size = _utf16_len(ch)
+        size = utf16_len(ch)
         if cur and used + size > budget:
             parts.append(cur)
             cur, used = "", 0
@@ -356,7 +361,7 @@ def save_full_text(state_dir: Path, text: str, chat_id: int) -> str:
             if now - old.stat().st_mtime > _FULL_TEXT_TTL_SEC:
                 old.unlink()
     token = secrets.token_hex(8)
-    (folder / f"{token}.txt").write_text(f"{chat_id}\n{text}", encoding="utf-8")
+    jsonstore.write_text(folder / f"{token}.txt", f"{chat_id}\n{text}")  # 0600: текст ответа
     return token
 
 
@@ -411,7 +416,7 @@ _STYLE_GROUPS = (
 )
 
 
-def _utf16_len(s: str) -> int:
+def utf16_len(s: str) -> int:
     # Смещения сущностей Telegram считает в UTF-16 (эмодзи занимают две единицы).
     return len(s.encode("utf-16-le")) // 2
 
@@ -426,7 +431,7 @@ class _Out:
 
     def text(self, s: str) -> None:
         self.parts.append(s)
-        self.offset += _utf16_len(s)
+        self.offset += utf16_len(s)
 
     def wrap(self, kind: str, fill, **kw) -> None:
         start = self.offset
@@ -697,6 +702,49 @@ def extract_quiet_marker(text: str) -> tuple[bool, str]:
     return (True, cleaned.strip()) if found else (False, text)
 
 
+# Повторная проверка, которую агент назначает себе сам (идея agent-autoloop,
+# решение Ивана 04.11.2026): <<LATER:30m|что проверить>>. Срок разбирает
+# tg_at.schedule_later, здесь только форма. Устроено как ASK, но «>» в тексте
+# допустим, а цитата формата в `коде` маркером не считается (ревью 04.11.2026).
+_LATER_RE = re.compile(r"<<LATER:([^\n]+?)>>")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+LATER_MAX_ABOUT_LEN = 200
+
+
+def extract_later_marker(text: str) -> tuple[tuple[str, str] | None, str]:
+    """<<LATER:срок|текст>> в самом конце ответа → ((срок, текст), текст без маркера).
+
+    Считается только последний маркер вне ``` ``` ``` и `кода`, и только если
+    после него одни пробелы, а строка с ним не цитата «>»: агент ставит свой
+    в конце ответа, маркер из процитированного письма или страницы посреди
+    ответа не срабатывает (ревью 04.11.2026). Без «|», с пустой частью или
+    длинным текстом маркер остаётся в тексте как есть, другие тоже.
+    """
+    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    # Одиночные кавычки ищутся вне блоков: иначе ``` склеился бы с соседней.
+    outside = _FENCE_RE.sub(lambda f: " " * len(f.group(0)), text)
+    fences += [(m.start(), m.end()) for m in _INLINE_CODE_RE.finditer(outside)]
+    opened = re.search(r"(?m)^[ \t]*```", outside)
+    if opened:
+        # Незакрытый блок (оборванный ответ) идёт до конца текста (ревью Codex
+        # 04.11.2026); ``` посреди строки текста блоком не считается (ревью Opus).
+        fences.append((opened.start(), len(text)))
+    marks = [m for m in _LATER_RE.finditer(text)
+             if not any(start <= m.start() < end for start, end in fences)]
+    if not marks:
+        return None, text
+    m = marks[-1]
+    line_head = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+    if text[m.end():].strip() or line_head.lstrip().startswith(">"):
+        return None, text
+    spec, sep, about = m.group(1).partition("|")
+    spec, about = spec.strip(), about.strip()
+    if not sep or not spec or not about or len(about) > LATER_MAX_ABOUT_LEN:
+        return None, text
+    cleaned = text[:m.start()] + text[m.end():]
+    return (spec, about), re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 # Сколько отметок одного вида называть в футере; остальные числом (журнал audit полный).
 _RUN_NOTES_SHOWN = 8
 
@@ -825,7 +873,7 @@ def _fit_utf16(text: str, limit: int) -> int:
 def split_for_telegram(text: str, limit: int) -> list[str]:
     # Лимит Telegram в единицах UTF-16, эмодзи вне BMP по две: кусок по
     # числу знаков отвергался целиком (аудит очереди 31.10.2026).
-    if _utf16_len(text) <= limit:
+    if utf16_len(text) <= limit:
         return [text]
     out: list[str] = []
     remaining = text

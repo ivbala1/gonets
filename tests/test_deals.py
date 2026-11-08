@@ -237,7 +237,7 @@ class DealDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.answer = "ok"
         self.fail_fork = False
         cfg = SimpleNamespace(
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,
             state_dir=state, allowed_user_ids={7}, allowed_chat_ids=set(),
@@ -299,7 +299,7 @@ class DealDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
 
     def _msg(self, **kw) -> SimpleNamespace:
-        msg = SimpleNamespace(message_thread_id=None, is_topic_message=False, chat_id=1,
+        msg = SimpleNamespace(message_thread_id=None, is_topic_message=False, chat_id=1, message_id=1,
                               chat=SimpleNamespace(id=1), set_reaction=AsyncMock(), forward_origin=None)
         msg.reply_text = AsyncMock(side_effect=lambda text, **_kw: SimpleNamespace(
             message_id=next(self.card_ids), text=text, chat=SimpleNamespace(id=1), chat_id=1,
@@ -325,14 +325,14 @@ class DealDispatchTests(unittest.IsolatedAsyncioTestCase):
         data = deals.load(deals.deals_dir(self.state))
         return list(data.values())[-1] if data else {}
 
-    async def _tap(self, deal: dict, n: int = 1, card=None) -> SimpleNamespace:
+    async def _tap(self, deal: dict, n: int = 1, card=None, stamp: str = "") -> SimpleNamespace:
         deal = deals.load(deals.deals_dir(self.state))[deal["id"]]
         card = card or SimpleNamespace(
             message_id=deal["card_msg"], chat=SimpleNamespace(id=1), chat_id=1,
             text=f"{deals.head(deal)}\n❓ {deal['question']}",
             message_thread_id=None, is_topic_message=False, set_reaction=AsyncMock(),
             reply_text=self._msg().reply_text)
-        query = SimpleNamespace(data=f"deal:{deal['id']}:{n}", answer=AsyncMock(), message=card,
+        query = SimpleNamespace(data=f"deal:{deal['id']}:{n}{stamp}", answer=AsyncMock(), message=card,
                                 edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
         update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
                                  effective_chat=SimpleNamespace(id=1, type="private"), update_id=2)
@@ -352,6 +352,29 @@ class DealDispatchTests(unittest.IsolatedAsyncioTestCase):
         card_text = self.morning_msg.reply_text.await_args_list[-1].args[0]
         self.assertTrue(card_text.startswith(deals.head(deal)))
         self.assertIsNotNone(deal["card_msg"])
+
+    async def test_unconfirmed_card_press_adopts_number(self) -> None:
+        # Карточка дела ушла без подтверждения: номера нет, первое нажатие с
+        # кнопки этого же вопроса (метка в кнопке) называет его; кнопка
+        # прежнего вопроса того же дела не подходит (ревью Codex 05.11.2026)
+        from claude_tg_bot import tg_deals
+        deal = await self._morning()
+        with deals.locked(deals.deals_dir(self.state)) as data:
+            data[deal["id"]]["card_msg"] = None
+        fresh = self._deal(deal["id"])
+
+        def card(mid: int) -> SimpleNamespace:
+            return SimpleNamespace(message_id=mid, chat=SimpleNamespace(id=1), chat_id=1, text="карточка",
+                                   message_thread_id=None, is_topic_message=False,
+                                   set_reaction=AsyncMock(), reply_text=self._msg().reply_text)
+        await self._tap(fresh, card=card(990), stamp=f":{tg_deals._deal_stamp(fresh) - 1}")
+        await self._tap(fresh, card=card(989))
+        self.assertEqual(self._deal(deal["id"])["state"], "asked")
+        self.answer = "Позвоню вечером."
+        await self._tap(fresh, card=card(991), stamp=f":{tg_deals._deal_stamp(fresh)}")
+        d = self._deal(deal["id"])
+        self.assertEqual(d["card_msg"], 991)
+        self.assertNotEqual(d["state"], "asked")
 
     async def test_without_flag_ordinary_card(self) -> None:
         self.answer = "План.<<ASK:Звонить маме?|да|нет>>"

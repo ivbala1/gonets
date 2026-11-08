@@ -86,7 +86,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         self.result_error = False
         self.run_hook = None  # async (kw) -> None, зовётся внутри рана
         self.cfg = SimpleNamespace(
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             codex_fallback_sandbox="read-only",
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,

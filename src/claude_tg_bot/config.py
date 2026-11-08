@@ -8,12 +8,13 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import dotenv_values, load_dotenv
 
-from . import warm
+from . import paths, tg_api, warm
 
 # Снимок os.environ перед первым load_dotenv (см. load_config).
 ENV_BEFORE_DOTENV: dict[str, str] | None = None
@@ -27,13 +28,14 @@ BOT_SECRET_ENV_NAMES = frozenset({
     "TELEGRAM_BOT_TOKEN", "APPROVE_SHARED_SECRET", "OPENAI_API_KEY",
     "IMMICH_API_KEY", "NEWS_GITHUB_TOKEN", "GEMINI_API_KEY", "TELEGRAM_API_HASH",
 })
-# Новые секреты в .env бота ловятся по имени, без правки списка выше.
+# Новые секреты в .env бота ловятся по имени, без правки списка выше. Срез идёт
+# и agent-browser (procs, 07.11.2026): его ключи *_PASSWORD, *_TOKEN держать вне .env бота.
 _SECRET_NAME_RE = re.compile(r"(?:TOKEN|SECRET|API_KEY|PASSWORD|PASSWD)$")
 # MCP на чтение без карточки (APPROVE_MCP_AUTO_ALLOW_REGEX), см. load_config.
 DEFAULT_MCP_AUTO_ALLOW_REGEX = (
     r"(?!get_invite_link$)(?:slack_)?(?:analyze|fetch|get|list|lookup|query|read|search|suggest|validate)[A-Za-z0-9_]*"
 )
-BOT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+BOT_ENV_FILE = paths.ENV_FILE
 
 
 def agent_env(base: dict[str, str] | None = None, *, env_file: Path = BOT_ENV_FILE) -> dict[str, str]:
@@ -109,6 +111,13 @@ def local_zone() -> ZoneInfo:
         return ZoneInfo(name or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
         return ZoneInfo("UTC")
+
+
+def now_local() -> datetime:
+    """Сейчас в поясе бота (aware). Наивный datetime.now() дал бы пояс системы."""
+    return datetime.now(local_zone())
+
+
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -125,8 +134,8 @@ def _validate_hook_settings(path: Path) -> None:
             "Approve-механизм не подключится — отказ стартовать (fail-closed)."
         )
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:  # ValueError: и битый JSON, и не UTF-8
         raise RuntimeError(f"hook settings file invalid: {path}: {e}") from e
 
     pre_tool = (data.get("hooks") or {}).get("PreToolUse")
@@ -373,7 +382,7 @@ def load_projects(path: Path) -> tuple[Project, ...]:
         return ()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:  # ValueError: и битый JSON, и не UTF-8
         print(f"[config] WARNING: projects file {path} невалиден: {e} — скоупинг тем выключен", file=sys.stderr)
         return ()
     if not isinstance(data, dict):
@@ -432,6 +441,11 @@ class Config:
     openai_tts_instructions: str
     voice_reply_max_chars: int
     voice_max_duration_sec: int
+    # Запасное распознавание GigaAM, когда OpenAI не распознал (пустой баланс,
+    # сбой) или ключа нет. Пусто в любом из трёх = выключено.
+    local_stt_python: str
+    local_stt_model_dir: str
+    local_stt_vad_model: str
     telegram_text_limit: int
     telegram_caption_limit: int
     large_reply_as_file_threshold: int
@@ -460,11 +474,6 @@ class Config:
     download_min_free_bytes: int
     # Общий срок одной большой загрузки (вход, повтор, скачивание), секунды.
     big_download_timeout_sec: int
-    # Regex для auto-allow безопасных Bash-команд без approve-карточки.
-    # Каждый сегмент команды (split по |/;/&&/||) должен матчиться + не содержать
-    # `$(` `` ` `` `>` `<` (за исключением безобидных `2>/dev/null`/`2>&1` etc).
-    # None = выключено (старое поведение, все Bash через approve).
-    bash_auto_allow_re: re.Pattern[str] | None
     # Regex для auto-allow read-only MCP-инструментов без approve-карточки.
     # Матчится по имени инструмента БЕЗ префикса mcp__<server>__ (fullmatch).
     # Нужен, чтобы mcp__* в hook-matcher не душил карточками ни чтение из
@@ -557,19 +566,22 @@ class Config:
     hangs_file: Path | None = None
     hangs_chat_keys: frozenset[str] = frozenset()
     workshop_chat_key: str = ""
-    # Карточка плана: одно «✅ Делай план» пускает остальные шаги запуска, кроме
-    # исключений (approval._plan_card_tags). С 03.11.2026 по умолчанию выключена:
-    # без карточки и так идёт всё, кроме опасного (serious.py); PLAN_CARDS=1 включает.
+    # Карточка плана «✅ Делай план». С 03.11.2026 по умолчанию выключена: с
+    # 04.11.2026 без карточки и так идёт всё, кроме отправки людям; PLAN_CARDS=1 включает.
     plan_cards: bool = False
-    # Серверы заказчиков (шаблоны fnmatch по имени или адресу из ~/.ssh/config):
-    # изменения на них идут карточкой (serious.py). Адреса в .env, не в коде.
-    approve_customer_hosts: tuple[str, ...] = ()
     # Юнит сервера Telegram: из него корни файлов для проверки пути send_file
     # до карточки (outbound.path_refusal). None: проверки нет.
     telegram_mcp_unit: Path | None = None
     # Порт сервера Telegram на loopback: Bash, который туда ходит, идёт карточкой
     # (serious.py, отправка мимо проверки). 0: проверки нет.
     telegram_mcp_port: int = 8770
+    # Группа и тема «Новостей» (NEWS_TG_CHAT_ID, NEWS_TG_THREAD_ID): пометка
+    # агенту в теме и группа тем задач. None: не задано или не число.
+    news_tg_chat_id: int | None = None
+    news_tg_thread_id: int | None = None
+    # Адрес сервера Bot API (TELEGRAM_BOT_API_URL, tg_api): облако или свой
+    # telegram-bot-api на ПК. Остальные модули читают ту же строку через tg_api.
+    telegram_bot_api_url: str = tg_api.DEFAULT_URL
     workshop_model: str = "opus"
     workshop_effort: str = "high"
     workshop_scope: str = ""
@@ -579,9 +591,20 @@ class Config:
         return min(self.allowed_user_ids)
 
 
-def _int_env(name: str, default: int) -> int:
+def bridge_url(cfg: Config, path: str) -> str:
+    """Адрес моста бота (`/approve`, `/restart`, `/task`). IPv6 (`::1`) в URL
+    только в квадратных скобках, иначе httpx ругается InvalidURL; адрес уже в
+    скобках второй раз не оборачивается. Имя или IPv4 как есть."""
+    host = cfg.approve_http_host
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
+    return f"http://{host}:{cfg.approve_http_port}{path}"
+
+
+def _int_env(name: str, default: int | None) -> int | None:
     """int из env с fallback: пустое/мусор → default + WARNING, а не падение
-    старта трейсбэком (опечатка в одном числовом ключе не должна валить бот)."""
+    старта трейсбэком (опечатка в одном числовом ключе не должна валить бот).
+    default=None для ключа без умолчания (номер чата скилла)."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -590,6 +613,25 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         print(f"[config] WARNING: {name}={raw!r} не целое число — беру {default}", file=sys.stderr)
         return default
+
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """Да/нет из env, одно правило на все ключи: 1/true/yes/on и 0/false/no/off
+    без учёта регистра; пустое значит default, прочее default + WARNING."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_WORDS:
+        return True
+    if raw in _FALSE_WORDS:
+        return False
+    print(f"[config] WARNING: {name}={raw!r} не да/нет (1/0, true/false, yes/no, on/off) — беру {default}",
+          file=sys.stderr)
+    return default
 
 
 def _float_env(name: str, default: float) -> float:
@@ -634,12 +676,17 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     global ENV_BEFORE_DOTENV
     if ENV_BEFORE_DOTENV is None:
         ENV_BEFORE_DOTENV = dict(os.environ)
-    # Голый load_dotenv() при `python -c` искал бы от cwd, а не от этого файла.
-    load_dotenv(BOT_ENV_FILE if BOT_ENV_FILE.is_file() else None)
+    # Голый load_dotenv() при `python -c` искал бы от cwd, а не от этого файла;
+    # отсутствующий явный файл просто пропускается.
+    load_dotenv(BOT_ENV_FILE)
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
+    try:
+        bot_api_url = tg_api.api_url()
+    except ValueError as e:
+        raise RuntimeError(str(e)) from None
 
     raw_ids = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").strip()
     if not raw_ids:
@@ -677,18 +724,12 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     ).expanduser().resolve()
 
     # По умолчанию — рядом с пакетом: .../claude-tg-bot/claude-hook-settings.json
-    default_hook_settings = Path(__file__).resolve().parents[2] / "claude-hook-settings.json"
-    hook_settings = Path(
-        os.environ.get("CLAUDE_HOOK_SETTINGS", str(default_hook_settings))
-    ).expanduser().resolve()
+    hook_settings = paths.hook_settings()
 
-    # Дефолт резолвим относительно project root (где pyproject.toml), а не cwd.
-    # Иначе hook, запущенный claude в CLAUDE_CWD, и notify из произвольной cwd
-    # создавали бы лишние state/ где угодно.
-    default_state_dir = Path(__file__).resolve().parents[2] / "state"
-    state_dir = Path(
-        os.environ.get("CLAUDE_TG_BOT_STATE_DIR", str(default_state_dir))
-    ).expanduser().resolve()
+    # Относительный путь и умолчание от корня бота (где pyproject.toml), а не
+    # от cwd. Иначе hook, запущенный claude в CLAUDE_CWD, и notify из
+    # произвольной cwd создавали бы лишние state/ где угодно.
+    state_dir = paths.state_dir()
     # Не создаём директорию здесь — load_config зовётся и из hook_approve / notify,
     # которым state/ не нужен. SessionStore/audit сами делают mkdir(parents=True).
 
@@ -785,10 +826,13 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     openai_tts_instr = os.environ.get("OPENAI_TTS_INSTRUCTIONS", "").strip()
     voice_max = _int_env("VOICE_REPLY_MAX_CHARS", 4000)
     voice_dur = _int_env("VOICE_MAX_DURATION_SEC", 180)
+    local_stt_python = os.path.expanduser(os.environ.get("LOCAL_STT_PYTHON", "").strip())
+    local_stt_model_dir = os.path.expanduser(os.environ.get("LOCAL_STT_MODEL_DIR", "").strip())
+    local_stt_vad_model = os.path.expanduser(os.environ.get("LOCAL_STT_VAD_MODEL", "").strip())
     tg_text = _int_env("TELEGRAM_TEXT_LIMIT", 4000)
     tg_caption = _int_env("TELEGRAM_CAPTION_LIMIT", 1024)
     # Нулевые лимиты зацикливают разбиение ответа (ревью 12.10.2026).
-    for name, value, ceiling in (("TELEGRAM_TEXT_LIMIT", tg_text, 4096),
+    for name, value, ceiling in (("TELEGRAM_TEXT_LIMIT", tg_text, tg_api.TEXT_LIMIT),
                                  ("TELEGRAM_CAPTION_LIMIT", tg_caption, 1024),
                                  ("VOICE_REPLY_MAX_CHARS", voice_max, None)):
         if value < 1 or (ceiling is not None and value > ceiling):
@@ -832,14 +876,6 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
             f"CLAUDE_TG_BOT_EFFORT={effort_level!r} invalid, допустимо: {', '.join(EFFORT_LEVELS)}"
         )
 
-    raw_bash_re = os.environ.get("APPROVE_BASH_AUTO_ALLOW_REGEX", "").strip()
-    bash_auto_allow_re: re.Pattern[str] | None = None
-    if raw_bash_re:
-        try:
-            bash_auto_allow_re = re.compile(raw_bash_re)
-        except re.error as e:
-            raise RuntimeError(f"APPROVE_BASH_AUTO_ALLOW_REGEX invalid regex: {e}") from e
-
     # Дефолт покрывает read-only глаголы (в т.ч. camelCase вроде getJiraIssue
     # и slack_read_*/slack_search_*). Пустое значение переменной = выключить
     # auto-allow, все MCP через карточку.
@@ -854,10 +890,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
 
     # Persona: добавляется к системному промпту Claude на каждом run.
     # Дефолт — <project_root>/telegram-persona.md. Если файла нет — пусто (no-op).
-    default_persona = Path(__file__).resolve().parents[2] / "telegram-persona.md"
-    persona_file = Path(
-        os.environ.get("CLAUDE_TG_BOT_PERSONA_FILE", str(default_persona))
-    ).expanduser().resolve()
+    persona_file = paths.env_path("CLAUDE_TG_BOT_PERSONA_FILE", "telegram-persona.md")
     persona_text = ""
     if persona_file.exists():
         try:
@@ -868,10 +901,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
     # Проекты для авто-скоупинга forum-тем по имени. Дефолт — projects.json в
     # корне проекта (рядом с pyproject.toml). Файл env-специфичен (абсолютные
     # пути на сервере), поэтому в репо лежит projects.example.json.
-    default_projects = Path(__file__).resolve().parents[2] / "projects.json"
-    projects_file = Path(
-        os.environ.get("CLAUDE_TG_BOT_PROJECTS_FILE", str(default_projects))
-    ).expanduser().resolve()
+    projects_file = paths.env_path("CLAUDE_TG_BOT_PROJECTS_FILE", "projects.json")
     projects = load_projects(projects_file)
 
     # Idle-TTL сессии в часах (env), храним в секундах. 0/отрицательное = выкл.
@@ -889,7 +919,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         m for m in (x.strip() for x in raw_choices.split(",")) if m
     ) or DEFAULT_MODEL_CHOICES
     model_choices_dynamic = not raw_choices
-    show_cost_footer = os.environ.get("SHOW_COST_FOOTER", "true").strip().lower() not in ("0", "false", "no", "off")
+    show_cost_footer = _bool_env("SHOW_COST_FOOTER", True)
     try:
         context_warn_tokens = int(os.environ.get("CONTEXT_WARN_TOKENS", "200000") or "200000")
     except ValueError:
@@ -912,7 +942,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
             "codex-фоллбэк/gpt: упадут при первом вызове.",
             file=sys.stderr,
         )
-    codex_fallback = os.environ.get("CODEX_FALLBACK", "true").strip().lower() not in ("0", "false", "no", "off")
+    codex_fallback = _bool_env("CODEX_FALLBACK", True)
     try:
         codex_timeout = int(os.environ.get("CODEX_TIMEOUT_SEC", "600") or "600")
     except ValueError:
@@ -929,7 +959,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         raise RuntimeError(
             f"CODEX_FALLBACK_SANDBOX={codex_fallback_sandbox!r} invalid, допустимо: {', '.join(sorted(_codex_sandboxes))}"
         )
-    codex_network_access = os.environ.get("CODEX_NETWORK_ACCESS", "false").strip().lower() in ("1", "true", "yes", "on")
+    codex_network_access = _bool_env("CODEX_NETWORK_ACCESS", False)
     if codex_network_access:
         for _var, _sb in (("CODEX_SANDBOX", codex_sandbox),
                           ("CODEX_FALLBACK_SANDBOX", codex_fallback_sandbox)):
@@ -941,7 +971,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
                 )
     codex_prefix = os.environ.get("CODEX_PREFIX", "gpt:").strip() or "gpt:"
     workshop_chat_key = os.environ.get("WORKSHOP_CHAT_KEY", "").strip()
-    plan_cards = os.environ.get("PLAN_CARDS", "0").strip().lower() in ("1", "true", "yes", "on")
+    plan_cards = _bool_env("PLAN_CARDS", False)
     if workshop_chat_key and not re.fullmatch(r"-?\d+:\d+", workshop_chat_key):
         print(f"[config] WARNING: WORKSHOP_CHAT_KEY={workshop_chat_key!r} не вида <chat>:<thread>, мастерская выключена",
               file=sys.stderr)
@@ -975,6 +1005,9 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         openai_tts_instructions=openai_tts_instr,
         voice_reply_max_chars=voice_max,
         voice_max_duration_sec=voice_dur,
+        local_stt_python=local_stt_python,
+        local_stt_model_dir=local_stt_model_dir,
+        local_stt_vad_model=local_stt_vad_model,
         telegram_text_limit=tg_text,
         telegram_caption_limit=tg_caption,
         large_reply_as_file_threshold=large_as_file,
@@ -987,7 +1020,6 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         telegram_api_hash=tg_api_hash,
         download_min_free_bytes=min_free,
         big_download_timeout_sec=big_timeout,
-        bash_auto_allow_re=bash_auto_allow_re,
         mcp_auto_allow_re=mcp_auto_allow_re,
         effort_level=effort_level,
         projects=projects,
@@ -1016,14 +1048,15 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         approve_guarded_data_hint=guarded_hint,
         workshop_chat_key=workshop_chat_key,
         plan_cards=plan_cards,
-        approve_customer_hosts=tuple(
-            h.strip() for h in os.environ.get("APPROVE_CUSTOMER_HOSTS", "").split(",") if h.strip()),
         telegram_mcp_unit=Path(unit).expanduser() if (unit := os.environ.get(
             "TELEGRAM_MCP_UNIT", "~/.config/systemd/user/telegram-mcp.service").strip()) else None,
         telegram_mcp_port=_int_env("TELEGRAM_MCP_PORT", 8770),
+        news_tg_chat_id=_int_env("NEWS_TG_CHAT_ID", None),
+        news_tg_thread_id=_int_env("NEWS_TG_THREAD_ID", None),
+        telegram_bot_api_url=bot_api_url,
         agent_role_chat_keys=frozenset(
             k.strip() for k in os.environ.get("AGENT_ROLE_CHAT_KEYS", "").split(",") if k.strip()),
-        hangs_file=Path(os.environ["HANGS_FILE"].strip()).expanduser()
+        hangs_file=paths.env_path("HANGS_FILE", "")
         if os.environ.get("HANGS_FILE", "").strip() else None,
         hangs_chat_keys=frozenset(
             k.strip() for k in os.environ.get("HANGS_CHAT_KEYS", "").split(",") if k.strip()),

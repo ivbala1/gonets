@@ -18,7 +18,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .claude_runner import _CREDENTIALS_PATH
+from . import jsonstore
+from .claude_runner import _CREDENTIALS_PATH, oauth_credentials
 
 log = logging.getLogger(__name__)
 
@@ -31,12 +32,8 @@ _FAMILY_RE = re.compile(r"^claude-([a-z]+)-")
 
 def _access_token(path: Path = _CREDENTIALS_PATH) -> str | None:
     """OAuth access-token Claude Code; None без файла или при логине по ключу."""
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
-    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    oauth = oauth_credentials(path)
+    token = oauth.get("accessToken") if oauth else None
     return token if isinstance(token, str) and token else None
 
 
@@ -92,12 +89,7 @@ def cached_models(state_dir: Path, *, ttl_sec: float = CACHE_TTL_SEC,
     """Модели из кэша, пока он свежий; иначе запрос к API с обновлением
     кэша. Ошибка запроса оставляет прошлый кэш (пусть и старый) либо []."""
     cache_path = state_dir / CACHE_NAME
-    try:
-        cached = json.loads(cache_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        cached = {}
-    if not isinstance(cached, dict):
-        cached = {}
+    cached = jsonstore.read_dict(cache_path, keep_corrupt=False)  # кэш: копия битого не нужна
     stale_models = cached.get("models") if isinstance(cached.get("models"), list) else []
     fetched_at = cached.get("fetched_at") if isinstance(cached.get("fetched_at"), (int, float)) else 0
     if stale_models and now() - fetched_at < ttl_sec:
@@ -109,10 +101,7 @@ def cached_models(state_dir: Path, *, ttl_sec: float = CACHE_TTL_SEC,
                     "прошлый кэш" if stale_models else "пустой список")
         return stale_models
     try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"fetched_at": now(), "models": models}, ensure_ascii=False, indent=1))
-        tmp.replace(cache_path)
+        jsonstore.write_json(cache_path, {"fetched_at": now(), "models": models}, indent=1)
     except OSError as exc:
         log.warning("кэш моделей не записался: %s", exc)
     return models

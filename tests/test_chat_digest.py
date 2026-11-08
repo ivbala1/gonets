@@ -10,7 +10,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot.i18n import _  # noqa: E402
+from claude_tg_bot.skills import _oneshot  # noqa: E402
 from claude_tg_bot.skills.chat_digest import __main__ as skill  # noqa: E402
+from claude_tg_bot.skills.chat_digest import core as skill_core  # noqa: E402
 from claude_tg_bot.skills.chat_digest.core import (  # noqa: E402
     PLAIN_TOPIC_ID,
     ChatUnread,
@@ -115,7 +117,7 @@ class FormatTest(unittest.TestCase):
         topic.messages.append(_msg(103, "фото", media="Photo", reply_to=101, forwarded_from="Канал"))
         text = format_topic(topic)
         self.assertIn(_("# Тема «{title}», непрочитанных {count}").format(title="Девочки", count=3), text)
-        self.assertIn("103 2026-09-11T10:00+00:00 Маша: [Photo] "
+        self.assertIn("103 " + skill_core._local_stamp("2026-09-11T10:00+00:00") + " Маша: [Photo] "
                       + _("[пересылка: {sender}]").format(sender="Канал") + " "
                       + _("(ответ на {id})").format(id=101) + " фото", text)
 
@@ -323,13 +325,14 @@ class MainFlowTest(unittest.TestCase):
 
 
 class ClaudeRunTest(unittest.TestCase):
+    # Запуск общий для сводок: skills._oneshot.run_claude_json.
     def test_timeout_becomes_runtime_error(self):
         import subprocess
 
         def boom(*a, **kw):
             raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
 
-        with patch.object(skill, "run_claude_oneshot", boom), patch.object(skill, "resolve_claude_bin", lambda: "claude"):
+        with patch.object(_oneshot, "run_claude_oneshot", boom), patch.object(_oneshot, "resolve_claude_bin", lambda: "claude"):
             with self.assertRaises(RuntimeError) as cm:
                 skill.run_digest_claude("x", 1)
         self.assertEqual(str(cm.exception), _("claude не уложился в {seconds} с").format(seconds=1))
@@ -340,7 +343,7 @@ class ClaudeRunTest(unittest.TestCase):
         def failing(*a, **kw):
             return CompletedProcess(a, 1, b"", b"very-private-detail 429 rate limit")
 
-        with patch.object(skill, "run_claude_oneshot", failing), patch.object(skill, "resolve_claude_bin", lambda: "claude"):
+        with patch.object(_oneshot, "run_claude_oneshot", failing), patch.object(_oneshot, "resolve_claude_bin", lambda: "claude"):
             with self.assertRaises(RuntimeError) as cm:
                 skill.run_digest_claude("x", 1)
         self.assertNotIn("very-private-detail", str(cm.exception))

@@ -15,9 +15,11 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime
 
 from telegram.ext import Application, ContextTypes
 
+from .config import local_zone
 from .i18n import _
 
 log = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ def burst_until_ts(ctx: ContextTypes.DEFAULT_TYPE, target_key: str) -> float:
 
 
 def format_burst_local(ts: float) -> str:
-    return time.strftime("%H:%M:%S", time.localtime(ts))
+    return datetime.fromtimestamp(ts, local_zone()).strftime("%H:%M:%S")
 
 
 async def _burst_expiry_watcher(

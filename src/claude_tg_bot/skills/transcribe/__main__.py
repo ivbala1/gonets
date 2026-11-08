@@ -36,8 +36,7 @@ import tempfile
 from pathlib import Path
 
 from ... import voice
-from ...config import load_config
-from ...danger import _secret_path
+from ...config import agent_env, load_config
 from ...i18n import _
 
 OUT_DIR = Path("/tmp/transcribe")
@@ -45,6 +44,10 @@ CHUNK_SEC = 600
 MAX_SEC = 4 * 3600
 PARALLEL = 4
 FFMPEG_TIMEOUT_SEC = 600
+# Срок ответа whisper-1 на кусок CHUNK_SEC в режиме --segments: он медленнее
+# модели бота, а срок бота (voice.OPENAI_STT_TIMEOUT_SEC, 120 с) сорвал бы
+# весь файл на одном долгом куске. Без срока у SDK 600 с на попытку.
+SEGMENTS_TIMEOUT_SEC = 300.0
 SEGMENTS_MODEL = "whisper-1"
 
 
@@ -54,12 +57,10 @@ def hms(seconds: float) -> str:
 
 
 def check_input(raw: str) -> Path:
-    """Путь до чтения: без секретов, обычный файл."""
-    if _secret_path(raw, str(Path.cwd())):
-        raise SystemExit(_("путь похож на секрет, расшифровывать не буду"))
+    """Путь до чтения: обычный файл. Проверки «путь похож на секрет» с
+    04.11.2026 нет: она стояла на разборе danger, удалённом вместе с замком
+    «только чтение» (решение Ивана: секреты без карточки)."""
     path = Path(raw).expanduser().resolve()
-    if _secret_path(str(path)):
-        raise SystemExit(_("путь похож на секрет, расшифровывать не буду"))
     if not path.is_file():
         raise SystemExit(_("нет такого файла: {path}").format(path=path))
     return path
@@ -72,7 +73,7 @@ def probe_duration(path: Path) -> float:
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=codec_type:format=duration",
              "-of", "json", f"file:{path}"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=agent_env(),
         )
     except subprocess.TimeoutExpired:
         raise SystemExit(_("ffprobe не уложился в минуту"))
@@ -92,7 +93,7 @@ def split_audio(path: Path, work: Path) -> list[Path]:
              "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-b:a", "48k",
              "-f", "segment", "-segment_time", str(CHUNK_SEC),
              str(work / "c%03d.mp3")],
-            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC,
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC, env=agent_env(),
         )
     except subprocess.TimeoutExpired:
         raise SystemExit(_("ffmpeg не уложился в {seconds} с").format(seconds=FFMPEG_TIMEOUT_SEC))
@@ -129,7 +130,7 @@ async def _one(client, cfg, chunk: Path, offset: float, segments: str | None) ->
     if cfg.openai_stt_prompt:
         kwargs["prompt"] = cfg.openai_stt_prompt
     resp = await client.audio.transcriptions.create(
-        file=(chunk.name, chunk.read_bytes()), **kwargs)
+        file=(chunk.name, chunk.read_bytes()), timeout=SEGMENTS_TIMEOUT_SEC, **kwargs)
     return "\n".join(segment_lines(resp.segments or [], offset))
 
 

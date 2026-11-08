@@ -30,9 +30,12 @@ class OneshotMarksScheduledTests(unittest.TestCase):
         self.assertNotIn(_oneshot.SCHEDULED_ENV, os.environ)
 
     def test_mark_name_is_public_contract(self) -> None:
-        # Сторож Домового (~/src/domovoy, domovoy/oneshot.py) ставит эту же
-        # переменную своим кодом, без импорта бота. Переименование здесь молча
-        # оставит его без решения «без карточки»: менять только вместе.
+        # Метку читают без импорта бота хуки Свода (~/src/svod: agent/hooks
+        # no_dash_guard, outbound_name_guard, unsent_work и
+        # engine/lib/memorycontext.py). Переименование здесь молча вернёт
+        # плановым ранам их поведение для живой сессии: менять только вместе.
+        # Домовой метку больше не ставит: его раны идут с `--setting-sources ""`,
+        # хуки там не грузятся.
         self.assertEqual(_oneshot.SCHEDULED_ENV, "CLAUDE_TG_BOT_SCHEDULED")
 
 

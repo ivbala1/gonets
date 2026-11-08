@@ -1,5 +1,4 @@
-"""Тесты yt_subs: выбор дорожки, чистка VTT, абзацы и то, что вызов скилла
-со ссылкой YouTube проходит без карточки."""
+"""Тесты yt_subs: выбор дорожки, чистка VTT, абзацы."""
 from __future__ import annotations
 
 import sys
@@ -8,7 +7,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot.approval import _SKILL_PYTHON, _bash_auto_allowed  # noqa: E402
 from claude_tg_bot.skills.yt_subs.__main__ import (  # noqa: E402
     pick_track,
     to_paragraphs,
@@ -72,24 +70,6 @@ class VttTests(unittest.TestCase):
         self.assertEqual(text.strip().split("\n\n")[0], "а" * 30 + ". " + "б" * 30 + " " + "в" * 30 + ".")
         long_run = to_paragraphs(["г" * 50] * 3, width=40)
         self.assertEqual(len(long_run.strip().split("\n\n")), 2)
-
-
-class AutoAllowTests(unittest.TestCase):
-    _CMD = f"{_SKILL_PYTHON} -m claude_tg_bot.skills.yt_subs"
-
-    def test_call_with_url_needs_no_card(self) -> None:
-        for cmd in (
-            self._CMD + ' "https://www.youtube.com/watch?v=LgWaWJ2Xv4I&t=60s"',
-            self._CMD + " 'https://youtu.be/FxkfmkUrQCI' --lang en",
-            self._CMD + ' "https://youtu.be/x" 2>&1',
-        ):
-            with self.subTest(cmd=cmd):
-                self.assertTrue(_bash_auto_allowed(cmd, None))
-
-    def test_unquoted_ampersand_stays_on_card(self) -> None:
-        # Без кавычек `&` отправит skill в фон и выполнит хвост отдельно.
-        cmd = self._CMD + " https://www.youtube.com/watch?v=x&rm -rf ~"
-        self.assertFalse(_bash_auto_allowed(cmd, None))
 
 
 if __name__ == "__main__":

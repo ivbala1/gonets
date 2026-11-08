@@ -11,12 +11,14 @@ import hashlib
 import html
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from ... import jsonstore
 from ...i18n import N_, _
 
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -419,26 +421,30 @@ def news_dir(state_dir: Path) -> Path:
     return state_dir / "news_digest"
 
 
-def load_state(path: Path) -> State:
-    if not path.is_file():
+def load_state(path: Path, *, keep_corrupt: bool = True) -> State:
+    """Нет файла или битый (он откладывается рядом): как первый запуск, а не
+    падение каждого прогона по таймеру до ручной правки. keep_corrupt=False
+    для пробного прогона: он состояние не меняет и битое не откладывает."""
+    existed = path.exists()
+    data = jsonstore.read_dict(path, keep_corrupt=keep_corrupt)
+    if not data:  # сохранённое состояние всегда с ключами
+        if existed:
+            print(f"news_digest: состояние {path} пустое, битое или нечитаемое"
+                  f"{' (битое отложено рядом)' if keep_corrupt else ''}, "
+                  "начинаю как первый запуск: уже отправленное за это окно может прийти снова",
+                  file=sys.stderr)
         return State(first_run=True)
-    data = json.loads(path.read_text(encoding="utf-8"))
     return State(seen=data.get("seen") or {}, snapshots=data.get("snapshots") or {},
                  fail_streak=data.get("fail_streak") or {})
 
 
 def save_state(path: Path, state: State) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"seen": state.seen, "snapshots": state.snapshots,
-                               "fail_streak": state.fail_streak}, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    jsonstore.write_json(path, {"seen": state.seen, "snapshots": state.snapshots,
+                                "fail_streak": state.fail_streak})
 
 
 def _write_json(path: Path, data: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    jsonstore.write_json(path, data, indent=1)
 
 
 def _item_from(raw: dict) -> Item:
@@ -449,10 +455,7 @@ def _item_from(raw: dict) -> Item:
 def load_digest(base: Path, digest_id: str) -> dict | None:
     """Выпуск нового вида (с номерами сообщений) или None. Выпуски первого
     вида (одним сообщением с сеткой кнопок) кнопками больше не обслуживаются."""
-    f = base / "digests" / f"{digest_id}.json"
-    if not f.is_file():
-        return None
-    data = json.loads(f.read_text(encoding="utf-8"))
+    data = jsonstore.read_dict(base / "digests" / f"{digest_id}.json", keep_corrupt=False)
     return data if data.get("v") == DIGEST_VERSION else None
 
 
@@ -494,9 +497,11 @@ def write_last(base: Path, digest_id: str, sent: list[Item], dropped: list[Candi
 
 def set_message_id(base: Path, digest_id: str, n: int, message_id: int) -> None:
     f = base / "digests" / f"{digest_id}.json"
-    data = json.loads(f.read_text(encoding="utf-8"))
+    data = jsonstore.read_dict(f, keep_corrupt=False)
+    if not data:
+        return  # выпуск пропал или битый: номер сообщения некуда записать
     for raw in data.get("items") or []:
-        if raw.get("n") == n:
+        if isinstance(raw, dict) and raw.get("n") == n:
             raw["message_id"] = message_id
     _write_json(f, data)
 
@@ -513,10 +518,7 @@ def find_item_by_message(base: Path, message_id: int) -> tuple[str, Item] | None
     """Пункт, отправленный сообщением message_id (для ответа на него в теме)."""
     ddir = base / "digests"
     for f in sorted(ddir.glob("*.json"), reverse=True) if ddir.is_dir() else []:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+        data = jsonstore.read_dict(f, keep_corrupt=False)
         if data.get("v") != DIGEST_VERSION:
             continue
         for raw in data.get("items") or []:
@@ -532,25 +534,16 @@ FEEDBACK_LABELS = {"p": N_("в список"), "w": N_("в работу"), "x": 
 
 def append_feedback(base: Path, digest_id: str, item: Item, action: str, now: datetime) -> None:
     """Строка в журнал отзывов: p в список, w в работу, x мимо, u отмена «мимо»."""
-    base.mkdir(parents=True, exist_ok=True)
     row = {"at": now.isoformat(timespec="seconds"), "digest": digest_id, "n": item.n, "action": action,
            "title": item.title, "source": item.source, "url": item.url}
-    with open(base / "feedback.jsonl", "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    jsonstore.jsonl_append(base / "feedback.jsonl", row)
 
 
 def recent_feedback(base: Path, limit: int = FEEDBACK_EXAMPLES) -> list[str]:
     """Последние действующие отзывы, свежие сверху: по пункту побеждает
     последнее нажатие, отменённое «мимо» не считается."""
-    f = base / "feedback.jsonl"
-    if not f.is_file():
-        return []
     last: dict[tuple[str, int], dict] = {}
-    for line in f.read_text(encoding="utf-8").splitlines():
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
+    for row in jsonstore.jsonl_tail(base / "feedback.jsonl"):
         if str(row.get("action", "")).startswith("task:"):
             continue  # итог задачи «В работу» это судьба задачи, а не оценка новости
         key = (row.get("digest"), row.get("n"))

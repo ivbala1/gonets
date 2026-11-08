@@ -4,21 +4,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 
-from telegram import (ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions,
+from telegram import (ForceReply, LinkPreviewOptions,
                       ReplyParameters, Update)
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
 from . import tasks
+from .buttons import markup as _markup, strip_buttons
 from .claude_runner import ClaudeResult, SessionStore
-from .config import Config
+from .config import Config, now_local
 from .i18n import _
-from .replies import _send_retrying, extract_loud_marker, extract_quiet_marker
+from .replies import (_send_retrying, extract_later_marker, extract_loud_marker, extract_quiet_marker,
+                      is_unconfirmed, split_for_telegram)
 from .skills.news_digest import core as news
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
@@ -27,17 +28,10 @@ log = logging.getLogger("claude_tg_bot.bot")
 
 # ---- Темы задач (tasks.py, переделка 16.10.2026) ----
 
-def _markup(rows: list[list[dict]]) -> InlineKeyboardMarkup | None:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(b["text"], callback_data=b["data"]) for b in row] for row in rows]
-    ) if rows else None
-
-
 def _task_for(cfg: Config, chat_id: int, thread_id: int | None,
               ctx: ContextTypes.DEFAULT_TYPE | None = None) -> dict | None:
     """Задача темы. Реестр не читается, а тема помечена как тема задачи:
-    задача без номера в обдумывании, чтобы ран шёл только чтением (ревью
-    Codex 13.10)."""
+    задача без номера в обдумывании (ревью Codex 13.10)."""
     if thread_id is None:
         return None
     try:
@@ -330,10 +324,12 @@ async def _task_start_admitted(query, cfg: Config, ctx: ContextTypes.DEFAULT_TYP
     if kind == "full":
         await _b._answer_quietly(query, _("Открыто {count} задач: сначала закрой одну").format(count=tasks.MAX_OPEN),
                               show_alert=True)
+        # Длинные заголовки: список режется, как ответы claude.
         with contextlib.suppress(Exception):
-            await msg.reply_text(_("Открытые задачи:\n{lines}").format(lines=tasks.open_list(opened)),
-                                 disable_notification=True,
-                                 link_preview_options=LinkPreviewOptions(is_disabled=True))
+            for chunk in split_for_telegram(_("Открытые задачи:\n{lines}").format(lines=tasks.open_list(opened)),
+                                            cfg.telegram_text_limit):
+                await msg.reply_text(chunk, disable_notification=True,
+                                     link_preview_options=LinkPreviewOptions(is_disabled=True))
         return
     await _b._answer_quietly(query, _("Завожу тему задачи"))
     try:
@@ -458,8 +454,11 @@ async def _task_new_card(ctx: ContextTypes.DEFAULT_TYPE, task: dict, line: str, 
         task = _task_update(cfg, tid, card_id=card.message_id) or task
         with contextlib.suppress(Exception):
             await ctx.bot.pin_chat_message(chat_id, card.message_id, disable_notification=True)
-    except Exception:
+    except Exception as e:
         log.warning("news task card failed", exc_info=True)
+        if is_unconfirmed(e):
+            # Карточка, возможно, ушла: старт её заново не шлёт (card_unsure).
+            task = _task_update(cfg, tid, card_unsure=True) or task
     return task
 
 
@@ -476,12 +475,9 @@ def _task_unborn(cfg: Config, tid: str) -> None:
         log.error("tasks registry unreadable, %s not freed: %s", tid, e)
 
 
-def _tasks_chat_id() -> int | None:
+def _tasks_chat_id(cfg: Config) -> int | None:
     """Группа тем задач: та же, что у «Новостей» (проект шага 3, 1.4)."""
-    try:
-        return int(os.environ.get("NEWS_TG_CHAT_ID", "").strip())
-    except ValueError:
-        return None
+    return cfg.news_tg_chat_id
 
 
 def _is_task_ask_reply(ctx: ContextTypes.DEFAULT_TYPE, msg: Any) -> bool:
@@ -550,7 +546,7 @@ async def _task_new(ctx: ContextTypes.DEFAULT_TYPE, words: str, tid: str, origin
     не будет. origin_key: тема, чья память переходит в задачу (решение Ивана
     13.10.2026, вопрос 3а)."""
     cfg: Config = ctx.application.bot_data["cfg"]
-    group = _tasks_chat_id()
+    group = _tasks_chat_id(cfg)
     if group is None:
         return _("Темы задач заводятся в группе с «Новостями», а она не задана "
                  "(NEWS_TG_CHAT_ID в .env бота).")
@@ -563,7 +559,7 @@ async def _task_new(ctx: ContextTypes.DEFAULT_TYPE, words: str, tid: str, origin
         item = tasks.command_item(words)
         try:
             with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
-                kind, task = tasks.reserve(data, tid, item, group, datetime.now().astimezone(),
+                kind, task = tasks.reserve(data, tid, item, group, now_local(),
                                            source="command", trusted=True, origin=origin,
                                            context=context.strip()[:tasks.COMMAND_TEXT_MAX])
                 task = dict(task) if task else None
@@ -666,10 +662,13 @@ async def _task_add(ctx: ContextTypes.DEFAULT_TYPE, tid: str, words: str, contex
                     task["chat_id"], tasks.addition_echo(words), message_thread_id=task["thread_id"],
                     link_preview_options=LinkPreviewOptions(is_disabled=True)))
             except Exception as e:
-                log.warning("task addition echo failed %s", tid, exc_info=True)
-                _task_add_settle(cfg, tid)
-                bd["active_work"] -= 1
-                return _("В тему задачи не ушло ({error}), не добавлено").format(error=type(e).__name__)
+                if not is_unconfirmed(e):
+                    log.warning("task addition echo failed %s", tid, exc_info=True)
+                    _task_add_settle(cfg, tid)
+                    bd["active_work"] -= 1
+                    return _("В тему задачи не ушло ({error}), не добавлено").format(error=type(e).__name__)
+                # Эхо обычно в теме видно: «не добавлено» вело к повтору и второму эху.
+                log.warning("task addition echo unconfirmed by Telegram, added anyway %s", tid)
             ctx.application.create_task(_b._task_add_run(ctx, task, tasks.addition_prompt(words, context)))
         except BaseException:
             bd["active_work"] -= 1
@@ -717,8 +716,9 @@ async def _task_intro(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -
     try:
         upd = _b._synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
         try:
-            await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, permission_mode="plan",
-                                      admitted=True)
+            # Обычный режим, как следующие ходы обдумывания (решение Ивана
+            # 04.11.2026: замка «только чтение» нет, правило в промте).
+            await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True)
         except Exception:
             log.exception("news task intro failed %s", task["id"])
         # Задачу могли закрыть, пока уходил ответ: снимок с заведения темы затёр
@@ -815,12 +815,10 @@ async def _task_do(ctx: ContextTypes.DEFAULT_TYPE, tid: str, sha: str, press: st
             return
         await say(_("Этот проект уже не действует: под последним проектом своя кнопка"), alert=True)
         if query is not None:
-            with contextlib.suppress(Exception):
-                await query.edit_message_reply_markup(reply_markup=None)
+            await strip_buttons(query)
         return
     if query is not None:
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await strip_buttons(query)
     await say(_("▶️ Выполняю"))
     ctx.application.create_task(_task_exec(ctx, task))
 
@@ -836,7 +834,7 @@ def _task_exec_finish(cfg: Config, ref: dict, result: ClaudeResult, stopping: bo
     ok = summary is not None and not tasks.exec_failed(summary)
     text = summary or (result.text if result.is_error else _(tasks.EXEC_UNCONFIRMED))
     # Итог хранится до доставки и может уйти отдельно: метка звука в нём лишняя.
-    text = extract_quiet_marker(extract_loud_marker(text)[1])[1]
+    text = extract_later_marker(extract_quiet_marker(extract_loud_marker(text)[1])[1])[1]
     try:
         with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
             current = data.get(ref["id"])
@@ -1010,7 +1008,7 @@ async def _task_note(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
             if target is None:
                 fresh["note_due"] = None
                 return True
-            if not tasks.claim(fresh, "note_sending", datetime.now().astimezone()):
+            if not tasks.claim(fresh, "note_sending", now_local()):
                 return False
             fresh = dict(fresh)
     except (OSError, ValueError) as e:
@@ -1022,14 +1020,16 @@ async def _task_note(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
         await _send_retrying(lambda: ctx.bot.send_message(
             chat_id, tasks.close_note(fresh), reply_parameters=reply,
             link_preview_options=LinkPreviewOptions(is_disabled=True)))
-    except Exception:
+    except Exception as e:
         log.warning("task close note failed %s", task["id"], exc_info=True)
-        with contextlib.suppress(OSError, ValueError):
-            with tasks.locked(base) as data:
-                current = data.get(task["id"])
-                if current is not None:
-                    tasks.release_note(current)
-        return False
+        if not is_unconfirmed(e):
+            with contextlib.suppress(OSError, ValueError):
+                with tasks.locked(base) as data:
+                    current = data.get(task["id"])
+                    if current is not None:
+                        tasks.release_note(current)
+            return False
+        # Неподтверждённая отправка: строка, скорее всего, дошла, повтор дал бы дубль.
     with contextlib.suppress(OSError, ValueError):
         _task_update(cfg, task["id"], note_due=None, note_sending=None,
                      noted=datetime.now().astimezone().isoformat(timespec="seconds"))
@@ -1049,9 +1049,10 @@ async def _task_offer_do(ctx: ContextTypes.DEFAULT_TYPE, task: dict, line: str) 
             message_thread_id=task["thread_id"], disable_notification=True,
             reply_markup=_markup(tasks.do_buttons(task["id"], task["plan_sha"])))
         offer_due = None
-    except Exception:
+    except Exception as e:
         log.warning("task do offer failed %s", task["id"], exc_info=True)
-        offer_due = True
+        # Неподтверждённая отправка: кнопка, скорее всего, ушла, повтор дал бы дубль.
+        offer_due = None if is_unconfirmed(e) else True
     with contextlib.suppress(OSError, ValueError):
         _task_update(cfg, task["id"], expect=("proposed",), expect_sha=task.get("plan_sha"), offer_due=offer_due)
 
@@ -1067,7 +1068,7 @@ async def _task_post_result(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
             fresh = data.get(task["id"])
             if fresh is None or not fresh.get("result_unsent") or not fresh.get("thread_id"):
                 return True
-            if not tasks.claim(fresh, "result_posting", datetime.now().astimezone()):
+            if not tasks.claim(fresh, "result_posting", now_local()):
                 return False
             fresh = dict(fresh)
     except (OSError, ValueError) as e:
@@ -1078,9 +1079,10 @@ async def _task_post_result(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> bool:
             fresh["chat_id"], tasks.unsent_result(fresh), message_thread_id=fresh["thread_id"],
             link_preview_options=LinkPreviewOptions(is_disabled=True)))
         done = True
-    except Exception:
+    except Exception as e:
         log.warning("task result post failed %s", task["id"], exc_info=True)
-        done = False
+        # Неподтверждённая отправка: итог, скорее всего, дошёл, повтор дал бы дубль.
+        done = is_unconfirmed(e)
     with contextlib.suppress(OSError, ValueError):
         if done:
             _task_update(cfg, task["id"], result_unsent=None, result_posting=None)
@@ -1110,8 +1112,7 @@ async def on_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if parsed is None or task is None or task.get("status") not in tasks.OPEN_STATUSES:
         await _b._answer_quietly(query, _("Кнопка устарела или задача уже закрыта"))
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await strip_buttons(query)
         return
     tid, action, sha = parsed
     pressed_in = getattr(getattr(query.message, "chat", None), "id", None) or getattr(query.message, "chat_id", None)
@@ -1121,8 +1122,7 @@ async def on_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if action == "keep":
         await _b._answer_quietly(query, _("Оставляю"))
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await strip_buttons(query)
         return
     if action == "do":
         await _task_do(ctx, tid, sha, press=query.id, query=query)
@@ -1150,8 +1150,7 @@ async def on_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if closed.get("note_due"):
         await _b._task_note(ctx, closed)
     if query.message is not None and query.message.message_id != closed.get("card_id"):
-        with contextlib.suppress(Exception):
-            await query.edit_message_reply_markup(reply_markup=None)
+        await strip_buttons(query)
 
 
 async def _tasks_housekeeping(ctx: ContextTypes.DEFAULT_TYPE, startup: bool = False) -> None:
@@ -1161,7 +1160,7 @@ async def _tasks_housekeeping(ctx: ContextTypes.DEFAULT_TYPE, startup: bool = Fa
     cfg: Config = ctx.application.bot_data["cfg"]
     base = tasks.registry_dir(cfg.state_dir)
     sessions: SessionStore | None = ctx.application.bot_data.get("sessions")
-    now = datetime.now().astimezone()
+    now = now_local()
     try:
         registry = tasks.load(base, strict=True)
     except (OSError, ValueError) as e:
@@ -1249,6 +1248,9 @@ async def _tasks_housekeeping(ctx: ContextTypes.DEFAULT_TYPE, startup: bool = Fa
                     log.warning("news task reminder failed %s: %s", tid, e)
             except TelegramError as e:
                 log.warning("news task reminder failed %s: %s", tid, e)
+                if is_unconfirmed(e):
+                    # Напоминание, скорее всего, дошло: дату ставим, повтор дал бы дубль.
+                    _task_update(cfg, tid, reminded=now.isoformat(timespec="seconds"))
         if not gone:
             continue
         if thread_id:
@@ -1300,8 +1302,10 @@ async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 said = True
             except BadRequest:
                 said = True
-            except Exception:
+            except Exception as e:
                 log.warning("cut thinking notice failed %s", task["id"], exc_info=True)
+                # Неподтверждённая отправка: сообщение, скорее всего, дошло, повтор дал бы дубль.
+                said = is_unconfirmed(e)
         if said:
             with contextlib.suppress(OSError, ValueError):
                 _task_update(cfg, task["id"], think_open=None)
@@ -1316,14 +1320,14 @@ async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for task in list(registry.values()):
         status = task.get("status")
         if (status in tasks.OPEN_STATUSES and status != "creating" and task.get("thread_id")
-                and not task.get("card_id")):
+                and not task.get("card_id") and not task.get("card_unsure")):
             log.warning("news task %s without card, sending it", task["id"])
             await _task_new_card(ctx, task, tasks.stage_line(task), status)
 
 
 async def _tasks_startup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Через полминуты после старта: права бота в группе новостей и уборка."""
-    chat_id = _tasks_chat_id()
+    chat_id = _tasks_chat_id(ctx.application.bot_data["cfg"])
     if chat_id is not None:
         try:
             me = await ctx.bot.get_me()

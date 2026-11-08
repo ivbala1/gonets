@@ -229,7 +229,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.dir.cleanup()
 
     async def run_stream(self, events, rc):
-        proc = MagicMock(returncode=rc, pid=123456)
+        proc = MagicMock(returncode=rc, pid=123456789)
         proc.stdin.drain = AsyncMock()
         proc.wait = AsyncMock(return_value=rc)
         proc.stdout = asyncio.StreamReader()

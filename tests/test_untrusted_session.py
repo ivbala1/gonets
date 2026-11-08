@@ -52,7 +52,7 @@ class UntrustedSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.runs: list[dict] = []
         self.answer = "ok"
         cfg = SimpleNamespace(
-            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False,
+            codex_trigger_prefix="gpt:", codex_bin="", codex_fallback=False, news_tg_chat_id=None, news_tg_thread_id=None,
             session_idle_ttl_sec=0, claude_bin="claude", claude_cwd=Path("/"),
             hook_settings_path=Path("/x.json"), max_claude_runtime_sec=0,
         )
@@ -190,11 +190,14 @@ class UntrustedSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
         run = await self._run("вечер", unattended=True)
         self.assertIsNone(run["resumed"])
 
-    async def test_plan_run_continues_legacy_marked_session(self) -> None:
+    async def test_plan_run_drops_legacy_marked_session(self) -> None:
+        # С 04.11.2026 хук не ограничивает и режим plan (решение Ивана: замка
+        # «только чтение» нет), поэтому фоновый plan-ран тоже не продолжает
+        # сессию с чужим текстом.
         await self._run("утро", unattended=True)
         self._legacy_mark("sid-0")
         run = await self._run("план", unattended=True, permission_mode="plan")
-        self.assertEqual(run["resumed"], "sid-0")
+        self.assertNotEqual(run["resumed"], "sid-0")
 
     async def test_mark_stops_working_after_reset(self) -> None:
         await self._run("утро", unattended=True)

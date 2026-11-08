@@ -22,7 +22,7 @@ import sys
 
 import httpx
 
-from .config import load_config
+from .config import bridge_url, load_config
 from .skills._oneshot import SCHEDULED_ENV
 
 
@@ -60,21 +60,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(result))
         return 0
-    # IPv6-адреса (например `::1`) в URL должны быть в квадратных скобках,
-    # иначе httpx ругается InvalidURL: `http://::1:8788/approve` парсится
-    # криво. Hostname без `:` (DNS-имя или IPv4) проходит как есть.
-    host = cfg.approve_http_host
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
-    url = f"http://{host}:{cfg.approve_http_port}/approve"
+    url = bridge_url(cfg, "/approve")
     # permission_mode нужен серверу, чтобы отличить plan-ран от фонового;
     # scheduled помечает oneshot-ран скилла, чью сессию бот не знает.
     body = {
         "tool_name": tool_name, "tool_input": tool_input, "session_id": session_id,
         "permission_mode": payload.get("permission_mode") or "",
         "scheduled": os.environ.get(SCHEDULED_ENV) == "1",
-        # Каталог агента: от него danger оценивает относительные пути
-        # (ревью 11.10.2026).
+        # Каталог агента: от него проверки отправки (serious, outbound)
+        # раскрывают относительные пути (ревью 11.10.2026).
         "cwd": payload.get("cwd") or "",
     }
     headers = {}

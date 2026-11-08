@@ -233,10 +233,10 @@ class SendAfterCardTests(_Env):
         self.assertEqual(kind, "card")
         mailsend.write_ticket(self.state, info["digest"], "s3")
 
-    def _run(self) -> tuple[int, MagicMock, str]:
+    def _run(self, refused: dict | None = None) -> tuple[int, MagicMock, str]:
         smtp = MagicMock()
         smtp.__enter__.return_value = smtp
-        smtp.send_message.return_value = {}
+        smtp.send_message.return_value = refused or {}
         cfg = SimpleNamespace(state_dir=self.state, approve_shared_secret="s3")
         out, err = io.StringIO(), io.StringIO()
         argv = ["--to", "hr@example.com", "--subject", "DevOps (Senior)", "--body-file", str(self.body),
@@ -270,6 +270,14 @@ class SendAfterCardTests(_Env):
         code, smtp, _ = self._run()
         self.assertEqual(code, 1)
         smtp.send_message.assert_not_called()
+
+    def test_partly_refused_recipients_is_rc_3(self) -> None:
+        # Части адресатов письмо ушло: код 3, повтор отправил бы его им ещё раз.
+        self._approve()
+        code, smtp, text = self._run(refused={"cc@example.com": (550, b"no")})
+        self.assertEqual(code, 3, text)
+        smtp.send_message.assert_called_once()
+        self.assertIn("cc@example.com", text)
 
     def test_changed_body_or_attachment_after_card_refused(self) -> None:
         for change in (lambda: self.body.write_text("Другой текст", encoding="utf-8"),

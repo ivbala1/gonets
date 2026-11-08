@@ -13,11 +13,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
 import os
-import signal
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from . import jsonstore, paths
+from . import procs
+from .config import agent_env
 from .i18n import _, plural
 
 log = logging.getLogger(__name__)
@@ -35,10 +36,19 @@ log = logging.getLogger(__name__)
 # и RestartPreventExitStatus юнита его быть не должно.
 EXIT_RESTART = 75
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = paths.BOT_ROOT
 REQUEST_NAME = "restart_request.json"
-# Пути, изменение которых меняет работающий код. state/ и прочее не в счёт.
+# Неотслеживаемые файлы в счёт только здесь: новый модуль меняет код, а
+# черновик в корне или state/ нет. Правка отслеживаемого файла в счёт везде,
+# кроме документов: бот читает и файлы корня (ревью Opus 04.11.2026).
 CODE_PATHS = ("src", "tests", "pyproject.toml")
+# Коммит после заявки только в эти файлы заявку не отменяет: бот их не читает.
+# Список разрешённых, а не запрещённых путей: бот читает и файлы корня
+# (telegram-persona.md, claude-hook-settings.json), их коммит меняет работу
+# так же, как код (ревью Codex и решение Ивана 04.11.2026).
+DOC_FILES = ("BACKLOG.md", "README.md")
+DOC_DIRS = ("docs/",)
+_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}")
 
 PHASE_PENDING = "pending"
 PHASE_RESTARTING = "restarting"
@@ -55,22 +65,13 @@ def request_path(state_dir: Path) -> Path:
 
 
 def load_request(state_dir: Path) -> dict | None:
-    try:
-        data = json.loads(request_path(state_dir).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        log.exception("restart request unreadable, ignoring")
-        return None
-    return data if isinstance(data, dict) and data.get("id") else None
+    """Битая заявка не читается и откладывается рядом (jsonstore, в журнал)."""
+    data = jsonstore.read_dict(request_path(state_dir))
+    return data if data.get("id") else None
 
 
 def save_request(state_dir: Path, req: dict) -> None:
-    """Атомарно: временный файл рядом и os.replace."""
-    path = request_path(state_dir)
-    tmp = path.with_suffix(f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(req, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    jsonstore.write_json(request_path(state_dir), req, indent=2)
 
 
 def clear_request(state_dir: Path) -> None:
@@ -94,26 +95,71 @@ def new_request(chat_key: str, reason: str, commit: str) -> dict:
 # --- git ---------------------------------------------------------------------
 
 def git_state(repo: Path = REPO) -> tuple[str, list[str]]:
-    """(HEAD, изменённые и неотслеживаемые пути кода). HEAD пустой при ошибке."""
+    """(HEAD, незакоммиченные пути, которые меняют работу). HEAD пустой при ошибке.
+
+    Отслеживаемые файлы везде, кроме документов (как у `code_problem` для
+    коммитов), неотслеживаемые только в CODE_PATHS."""
     try:
         head = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, timeout=30, check=True, env=agent_env(),
         ).stdout.strip()
+        # Байты: имя постороннего файла не в UTF-8 не должно ронять проверку.
         status = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=normal",
-             "--", *CODE_PATHS],
-            capture_output=True, text=True, timeout=30, check=True,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+            ["git", "-C", str(repo), "status", "--porcelain", "-z", "--no-renames",
+             "--untracked-files=normal"],
+            capture_output=True, timeout=30, check=True, env=agent_env(),
+        ).stdout.decode("utf-8", "surrogateescape")
+    except (OSError, subprocess.SubprocessError, ValueError):
         log.exception("git state failed")
         return "", []
-    dirty = [line[3:] for line in status.splitlines() if line.strip()]
+    dirty = []
+    for entry in status.split("\0"):
+        if len(entry) < 4:
+            continue
+        # Имя не в UTF-8 уйдёт в текст отмены: без одиночных суррогатов.
+        code = entry[:2]
+        path = entry[3:].encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        if code == "??":
+            if path.startswith(tuple(p + "/" for p in CODE_PATHS)) or path in CODE_PATHS:
+                dirty.append(path)
+        elif not _doc_only(path):
+            dirty.append(path)
     return head, dirty
 
 
+def changed_since(commit: str, head: str, repo: Path = REPO) -> list[str] | None:
+    """Файлы, изменённые между коммитом заявки и HEAD; None при ошибке git.
+
+    Сравнение деревьев, а не история: rebase и amend ему не мешают.
+    --no-renames: при переименовании из корня в docs/ виден и старый путь,
+    иначе git показал бы только новый, в docs/ (ревью Opus 04.11)."""
+    if not _COMMIT_RE.fullmatch(commit):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "diff", "-z", "--name-only", "--no-renames",
+             "--no-ext-diff", commit, head, "--"],
+            capture_output=True, text=True, timeout=30, check=True, env=agent_env(),
+        ).stdout
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # ValueError: имя файла не в UTF-8 (UnicodeDecodeError). Пропавший
+        # коммит заявки (rebase, gc) обычен: traceback в журнале не нужен.
+        log.warning("git diff since request failed: %s", type(exc).__name__)
+        return None
+    return [p for p in out.split("\0") if p]
+
+
+def _doc_only(path: str) -> bool:
+    return path in DOC_FILES or path.startswith(DOC_DIRS)
+
+
 def code_problem(commit: str, repo: Path = REPO) -> str:
-    """Почему код не тот, что в заявке (пусто, если тот)."""
+    """Почему код не тот, что в заявке (пусто, если тот).
+
+    Новый коммит только в документацию (DOC_FILES, DOC_DIRS) заявку не
+    отменяет, перезапуск идёт на нём: заявку 051edfa5 04.11.2026 отменил
+    коммит одного бэклога."""
     head, dirty = git_state(repo)
     if not head:
         return _("не удалось прочитать состояние git")
@@ -121,8 +167,16 @@ def code_problem(commit: str, repo: Path = REPO) -> str:
         shown = ", ".join(dirty[:5]) + (_(" и др.") if len(dirty) > 5 else "")
         return _("в коде есть незакоммиченные правки: {shown}").format(shown=shown)
     if commit and head != commit:
-        return _("коммит сменился после заявки: было {old}, стало {new}").format(
-            old=commit[:7], new=head[:7])
+        changed = changed_since(commit, head, repo)
+        if changed is None:
+            return _("коммит сменился после заявки: было {old}, стало {new}, "
+                     "сравнить их не удалось").format(old=commit[:7], new=head[:7])
+        foreign = [p for p in changed if not _doc_only(p)]
+        if foreign:
+            shown = ", ".join(foreign[:5]) + (_(" и др.") if len(foreign) > 5 else "")
+            return _("коммит сменился после заявки: было {old}, стало {new}, "
+                     "изменены не только документы: {shown}").format(
+                old=commit[:7], new=head[:7], shown=shown)
     return ""
 
 
@@ -147,20 +201,14 @@ def fresh_env() -> dict[str, str]:
 
 async def _run(args: list[str], timeout: float, cwd: Path,
                env: dict[str, str] | None = None) -> tuple[int, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *args, cwd=str(cwd), env=env, stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
-    )
+    # Своя группа: на таймауте и отмене гаснут и дочерние процессы тестов,
+    # которые держали бы вывод открытым (procs.run_bounded).
     try:
-        out, _unused = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
-        # Вся группа: дочерние процессы тестов держали бы вывод открытым.
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        await proc.wait()
+        rc, out, _unused = await procs.run_bounded(args, timeout=timeout, env=env, cwd=cwd,
+                                                   stderr=asyncio.subprocess.STDOUT)
+    except TimeoutError:
         return -1, _("не уложилось в {seconds} с").format(seconds=int(timeout))
-    return proc.returncode or 0, out.decode(errors="replace")
+    return rc or 0, out.decode(errors="replace")
 
 
 def _tail(text: str, lines: int = 6) -> str:

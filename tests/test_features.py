@@ -298,27 +298,39 @@ class VoiceSeriesTests(unittest.TestCase):
         self.assertIn("Абзац 3.", rest)
         self.assertNotIn("Абзац 0.", rest)
 
-    def test_unconfirmed_save_fails_sends_text(self) -> None:
-        # Кнопке нечего открыть: ответ важнее дубля.
+    def test_unconfirmed_save_fails_note_without_button(self) -> None:
+        # Кнопке нечего открыть: записка без кнопки, ответ текстом не
+        # повторяется (голосовое обычно доходит, текст был бы дублем).
         with patch.object(botmod, "save_full_text", side_effect=OSError("disk full")):
             ok, msg = self._series("Короткий ответ.", voice=AsyncMock(side_effect=self._unconfirmed()))
         self.assertTrue(ok)
         msg.reply_text.assert_awaited_once()
-        self.assertEqual(msg.reply_text.call_args.args[0], "Короткий ответ.")
+        self.assertNotIn("Короткий ответ.", msg.reply_text.call_args.args[0])
+        self.assertNotIn("кнопке", msg.reply_text.call_args.args[0])
+        self.assertIsNone(msg.reply_text.call_args.kwargs.get("reply_markup"))
 
-    def test_unconfirmed_note_failed_sends_text(self) -> None:
+    def test_unconfirmed_note_failed_no_text_copy(self) -> None:
         msg = SimpleNamespace(reply_voice=AsyncMock(side_effect=self._unconfirmed()),
-                              reply_text=AsyncMock(side_effect=[NetworkError("down"), None]))
+                              reply_text=AsyncMock(side_effect=[BadRequest("bad"), None]))
         ctx = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
         with tempfile.TemporaryDirectory() as tmp:
             cfg = SimpleNamespace(telegram_caption_limit=1024, voice_reply_max_chars=4000,
                                   state_dir=Path(tmp), telegram_text_limit=4000,
                                   large_reply_as_file_threshold=12000)
             with patch.object(botmod, "synthesize", AsyncMock(return_value=b"ogg")):
-                ok = asyncio.run(botmod._send_voice_series(
-                    cfg, ctx, SimpleNamespace(message=msg), 42, object(), "Короткий ответ."))
+                with self.assertLogs(botmod.log, "ERROR"):
+                    ok = asyncio.run(botmod._send_voice_series(
+                        cfg, ctx, SimpleNamespace(message=msg), 42, object(), "Короткий ответ."))
         self.assertTrue(ok)
-        self.assertEqual(msg.reply_text.call_args.args[0], "Короткий ответ.")
+        msg.reply_text.assert_awaited_once()
+
+    def test_read_error_falls_back_to_text(self) -> None:
+        # ReadError бывает и при недошедшем запросе (httpcore глушит сбой
+        # записи): это отказ, ответ уходит текстом общей веткой.
+        err = NetworkError("httpx.ReadError")
+        err.__cause__ = httpx.ReadError("")
+        ok, msg = self._series("Короткий ответ.", voice=AsyncMock(side_effect=err))
+        self.assertFalse(ok)
 
     def test_other_timeout_still_falls_back_to_text(self) -> None:
         err = TimedOut()
@@ -488,6 +500,11 @@ class SendReplyInlineCodeTests(unittest.TestCase):
         kwargs = msg.reply_voice.call_args.kwargs
         self.assertEqual(kwargs["caption"], "точка 1, 2")
         self.assertEqual(len(kwargs["caption_entities"]), 1)
+        # Голосовое ждёт ответа Telegram как файл, не общие 30 с (07.11.2026).
+        self.assertEqual((kwargs["read_timeout"], kwargs["write_timeout"]), (120, 120))
+        asyncio.run(send_voice_caption(msg, b"ogg", "без разметки"))
+        kwargs = msg.reply_voice.call_args.kwargs
+        self.assertEqual((kwargs["read_timeout"], kwargs["write_timeout"]), (120, 120))
 
 
 class SendFilesTests(unittest.TestCase):
@@ -923,17 +940,6 @@ class UnattendedPolicyTests(unittest.TestCase):
         )
         base.update(over)
         return SimpleNamespace(**base)
-
-    def test_whitelist_and_bash_disabled_for_unattended(self) -> None:
-        """Регрессия: whitelist включает рабочие каталоги, а bash-regex
-        допускает запись аргументами (`sort -o`), — для фонового рана нельзя."""
-        cfg = self._cfg()
-        for is_unattended, expect_whitelist, expect_bash in ((False, True, True), (True, False, False)):
-            with self.subTest(unattended=is_unattended):
-                whitelist = () if is_unattended else cfg.approve_whitelist_paths
-                bash_re = None if is_unattended else cfg.bash_auto_allow_re
-                self.assertEqual(bool(whitelist), expect_whitelist)
-                self.assertEqual(bash_re is not None, expect_bash)
 
     def test_mcp_read_only_still_allowed(self) -> None:
         """Чтение фоновому разбору нужно, мутирующие имена под regex не подпадают."""

@@ -82,13 +82,85 @@ class CodeProblemTests(unittest.TestCase):
     def test_files_outside_code_do_not_matter(self) -> None:
         (self.repo / "state").mkdir()
         (self.repo / "state" / "x.json").write_text("{}")
+        (self.repo / "draft.md").write_text("черновик")
         self.assertEqual(restart.code_problem(self.head, self.repo), "")
+
+    def test_uncommitted_root_file_cancels(self) -> None:
+        # Бот читает файлы корня: их правка без коммита меняет работу так же,
+        # как с коммитом (ревью Opus 04.11.2026). Документы не в счёт.
+        self._commit("telegram-persona.md", "BACKLOG.md", "docs/x.md")
+        head = _git(self.repo, "rev-parse", "HEAD")
+        for p in ("BACKLOG.md", "docs/x.md"):
+            (self.repo / p).write_text("правка\n")
+        self.assertEqual(restart.code_problem(head, self.repo), "")
+        (self.repo / "telegram-persona.md").write_text("правка\n")
+        problem = restart.code_problem(head, self.repo)
+        self.assertRegex(problem, msg_re("в коде есть незакоммиченные правки: {shown}"))
+        self.assertIn("telegram-persona.md", problem)
+        self.assertNotIn("BACKLOG.md", problem)
+
+    def test_non_utf8_untracked_name_outside_code(self) -> None:
+        try:
+            (self.repo / b"\xff.txt".decode("utf-8", "surrogateescape")).write_text("x")
+        except OSError:
+            self.skipTest("файловая система не принимает имя не в UTF-8 (APFS)")
+        self.assertEqual(restart.code_problem(self.head, self.repo), "")
+
+    def test_missing_request_commit_logs_without_traceback(self) -> None:
+        with self.assertLogs(restart.log, "WARNING") as logs:
+            self.assertIsNone(restart.changed_since("0" * 40, self.head, self.repo))
+        self.assertTrue(all(r.exc_info is None for r in logs.records))
 
     def test_commit_changed(self) -> None:
         (self.repo / "src" / "a.py").write_text("x = 3\n")
         _git(self.repo, "commit", "-qam", "next")
-        self.assertRegex(restart.code_problem(self.head, self.repo),
-                         msg_re("коммит сменился после заявки: было {old}, стало {new}"))
+        problem = restart.code_problem(self.head, self.repo)
+        self.assertRegex(problem, msg_re("коммит сменился после заявки: было {old}, стало {new}, "
+                                         "изменены не только документы: {shown}"))
+        self.assertIn("src/a.py", problem)
+
+    def _commit(self, *paths: str) -> None:
+        for p in paths:
+            (self.repo / p).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / p).write_text("text\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "next")
+
+    def test_docs_only_commit_keeps_request(self) -> None:
+        # Заявку 051edfa5 (04.11.2026) отменил коммит одного бэклога.
+        self._commit("BACKLOG.md")
+        self._commit("README.md", "docs/x.md", "docs/sub/y.md")
+        self.assertEqual(restart.code_problem(self.head, self.repo), "")
+
+    def test_root_files_cancel_request(self) -> None:
+        # Бот читает файлы корня: их коммит меняет работу, как код.
+        self._commit("docs/x.md", "telegram-persona.md")
+        problem = restart.code_problem(self.head, self.repo)
+        self.assertIn("telegram-persona.md", problem)
+        self.assertNotIn("docs/x.md", problem)
+
+    def test_rename_out_of_docs_cancels(self) -> None:
+        self._commit("docs/hook.json")
+        base = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "mv", "docs/hook.json", "claude-hook-settings.json")
+        _git(self.repo, "commit", "-qm", "mv")
+        self.assertIn("claude-hook-settings.json", restart.code_problem(base, self.repo))
+
+    def test_rename_into_docs_cancels(self) -> None:
+        # Без --no-renames git показал бы только docs/persona.md.
+        self._commit("telegram-persona.md")
+        base = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "docs").mkdir()
+        _git(self.repo, "mv", "telegram-persona.md", "docs/persona.md")
+        _git(self.repo, "commit", "-qm", "mv")
+        self.assertIn("telegram-persona.md", restart.code_problem(base, self.repo))
+
+    def test_unknown_request_commit_cancels(self) -> None:
+        self._commit("BACKLOG.md")
+        for bad in ("0" * 40, "--output=/tmp/x", "HEAD~1"):
+            self.assertRegex(restart.code_problem(bad, self.repo),
+                             msg_re("коммит сменился после заявки: было {old}, стало {new}, "
+                                    "сравнить их не удалось"))
 
 
 class ValidateTests(unittest.IsolatedAsyncioTestCase):
@@ -418,6 +490,34 @@ class SelfRestartRefusalTests(unittest.TestCase):
             "systemctl --user restart claude-tg-bot.service",
             "cd x && systemctl --user stop claude-tg-bot",
             "sh -c 'systemctl --user restart claude-tg-bot'",
+            'bash -lc "systemctl --user restart claude-tg-bot"',
+            "timeout 30 systemctl --user restart claude-tg-bot",
+            '/bin/bash -c "systemctl --user restart claude-tg-bot"',
+            'echo "$(systemctl --user restart claude-tg-bot)"',
+            'echo "`systemctl --user restart claude-tg-bot`"',
+            "python3 -c \"import os; os.system('systemctl --user restart claude-tg-bot')\"",
+            # кавычки у аргументов не прячут имя службы (ревью /2mind 04.11.2026)
+            'systemctl --user restart "claude-tg-bot.service"',
+            'systemctl --user "stop" claude-tg-bot',
+            "pkill -f 'python -m claude_tg_bot'",
+            'result="$(systemctl --user restart claude-tg-bot 2>&1)"',
+            "cat <<EOF\n$(systemctl --user restart claude-tg-bot)\nEOF",
+            "sudo -u alice systemctl --user restart claude-tg-bot",
+            "git status && /usr/bin/systemctl --user restart claude-tg-bot",
+            "bash <<'EOF'\nsystemctl --user restart claude-tg-bot\nEOF",
+            "x=\"$(bash <<'EOF'\nsystemctl --user restart claude-tg-bot\nEOF\n)\"",
+            "ls; bash -c 'systemctl --user restart claude-tg-bot'",
+            # слова вне кавычек у любой программы (ревью Opus 04.11.2026)
+            "if systemctl --user restart claude-tg-bot; then echo ok; fi",
+            "while ! systemctl --user restart claude-tg-bot; do sleep 1; done",
+            "command systemctl --user restart claude-tg-bot",
+            "stdbuf -oL systemctl --user restart claude-tg-bot",
+            # пропуски разбора по звеньям, найденные вторым кругом Opus 04.11.2026
+            "cat <<'EOF' | bash\nsystemctl --user restart claude-tg-bot\nEOF",
+            'echo "systemctl --user restart claude-tg-bot" | bash',
+            'if systemctl --user restart "claude-tg-bot"; then echo ok; fi',
+            "cat <<'EOF' && systemctl --user restart claude-tg-bot\nhello\nEOF",
+            'bash -c "$(cat <<\'EOF\'\nsystemctl --user restart claude-tg-bot\nEOF\n)"',
             "systemctl --user kill claude-tg-bot",
             "pkill -f claude_tg_bot",
             "kill $(systemctl --user show -p MainPID --value claude-tg-bot)",

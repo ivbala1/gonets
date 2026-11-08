@@ -4,9 +4,9 @@ from __future__ import annotations
 import contextlib
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from . import buttons
 from .auth import looks_like_auth_code
 from .i18n import _
 
@@ -18,11 +18,11 @@ def _login_keyboard(ctx, engines=("claude", "codex"), *, private: bool = True):
     rows = []
     for engine in engines:
         label = _("Восстановить вход {engine}").format(engine='Claude' if engine == 'claude' else 'Codex')
-        action = {"callback_data": f"login:{engine}"} if private else {
+        action = {"data": f"login:{engine}"} if private else {
             "url": f"https://t.me/{ctx.bot.username}?start=login_{engine}"
         }
-        rows.append([InlineKeyboardButton(label, **action)])
-    return InlineKeyboardMarkup(rows)
+        rows.append([{"text": label, **action}])
+    return buttons.markup(rows)
 
 
 async def _offer_login(update, ctx, engine):
@@ -79,7 +79,7 @@ async def on_login_callback(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
         return
     await update.callback_query.answer()
-    await _b._start_login(update, ctx, update.callback_query.data.split(":", 1)[1])
+    await _b._start_login(update, ctx, (update.callback_query.data or "").partition(":")[2])
 
 
 async def on_auth_update(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE):

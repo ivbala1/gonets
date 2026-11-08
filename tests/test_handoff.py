@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import signal
 import io
 import json
 import sys
@@ -563,22 +564,24 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(asyncio.run(run(b"not json")), "unknown")
         self.assertEqual(asyncio.run(screen_server.focus_kind("")), "unknown")
         # Экран закрыт во время проверки: процесс убит, а не брошен.
-        async def cancelled() -> object:
+        async def cancelled() -> tuple[object, Mock]:
             proc = AsyncMock()
             proc.returncode = None
-            proc.kill = Mock()
-            async def hang() -> None:
+            async def hang(*_a) -> None:
                 await asyncio.sleep(10)
             proc.communicate.side_effect = hang
-            with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+            kill = Mock()
+            with patch.object(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)), \
+                    patch.object(screen_server.procs, "kill_group", kill):
                 task = asyncio.create_task(screen_server.focus_kind("s1"))
                 await asyncio.sleep(0.05)
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-            return proc
-        hung = asyncio.run(cancelled())
-        hung.kill.assert_called_once()
+            return proc, kill
+        hung, kill = asyncio.run(cancelled())
+        # Группа процесса убита и процесс снят (procs.run_bounded).
+        kill.assert_called_once_with(hung, signal.SIGKILL)
         hung.wait.assert_awaited_once()
         missing = AsyncMock(side_effect=FileNotFoundError)
         with patch.object(asyncio, "create_subprocess_exec", missing):
