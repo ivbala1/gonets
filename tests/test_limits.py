@@ -127,6 +127,7 @@ class SnapshotTests(unittest.TestCase):
     def test_limit_error_and_reset_from_text(self) -> None:
         self.assertTrue(limits.is_limit_error(LIMIT_TEXT))
         self.assertTrue(limits.is_limit_error("API Error: You're out of usage credits"))
+        self.assertTrue(limits.is_limit_error(LIMIT_TEXT.replace("session", "5-hour")))
         self.assertFalse(limits.is_limit_error("Rate limit exceeded on tool output"))
         now = datetime(2026, 10, 20, 22, 0, tzinfo=timezone(timedelta(hours=4))).timestamp()
         reset = limits.reset_from_text(LIMIT_TEXT, now)
