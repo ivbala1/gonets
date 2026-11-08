@@ -200,7 +200,7 @@ def summary(snapshot: dict | None = None, now: float | None = None) -> str:
 
 
 _LIMIT_RE = re.compile(
-    r"^(?:you['’]ve (?:hit|reached) your (?:session|weekly|usage|opus|sonnet).*limit"
+    r"^(?:you['’]ve (?:hit|reached) your (?:session|5-hour|weekly|usage|opus|sonnet).*limit"
     r"|you['’]re out of (?:usage credits|extra usage)"
     r"|(?:out of usage credits|session limit reached|weekly limit reached|usage limit reached)"
     r"|rate limit reached)", re.IGNORECASE)
