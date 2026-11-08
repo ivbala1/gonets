@@ -165,6 +165,38 @@ class SnapshotTests(unittest.TestCase):
         reset = limits.reset_from_text("You've hit your session limit · resets 2:40am (Etc/GMT-4)", now)
         self.assertIsNotNone(reset)
 
+    def test_past_reset_time_means_retry_soon(self) -> None:
+        """Ревью Codex 08.11.2026: «resets 4pm» в 16:06 прошёл, а не завтра в 16:00."""
+        dubai = timezone(timedelta(hours=4))
+        for now, text, want, soon in (
+                (datetime(2026, 11, 8, 16, 6, tzinfo=dubai), "resets 4pm", "08 16:00", True),
+                (datetime(2026, 11, 9, 1, 0, tzinfo=dubai), "resets 11pm", "08 23:00", True),
+                (datetime(2026, 11, 8, 23, 0, tzinfo=dubai), "resets 3am", "09 03:00", False)):
+            with self.subTest(text=text):
+                reset = limits.reset_from_text(f"You've hit your session limit · {text} ({ZONE})", now.timestamp())
+                self.assertEqual(datetime.fromtimestamp(reset, dubai).strftime("%d %H:%M"), want)
+                wait = limits.fire_at(reset, now.timestamp()) - now.timestamp()
+                self.assertEqual(wait <= 5 * limits.GRACE_SEC, soon)
+        now = datetime(2026, 11, 8, 16, 6, tzinfo=dubai)
+        for text in ("You've hit your daily limit · resets 4pm", "Opus limit reached · resets 4pm"):
+            reset = limits.reset_from_text(f"{text} ({ZONE})", now.timestamp())
+            self.assertEqual(datetime.fromtimestamp(reset, dubai).strftime("%d %H:%M"), "09 16:00", text)
+
+    def test_hit_reset_takes_the_latest_exhausted_window(self) -> None:
+        """Ревью Codex 08.11.2026: событие с одним пятичасовым окном не перекрывает
+        сохранённую неделю на 100%; последнее событие рана старше снимка, который
+        обновил другой ран; без снимка решает событие."""
+        now = time.time()
+        week, hour = now + 3 * 86400, now + 600
+        limits.record({"seven_day": {"pct": 100.0, "resets_at": week}}, now - 60)
+        self.assertEqual(limits.hit_reset({"five_hour": {"pct": 100.0, "resets_at": hour}}, "", now), week)
+        stale = {"five_hour": {"pct": 100.0, "resets_at": hour}, "seven_day": {"pct": 40.0, "resets_at": week}}
+        self.assertEqual(limits.hit_reset(stale, "", now), week)
+        limits.record({"seven_day": {"pct": 40.0, "resets_at": week}}, now)
+        self.assertEqual(limits.hit_reset(stale, "", now), hour)
+        limits._path = None
+        self.assertEqual(limits.hit_reset(stale, "", now), hour)
+
     def test_reset_in_repeated_hour(self) -> None:
         """Осенний перевод стрелок: вторые 02:30 через 45 минут, а не сутки спустя."""
         from zoneinfo import ZoneInfo
