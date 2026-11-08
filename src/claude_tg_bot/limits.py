@@ -200,10 +200,8 @@ def summary(snapshot: dict | None = None, now: float | None = None) -> str:
 
 
 _LIMIT_RE = re.compile(
-    r"^(?:you['’]ve (?:hit|reached) your (?:session|5-hour|weekly|usage|opus|sonnet).*limit"
-    r"|you['’]re out of (?:usage credits|extra usage)"
-    r"|(?:out of usage credits|session limit reached|weekly limit reached|usage limit reached)"
-    r"|rate limit reached)", re.IGNORECASE)
+    # Формулировка меняется от выпуска к выпуску (session, 5-hour): ловим форму, а не список слов.
+    r"^(?![^\n]*\b(?:context|token|output)\b)(?:you(?:['’]ve| have) (?:hit|reached) (?:your|the) [\w‑ -]*limit|you['’]re out of (?:usage credits|extra usage)|out of usage credits|(?:[\w-]+ ){0,2}(?:usage|session|weekly|daily|opus|sonnet|[\w‑-]*hour(?:ly)?|[\w‑-]*day) limit (?:reached|exceeded)|rate limit reached|(?:[\w-]+ ){0,3}limit\s*[·∙|:-]\s*resets?\s+(?:at\s+)?\d)", re.IGNORECASE)
 
 
 def is_limit_error(text: str) -> bool:
@@ -221,7 +219,7 @@ def reset_from_text(text: str, now: float | None = None) -> float | None:
     """«resets 2:40am (Europe/Berlin)» в секунды Unix, пояс бота. Недельный и
     чужой пояс не угадываем: пояс из текста годится, только если сейчас он идёт
     вровень с поясом бота (Europe/Kiev и Europe/Kyiv), неизвестное имя отказ."""
-    if not is_limit_error(text) or re.search(r"weekly|seven.day", text, re.IGNORECASE):
+    if not is_limit_error(text) or re.search(r"week|seven.day|7.?day|7d\b|168", text, re.IGNORECASE):
         return None
     tz = local_zone()
     at = time.time() if now is None else now
@@ -234,7 +232,7 @@ def reset_from_text(text: str, now: float | None = None) -> float | None:
         moment = datetime.fromtimestamp(at, tz)
         if moment.utcoffset() != moment.astimezone(named).utcoffset():
             return None
-    m = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\w)", text, re.IGNORECASE)
+    m = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\w|\s+[a-z])", text, re.IGNORECASE)
     if not m:
         return None
     hours, minutes = int(m.group(1)), int(m.group(2) or 0)

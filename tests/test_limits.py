@@ -128,11 +128,29 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(limits.is_limit_error(LIMIT_TEXT))
         self.assertTrue(limits.is_limit_error("API Error: You're out of usage credits"))
         self.assertTrue(limits.is_limit_error(LIMIT_TEXT.replace("session", "5-hour")))
+        for t in ("You've hit your 5 hour limit · resets 3pm", "You've reached the daily limit",
+                  "Five-hour limit reached", "Hourly usage limit · resets at 3:30pm"):
+            self.assertTrue(limits.is_limit_error(t), t)
+        for t in ("The limit of this loop is 10", "Rate limit exceeded, resets in 30s",
+                  "Context limit reached · /compact or /clear to continue",
+                  "Output token limit reached",
+                  "Server rate limit reached",
+                  "You've reached the end of the file; no limit here",
+                  "The GitHub API limit resets at 5pm"):
+            self.assertFalse(limits.is_limit_error(t), t)
         self.assertFalse(limits.is_limit_error("Rate limit exceeded on tool output"))
         now = datetime(2026, 10, 20, 22, 0, tzinfo=timezone(timedelta(hours=4))).timestamp()
         reset = limits.reset_from_text(LIMIT_TEXT, now)
         self.assertEqual(datetime.fromtimestamp(reset, timezone(timedelta(hours=4))).strftime("%d %H:%M"), "21 02:40")
         self.assertIsNone(limits.reset_from_text("You've hit your weekly limit · resets Oct 24", now))
+        self.assertIsNone(limits.reset_from_text("You've hit your 7-day limit · resets 3pm", now))
+        self.assertIsNone(limits.reset_from_text("You've hit your limit for the week · resets 3pm", now))
+        for t in ("You have reached your 5-hour limit", "5-hour limit exceeded", "You've hit your 5‑hour limit · resets 3pm"):
+            self.assertTrue(limits.is_limit_error(t), t)
+        for t in ("You've hit your context limit", "You've reached your output token limit", "Output token limit · resets 5pm"):
+            self.assertFalse(limits.is_limit_error(t), t)
+        for t in ("You've hit your 168-hour limit · resets 3pm", "You've hit your 7d limit · resets 3pm", "You've hit your session limit · resets 15 Nov at 5pm"):
+            self.assertIsNone(limits.reset_from_text(t, now), t)
         self.assertIsNone(limits.reset_from_text("You've hit your session limit · resets 2am (Europe/Moscow)", now))
 
     def test_reset_zone_names(self) -> None:
