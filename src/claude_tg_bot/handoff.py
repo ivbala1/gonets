@@ -266,12 +266,22 @@ def session_busy(base: Path, session: str, now: float | None = None) -> bool:
     return False
 
 
-def prune(base: Path, now: float | None = None) -> None:
+def prune(base: Path, now: float | None = None, *, dry_run: bool = False) -> int:
+    """Удалить записи старше KEEP_DAYS от created_ts; битое время пропускается.
+    Возвращает число удалённых (в сухом прогоне: подлежащих удалению)."""
     now = now or time.time()
+    removed = 0
     for path in base.glob("*.json"):
         rec = load(base, path.stem)
-        if rec and now - float(rec.get("created_ts", now)) > KEEP_DAYS * 86400:
-            path.unlink(missing_ok=True)
+        try:
+            old = bool(rec) and now - float(rec.get("created_ts", now)) > KEEP_DAYS * 86400
+        except (TypeError, ValueError):
+            continue
+        if old:
+            if not dry_run:
+                path.unlink(missing_ok=True)
+            removed += 1
+    return removed
 
 
 def parse_region(raw: str) -> list[int] | None:

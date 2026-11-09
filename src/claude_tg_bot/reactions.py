@@ -18,7 +18,9 @@ SENT_FILE = "sent_texts.jsonl"
 MEANINGS = ("👍", "👎")
 TEXT_LIMIT = 500
 _TAIL_BYTES = 256 * 1024
-_MAX_BYTES = 2 * 1024 * 1024
+# Подрезка до окна lookup: старше хвоста _TAIL_BYTES строки никто не читает
+# (этап 2 уборки, 09.11.2026; до того 2 МБ -> 1 МБ при старте бота).
+_MAX_BYTES = 2 * _TAIL_BYTES
 
 _state_dir: Path | None = None
 
@@ -30,12 +32,25 @@ def configure(state_dir: Path) -> None:
     _trim(state_dir / SENT_FILE)
 
 
-def _trim(path: Path) -> None:
-    """Под замком дописывания: notify (другой процесс) пишет сюда же."""
+def _trim_file(path: Path) -> bool:
+    """Подрезка до окна lookup под замком дописывания (notify, другой процесс,
+    пишет сюда же). Нет файла: False."""
     try:
-        jsonstore.jsonl_trim(path, _MAX_BYTES, _MAX_BYTES // 2)
+        return jsonstore.jsonl_trim(path, _MAX_BYTES, _MAX_BYTES // 2)
     except FileNotFoundError:
-        pass
+        return False
+
+
+def trim(state_dir: Path) -> bool:
+    """Подрезка из суточной уборки бота (retention.owner_passes): сбой
+    пробрасывается в отчёт уборки."""
+    return _trim_file(state_dir / SENT_FILE)
+
+
+def _trim(path: Path) -> None:
+    """Подрезка при старте: сбой только в журнал, старт не мешает."""
+    try:
+        _trim_file(path)
     except OSError as e:
         log.warning("sent log trim failed: %s", e)
 

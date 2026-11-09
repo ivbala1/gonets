@@ -301,7 +301,9 @@ def _session_will_change(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: 
 # дневные сводки сторожа без карточек. Ключ по сессии, а не по чату: после
 # /reset или idle-сброса метка сама перестаёт действовать, а /resume старой
 # сессии её возвращает. Старше срока метки удаляются.
-_UNTRUSTED_MARK_TTL_SEC = 30 * 24 * 3600
+# Не короче _SESSION_SCOPE_TTL_SEC: /resume старой сессии после чужого текста
+# иначе вернул бы её с полными правами (этап 2 уборки, 09.11.2026; было 30 дней).
+_UNTRUSTED_MARK_TTL_SEC = 90 * 24 * 3600
 
 
 def _mark_untrusted_session(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, sid: str | None) -> None:
@@ -343,6 +345,13 @@ def _note_session_scope(ctx: ContextTypes.DEFAULT_TYPE, sid: str, scope_hint: st
     for old in [k for k in scopes.data if scopes.last_used(k) < cutoff]:
         scopes.remove(old)
     scopes.set(sid, json.dumps(scope_hint, ensure_ascii=False))
+    # Метка чужого текста стареет с той же точки, что скоуп: иначе сессия,
+    # продолжаемая обычными ранами, теряла бы её через срок от последнего
+    # чужого рана, пока /resume её ещё даёт (ревью Codex 09.11.2026).
+    marks: SessionStore | None = ctx.application.bot_data.get("untrusted_sessions")
+    mark = marks.get(sid) if marks is not None else None
+    if mark is not None:
+        marks.set(sid, mark)
 
 
 def _session_scope(ctx: ContextTypes.DEFAULT_TYPE, sid: str) -> str | None:
@@ -4747,6 +4756,15 @@ def _state_cleanup_pass(cfg: Config, trees: list[tuple[Path, int, str]]) -> None
         stats["errors"] = stats.get("errors", 0) + 1
         stats.setdefault("sample", []).append(f"audit: {type(e).__name__}")
         log.exception("cleanup audit failed")
+    counts, owner_errors = retention.owner_passes(cfg.state_dir, now)
+    owned = sum(counts.values())
+    deleted += owned
+    if owned:
+        log.info("cleanup owners: removed %d old records", owned)
+    if owner_errors:
+        stats["errors"] = stats.get("errors", 0) + len(owner_errors)
+        stats.setdefault("sample", []).extend(owner_errors)
+        log.warning("cleanup owners failed: %s", ", ".join(owner_errors))
     overdue = len(retention.due_files(trees, now))
     retention.write_report(cfg.state_dir, deleted=deleted, freed=stats.get("freed", 0),
                            errors=stats.get("errors", 0), sample=stats.get("sample", []),
