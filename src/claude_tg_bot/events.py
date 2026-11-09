@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import re
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -117,6 +118,51 @@ def expired(rec: dict[str, Any], now: float | None = None) -> bool:
         return True
 
 
+def _done_expired(rec: dict[str, Any], now: float) -> bool:
+    """Конченное событие старше KEEP_DONE_SEC (общее для startup и prune_done)."""
+    return now - float(rec.get("done_at") or rec.get("accepted_at") or 0) > KEEP_DONE_SEC
+
+
+def prune_done(base: Path, now: float | None = None, *, dry_run: bool = False) -> int:
+    """Удалить конченные события старше KEEP_DONE_SEC (суточная уборка бота,
+    этап 2: startup делает то же только при рестарте). Живые, битые и
+    принимаемые не трогает: их судьбу решает startup. Возвращает число удалённых
+    (в сухом прогоне: подлежащих удалению)."""
+    now = time.time() if now is None else now
+    removed = 0
+    if base.is_symlink() or not base.is_dir():
+        return 0
+    for path in sorted(base.glob("*.json")):
+        if not _ID_RE.fullmatch(path.stem):
+            continue
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            continue
+        rec = load(base, path.stem)
+        if rec is None or rec.get("status") != "done":
+            continue
+        try:
+            old = _done_expired(rec, now)
+        except (TypeError, ValueError):
+            continue
+        if old:
+            if not dry_run:
+                # Тот же файл, что прочитан: startup мог удалить его, а /event
+                # положить новый с тем же ключом (ревью Codex 09.11.2026).
+                try:
+                    now_st = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if (now_st.st_ino, now_st.st_mtime_ns) != (before.st_ino, before.st_mtime_ns):
+                    continue
+                path.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 def startup(base: Path, now: float | None = None,
             boot: str | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """После рестарта: (будить, прерванные, просроченные). Конченные старше
@@ -146,7 +192,7 @@ def startup(base: Path, now: float | None = None,
                 # дошедший до ответа 200: события не было.
                 path.unlink(missing_ok=True)
             elif status == "done":
-                if now - float(rec.get("done_at") or rec.get("accepted_at") or 0) > KEEP_DONE_SEC:
+                if _done_expired(rec, now):
                     path.unlink(missing_ok=True)
             elif status == "started":
                 interrupted.append(rec)

@@ -3,8 +3,8 @@
 
 У каждого вида данных есть правило: срок, после которого уборка бота
 (`bot._attachment_cleanup_loop`) его удаляет, или пометка, почему оно
-хранится («постоянно», «справочник», «этап 2»: срок ещё не решён). Имя в
-state/, которого нет в RULES, попадает в отчёт как «без правила», и его
+хранится («постоянно», «справочник»). Имя в state/, которого нет в RULES или
+с пометкой STAGE2 («этап 2», срок не назначен), попадает в отчёт как «без правила», и его
 показывает doctor Свода (`check_state_cleanup`).
 
 Отчёт `state/cleanup/last.json` в общем виде с очистителем ~/tmp Свода:
@@ -53,9 +53,65 @@ def trees(state_dir: Path, attachment_ttl_days: int) -> list[tuple[Path, int, st
         (state_dir / "memory-drafts", attachment_ttl_days, "memory-drafts"),
         # Запросы и ответы /2mind: нужны рану, который спросил; позже их не читают.
         (state_dir / "2mind", TWO_MIND_TTL_DAYS, "2mind"),
+        # Этап 2 (09.11.2026): сроки владельцев, которые сами чистят только при
+        # следующей записи; здесь тем же сроком и без активности.
+        (state_dir / "voice-texts", _full_text_days(), "voice-texts"),
+        (state_dir / "mailsend", MAILSEND_TTL_DAYS, "mailsend"),
         (paths.TELEGRAM_SEND_DIR, TELEGRAM_FILES_TTL_DAYS, "telegram-send"),
         (TELEGRAM_MCP_DOWNLOADS, TELEGRAM_FILES_TTL_DAYS, "telegram-mcp-downloads"),
     ]
+
+
+# Билет одобрения письма живёт mailsend.TICKET_TTL_SEC (10 минут); сутки с запасом.
+MAILSEND_TTL_DAYS = 1
+# Итоговые записи очереди «в приложение» (сделано, снято): дней от закрытия.
+APP_QUEUE_CLOSED_DAYS = 30
+# Пометка «срок не назначен»: в отчёте идёт как имя без правила (doctor красный).
+STAGE2 = "этап 2"
+
+
+def _full_text_days() -> int:
+    from .replies import _FULL_TEXT_TTL_SEC
+    return _FULL_TEXT_TTL_SEC // 86400
+
+
+def _handoff_prune(handoff, state_dir: Path, now: float, dry_run: bool) -> int:
+    base = handoff.handoff_dir(state_dir)
+    if base.is_symlink() or not base.is_dir():
+        return 0
+    return handoff.prune(base, now, dry_run=dry_run)
+
+
+def owner_passes(state_dir: Path, now: float, *, dry_run: bool = False) -> tuple[dict[str, int], list[str]]:
+    """Уборка словарей и записей их владельцами, которые сами чистят только при
+    рестарте или следующей записи (этап 2): ({проход: удалено записей}, ошибки).
+    Записи, а не файлы: в отчёте они идут в deleted_files без freed_bytes.
+    Сухой прогон только считает; подрезку sent_texts не показывает."""
+    from . import events, handoff, reactions
+    try:
+        from . import app_launch
+    except ImportError:  # открытая копия: очереди «в приложение» в ней нет
+        app_launch = None
+    counts, errors = {}, []
+    passes = [
+        ("events", lambda: events.prune_done(events.event_dir(state_dir), now, dry_run=dry_run)),
+        # Экраны передачи по created_ts записи; замок `.lock` каталога не трогается.
+        ("handoff", lambda: _handoff_prune(handoff, state_dir, now, dry_run)),
+    ]
+    if app_launch is not None:
+        passes.append(("app_queue", lambda: app_launch.prune(
+            state_dir, now, APP_QUEUE_CLOSED_DAYS * 86400, dry_run=dry_run)))
+    if not dry_run:
+        # Подрезка не удаляет файлов: в счёт удалённых не идёт.
+        passes.append(("sent_texts", lambda: reactions.trim(state_dir) and 0))
+    for name, fn in passes:
+        # Любой сбой одного прохода идёт в отчёт, а не обрывает весь проход
+        # до write_report (ревью 09.11.2026: TypeError из битой записи).
+        try:
+            counts[name] = int(fn())
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {type(e).__name__}")
+    return counts, errors
 
 
 def due_files(roots: list[tuple[Path, int, str]], now: float) -> list[tuple[str, Path, float]]:
@@ -92,21 +148,43 @@ RULES: dict[str, str] = {
     "telethon-bot.session*": "постоянно: вход Telethon (и журнал SQLite во время записи)",
     ".writetest-*": "проба записи при старте (__main__), живёт секунды",
     "geodata": "справочник: постоянно",
-    # Этап 2: срок не решён, разбор в BACKLOG (уборка временного, этап 2).
-    "events": "этап 2", "otkliki": "этап 2", "outbox": "этап 2", "news_digest": "этап 2",
-    "voice-texts": "этап 2", "session_scopes.json": "этап 2", "codex_checks.json": "этап 2",
-    "sent_texts.jsonl": "этап 2 (защита от повторов)",
-    "deals": "этап 2", "diary": "этап 2", "diary_audio": "этап 2", "diary_evening": "этап 2",
-    "handoff": "этап 2", "mailsend": "этап 2",
-    # Словари состояния: один файл на вид, растут медленно; срок в этапе 2.
-    "app_queue.json": "этап 2", "at_jobs.json": "этап 2", "claude_limits.json": "постоянно: одна запись",
-    "cost_by_day.json": "этап 2", "daily_pins.json": "этап 2", "deal_sessions.json": "этап 2",
-    "diary_snooze.json": "постоянно: одна запись", "foreign_sessions.json": "этап 2",
+    # Этап 2 (09.11.2026): владелец бот, срок по коду владельца.
+    "events": "уборка бота: конченные события events.KEEP_DONE_SEC (8 суток) после done_at; живые постоянно",
+    "voice-texts": "уборка бота: полный текст ответа replies._FULL_TEXT_TTL_SEC (14 дней) от записи",
+    "handoff": "уборка бота: экраны передачи handoff.prune, handoff.KEEP_DAYS (7 дней) от created_ts; замок постоянно",
+    "mailsend": f"уборка бота: билеты одобрения письма {MAILSEND_TTL_DAYS} день от записи (живут 10 минут)",
+    "news_digest": ("чистит владелец: выпуски 30 дней, seen 60, задачи gone 40 (skills/news_digest);"
+                    " отзывы feedback.jsonl и замки постоянно, растут медленно"),
+    "deals": "чистит владелец: закрытые дела deals.KEEP_CLOSED_SEC (8 суток) при старте бота",
+    "sent_texts.jsonl": ("уборка бота: хвост 256 КБ для reactions.lookup (текст под реакцией Ивана),"
+                         " подрезка в суточном проходе; в защите от повторов не участвует"),
+    "session_scopes.json": "чистит владелец: 90 дней от последнего рана сессии (не короче жизни расшифровок, изоляция /resume)",
+    "untrusted_sessions.json": "чистит владелец: 90 дней от последнего рана помеченной сессии, как session_scopes (метка не короче окна /resume)",
+    "codex_checks.json": "чистит владелец: последние 30 кнопок «Проверь Кодексом» (tg_quick.CHECK_KEEP)",
+    "session_costs.json": "чистит владелец: последние 300 сессий (claude_runner.COST_TOTALS_KEEP)",
+    "cost_by_day.json": "чистит владелец: 14 дней",
+    "daily_pins.json": "чистит владелец: 40 дней (notify.DAILY_KEEP_SEC)",
+    "app_queue.json": f"уборка бота: сделанные и снятые записи {APP_QUEUE_CLOSED_DAYS} дней после закрытия; открытые постоянно",
+    "at_jobs.json": "постоянно: очередь /at, записи снимаются при запуске и отмене",
+    "sessions.json": "постоянно: сессия на тему, снимается /reset и закрытием задачи",
+    "scope_fingerprints.json": "постоянно: запись на тему, снимается закрытием задачи",
+    "topic_names.json": "постоянно: имя на тему, снимается закрытием задачи",
+    "model_session_overrides.json": "постоянно: снимается сменой сессии",
+    "foreign_sessions.json": "постоянно: запись на чат, перезаписывается каждым раном",
+    "deal_sessions.json": "постоянно: запись на чат, перезаписывается каждым раном",
+    "reaction_notes.json": "постоянно: опустошается следующим ходом лички",
+    # Ждут решения Ивана (вопрос 09.11.2026): невоспроизводимое или без копии.
+    "otkliki": "постоянно до решения Ивана: история откликов с текстами черновиков (вопрос 09.11.2026)",
+    "outbox": "постоянно до решения Ивана: файлы для SEND_FILE, часть без копии (вопрос 09.11.2026)",
+    "diary": "остаток дневника бота (код снят 07.10.2026, канон в Obsidian): удалить по «ок» Ивана",
+    "diary_audio": "остаток дневника бота: удалить по «ок» Ивана",
+    "diary_evening": "остаток дневника бота: удалить по «ок» Ивана",
+    "diary_snooze.json": "остаток дневника бота: удалить по «ок» Ивана",
+    "claude_limits.json": "постоянно: одна запись",
     "login_expiry.json": "постоянно: одна запись", "model_overrides.json": "постоянно: настройки",
-    "model_pending_overrides.json": "постоянно: настройки", "model_session_overrides.json": "этап 2",
-    "models.json": "постоянно: настройки", "reaction_notes.json": "этап 2",
-    "scope_fingerprints.json": "этап 2", "scopes.json": "постоянно: настройки", "sessions.json": "этап 2",
-    "session_costs.json": "этап 2", "topic_names.json": "этап 2", "untrusted_sessions.json": "этап 2",
+    "model_pending_overrides.json": "постоянно: настройки",
+    "models.json": "постоянно: настройки",
+    "scopes.json": "постоянно: настройки",
     "inflight.json": "постоянно: идущие раны", "effort_overrides.json": "постоянно: настройки",
     "restart_request.json": "заявка на перезапуск: живёт до перезапуска",
 }
@@ -125,7 +203,7 @@ def unknown(state_dir: Path) -> list[str]:
         names = sorted(p.name for p in state_dir.iterdir())
     except OSError:
         return []
-    return [n for n in names if rule_for(n) is None and not (n.startswith(".") and n.endswith(".tmp"))]
+    return [n for n in names if rule_for(n) in (None, STAGE2) and not (n.startswith(".") and n.endswith(".tmp"))]
 
 
 def write_report(state_dir: Path, *, deleted: int, freed: int, errors: int, sample: list[str],
@@ -162,6 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"удалит {len(due)}:")
     for name, f, m in due:
         print(f"  {name}  {datetime.fromtimestamp(m, config.local_zone()):%d.%m.%Y}  {f}")
+    counts, errs = owner_passes(paths.state_dir(), now, dry_run=True)
+    print("проходы владельцев удалят записей: "
+          + ", ".join(f"{k} {v}" for k, v in counts.items())
+          + (f"; ошибки: {', '.join(errs)}" if errs else ""))
     unk = unknown(paths.state_dir())
     if unk:
         print("без правила: " + ", ".join(unk))
