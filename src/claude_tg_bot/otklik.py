@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import uuid
 from collections.abc import Iterator
@@ -84,6 +85,8 @@ STATUS_LINES = {
 # старых записей бот не перерисовывает (sync_targets).
 LIVE_STATUSES = ("pending", "approved", "edit", "sending", "failed", "unknown")
 SYNC_DAYS = 14
+# Нерешённая пачка «✅ Все N» живёт неделю (уборка бота, prune).
+BATCH_KEEP_SEC = 7 * 86400
 
 
 class Refused(Exception):
@@ -137,6 +140,49 @@ def locked(base: Path) -> Iterator[None]:
     Держать только на чтение и запись файлов, без сети."""
     with jsonstore.file_lock(base / LOCK_NAME):
         yield
+
+
+def prune(base: Path, now: float, keep_sec: float, *, dry_run: bool = False) -> int:
+    """Удалить итоговые записи (DONE_STATUSES) старше keep_sec от updated
+    (суточная уборка бота, retention.OTKLIK_DONE_DAYS). Живые не трогает;
+    запись без читаемого времени хранится. Под замком переходов."""
+    if base.is_symlink() or not base.is_dir():
+        return 0
+    removed = 0
+    with (contextlib.nullcontext() if dry_run else locked(base)):
+        for path in sorted(base.glob("*.json")):
+            if not _ID_RE.fullmatch(path.stem) or path.is_symlink():
+                continue
+            rec = load(base, path.stem)
+            if not rec or rec.get("status") not in DONE_STATUSES:
+                continue
+            # Без своего updated возраст последнего изменения неизвестен:
+            # запись хранится (ревью Codex 09.11.2026), created не подставляется.
+            raw = rec.get("updated")
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                updated = datetime.fromisoformat(raw).timestamp()
+            except ValueError:
+                continue
+            if now - updated > keep_sec:
+                if not dry_run:
+                    path.unlink(missing_ok=True)
+                removed += 1
+        # Пачки «✅ Все N», которые так и не нажали: кнопка потом ответит
+        # «пачка уже решена» (ревью 09.11.2026).
+        bdir = base / "batches"
+        if not bdir.is_symlink() and bdir.is_dir():
+            for path in sorted(bdir.glob("*.json")):
+                try:
+                    st = path.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and now - st.st_mtime > BATCH_KEEP_SEC:
+                    if not dry_run:
+                        path.unlink(missing_ok=True)
+                    removed += 1
+    return removed
 
 
 def _records(base: Path) -> Iterator[dict[str, Any]]:
