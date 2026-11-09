@@ -71,11 +71,43 @@ class CommandClassifyTests(_Env):
 
     def test_tricky_forms_give_command_card(self) -> None:
         for cmd in (f'bash -c "{self.cmd()}"', f"x=$({self.cmd()})", f"`{self.cmd()}`",
-                    f"{self.cmd()} | tee /tmp/log", f"{self.cmd()}; echo ok",
+                    f"{self.cmd()} | tee /tmp/log", f"{self.cmd()}; rm -f /tmp/x",
+                    f"{self.cmd()} > /tmp/log", f"{self.cmd()} 2> /tmp/err", f"{self.cmd()} &",
+                    f"{self.cmd()} |& head", f"{self.cmd()} | sed -i s/a/b/ {self.body}",
+                    f"{self.cmd()} | head; git push", f"{self.cmd()} |", f"{self.cmd()} ;",
+                    f"{self.cmd()} | grep issue#12; rm -rf /tmp/x", f"{self.cmd()} < /dev/null",
+                    f"{self.cmd()} ;; cat x", f"{self.cmd()} | /usr/bin/head", f"{self.cmd()} | rg --pre=sh x",
+                    f"{PY} --to a@b.c 2>&1 --subject s --body-file {self.body}",
+                    f"{self.cmd()}\xa0#x; rm -rf /tmp/zz", f"{self.cmd()}\x0b#x; rm -rf /tmp/zz",
                     f"bash <<'EOF'\n{self.cmd()}\nEOF", f"FOO=1 {self.cmd()}",
                     f"timeout 60 {self.cmd()}", "python -c 'import claude_tg_bot.mailsend'"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
+
+    def test_reader_tail_keeps_kind(self) -> None:
+        # Карточки 09.11.2026: справка и сухой прогон с `| head`, `; cat` шли
+        # карточкой команды; настоящая отправка с `| tail` давала карточку без
+        # билета, и письмо не уходило.
+        for extra in (" --dry-run 2>&1 | tail -8", " --dry-run | head -30; cat /tmp/x",
+                      " --dry-run && echo ok || echo fail"):
+            with self.subTest(extra=extra):
+                self.assertEqual(outbound.mailsend_check(self.cmd(extra), None)[0], "dry")
+        help_cmd = f'{PY} --help 2>&1 | head -30; cat "{self.body}"'
+        self.assertEqual(outbound.mailsend_check(help_cmd, None)[0], "dry")
+        # Комментарий bash (`#` в начале слова) не аргумент (ревью Codex 09.11.2026).
+        self.assertEqual(outbound.mailsend_check(f"{PY} --help | head -30 # don't print more", None)[0], "dry")
+        for extra in (" # send once", " | tail -8 # don't print more", " # --help",
+                      " --subject 'a # b'"):
+            with self.subTest(extra=extra):
+                kind, info = outbound.mailsend_check(self.cmd(extra), None)
+                self.assertEqual(kind, "card")
+        plain = outbound.mailsend_check(self.cmd(), None)
+        # `-h` у читателя в хвосте не делает отправку справкой.
+        for extra in (" 2>&1 | tail -8", "; echo ok", " | grep -i sent | wc -l", " | grep -h sent"):
+            with self.subTest(extra=extra):
+                kind, info = outbound.mailsend_check(self.cmd(extra), None)
+                self.assertEqual(kind, "card")
+                self.assertEqual(info["digest"], plain[1]["digest"])
 
     def test_file_names_are_not_mentions(self) -> None:
         for cmd in ("cat src/claude_tg_bot/mailsend.py", ".venv/bin/python -m pytest tests/test_mailsend.py"):
