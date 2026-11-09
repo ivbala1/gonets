@@ -143,15 +143,22 @@ _MAILSEND_FORM = "[cd DIR &&] .venv/bin/python -m claude_tg_bot.mailsend --to ..
 def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] | None:
     """Аргументы mailsend из простой команды `[cd DIR &&] PY -m
     claude_tg_bot.mailsend ...` и каталог для относительных путей. Подстановки,
-    конвейеры, bash -c, heredoc и переменные не разбираются: None."""
+    bash -c, heredoc, переменные и хвост не из читателей (_reader_tail) не
+    разбираются: None."""
     # Перенос строки через `\` bash убирает до разбора; в одинарных кавычках
     # он остался бы, но такой путь или тема дадут другой хеш, то есть отказ.
     cmd = cmd.replace("\\\n", "")
     if any(c in cmd for c in "$`\\\n\r"):
         return None
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        # Комментарий как в bash: `#` в начале слова вне кавычек, до конца
+        # (перевода строки здесь нет). `#` внутри слова (`issue#12`) shlex
+        # считает комментарием, bash нет: хвост за ним пропал бы из разбора
+        # (ревью Opus 09.11.2026), а без комментариев вовсе `# don't` ломал
+        # разбор и `# --help` делал отправку справкой (ревью Codex).
+        lex = shlex.shlex(cmd[:_shell_scan(cmd)[1]], posix=True, punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""
         tokens = list(lex)
     except ValueError:
         return None
@@ -170,9 +177,38 @@ def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] |
             or tokens[1:3] != ["-m", _MAILSEND_MODULE]):
         return None
     argv = tokens[3:]
-    if any(t and set(t) <= _SHELL_OPS for t in argv):
+    cut = next((i for i, t in enumerate(argv) if t and set(t) <= _SHELL_OPS), len(argv))
+    argv, rest = argv[:cut], argv[cut:]
+    # `2>&1` сразу за аргументами: вывод ошибок в тот же поток.
+    if rest[:2] == [">&", "1"] and argv[-1:] == ["2"]:
+        argv, rest = argv[:-1], rest[2:]
+    if not _reader_tail(rest):
         return None
     return argv, base
+
+
+# Хвост после mailsend, который письма не меняет и ничего не пишет: читатели
+# вывода и файлов через `|`, `;`, `&&`, `||` (без перенаправлений). Справка и
+# сухой прогон с `| head` шли карточкой «mention», настоящая отправка с
+# `| tail` тоже, а по ней билет не пишется, и письмо не уходило: агент
+# повторял команду второй карточкой (карточки 23.10, 27.10 и 09.11.2026,
+# решение Ивана 09.11.2026). Письмо всё равно сверяется с билетом по хешу.
+# Без `rg`: `--pre` запускает программу на каждом файле (ревью Opus).
+_TAIL_OPS = frozenset({"|", ";", "&&", "||"})
+_TAIL_READERS = frozenset({"head", "tail", "grep", "egrep", "fgrep", "wc", "cat",
+                           "ls", "echo", "printf"})
+
+
+def _reader_tail(rest: list[str]) -> bool:
+    """Хвост из кусков `ОП читатель аргументы...`; пустой тоже годится."""
+    i = 0
+    while i < len(rest):
+        if rest[i] not in _TAIL_OPS or i + 1 >= len(rest) or rest[i + 1] not in _TAIL_READERS:
+            return False
+        i += 2
+        while i < len(rest) and not (rest[i] and set(rest[i]) <= _SHELL_OPS):
+            i += 1
+    return True
 
 
 def _command_head(tokens: list[str]) -> str:
@@ -185,14 +221,21 @@ def _command_head(tokens: list[str]) -> str:
     return ""
 
 
-def _single_quoted(cmd: str) -> list[bool]:
+# Перед `#` комментария bash: начало строки, пробел, табуляция, перевод
+# строки или оператор. Неразрывный пробел и `\v` слово не делят: `s\xa0#x; rm`
+# в bash исполняет `rm` (перепроверка Opus 09.11.2026).
+_COMMENT_AFTER = frozenset(" \t\n;&|()<>")
+
+
+def _shell_scan(cmd: str) -> tuple[list[bool], int]:
     """Для каждого знака: внутри одинарных кавычек оболочки, где `$(...)` и
-    обратные кавычки не исполняются. В двойных кавычках `'` обычный знак.
-    Комментарий (`#` в начале слова вне кавычек, до конца строки) кавычек не
-    открывает: апостроф в `# don't` не прячет подстановки ниже. Сам текст
-    комментария считается исполняемым: лишняя карточка дешевле."""
+    обратные кавычки не исполняются (в двойных `'` обычный знак); и начало
+    первого комментария (`#` в начале слова вне кавычек) или длина строки.
+    Комментарий кавычек не открывает: апостроф в `# don't` не прячет
+    подстановки ниже."""
     out, single, double, esc, comment, prev = [], False, False, False, False, "\n"
-    for c in cmd:
+    first = len(cmd)
+    for i, c in enumerate(cmd):
         out.append(single and c != "'")
         if esc:
             esc = False
@@ -208,10 +251,17 @@ def _single_quoted(cmd: str) -> list[bool]:
             pass
         elif c == "'":
             single = True
-        elif c == "#" and (prev.isspace() or prev in ";&|()<>"):
+        elif c == "#" and prev in _COMMENT_AFTER:
             comment = True
+            first = min(first, i)
         prev = c
-    return out
+    return out, first
+
+
+def _single_quoted(cmd: str) -> list[bool]:
+    """_shell_scan: только признаки одинарных кавычек. Текст комментария
+    здесь считается исполняемым: лишняя карточка дешевле."""
+    return _shell_scan(cmd)[0]
 
 
 def _substitutions(cmd: str) -> list[str]:
