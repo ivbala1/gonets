@@ -38,11 +38,15 @@ TELEGRAM_MCP_DOWNLOADS = Path.home() / ".cache" / "telegram-mcp" / "downloads"
 # старый файл ушёл бы первым же проходом. В state/ и у сервера Bot API файлы
 # пишет сам бот: срок от mtime.
 COPY_ROOTS = frozenset({paths.TELEGRAM_SEND_DIR, TELEGRAM_MCP_DOWNLOADS})
+# То же для деревьев state/ по имени: в outbox агенты кладут файлы руками
+# для <<SEND_FILE:...>> (решение Ивана 09.11.2026: 30 дней, как telegram-send).
+COPY_STATE_NAMES = frozenset({"outbox"})
 
 
 def age_time(st, root: Path) -> float:
     """Время, от которого считается срок файла дерева root."""
-    return max(st.st_mtime, st.st_ctime) if root in COPY_ROOTS else st.st_mtime
+    copied = root in COPY_ROOTS or root.name in COPY_STATE_NAMES
+    return max(st.st_mtime, st.st_ctime) if copied else st.st_mtime
 
 
 def trees(state_dir: Path, attachment_ttl_days: int) -> list[tuple[Path, int, str]]:
@@ -57,6 +61,7 @@ def trees(state_dir: Path, attachment_ttl_days: int) -> list[tuple[Path, int, st
         # следующей записи; здесь тем же сроком и без активности.
         (state_dir / "voice-texts", _full_text_days(), "voice-texts"),
         (state_dir / "mailsend", MAILSEND_TTL_DAYS, "mailsend"),
+        (state_dir / "outbox", TELEGRAM_FILES_TTL_DAYS, "outbox"),
         (paths.TELEGRAM_SEND_DIR, TELEGRAM_FILES_TTL_DAYS, "telegram-send"),
         (TELEGRAM_MCP_DOWNLOADS, TELEGRAM_FILES_TTL_DAYS, "telegram-mcp-downloads"),
     ]
@@ -66,6 +71,10 @@ def trees(state_dir: Path, attachment_ttl_days: int) -> list[tuple[Path, int, st
 MAILSEND_TTL_DAYS = 1
 # Итоговые записи очереди «в приложение» (сделано, снято): дней от закрытия.
 APP_QUEUE_CLOSED_DAYS = 30
+# Итоговые отклики (отправлено, пропущено, не ушло, по otklik.DONE_STATUSES;
+# у failed есть кнопка ↩️, после срока она ответит «устарела»): дней от
+# последнего изменения записи (решение Ивана 09.11.2026); остальные не удаляются.
+OTKLIK_DONE_DAYS = 180
 # Пометка «срок не назначен»: в отчёте идёт как имя без правила (doctor красный).
 STAGE2 = "этап 2"
 
@@ -87,7 +96,7 @@ def owner_passes(state_dir: Path, now: float, *, dry_run: bool = False) -> tuple
     рестарте или следующей записи (этап 2): ({проход: удалено записей}, ошибки).
     Записи, а не файлы: в отчёте они идут в deleted_files без freed_bytes.
     Сухой прогон только считает; подрезку sent_texts не показывает."""
-    from . import events, handoff, reactions
+    from . import events, handoff, otklik, reactions
     try:
         from . import app_launch
     except ImportError:  # открытая копия: очереди «в приложение» в ней нет
@@ -97,6 +106,8 @@ def owner_passes(state_dir: Path, now: float, *, dry_run: bool = False) -> tuple
         ("events", lambda: events.prune_done(events.event_dir(state_dir), now, dry_run=dry_run)),
         # Экраны передачи по created_ts записи; замок `.lock` каталога не трогается.
         ("handoff", lambda: _handoff_prune(handoff, state_dir, now, dry_run)),
+        ("otkliki", lambda: otklik.prune(otklik.otklik_dir(state_dir), now,
+                                         OTKLIK_DONE_DAYS * 86400, dry_run=dry_run)),
     ]
     if app_launch is not None:
         passes.append(("app_queue", lambda: app_launch.prune(
@@ -174,12 +185,17 @@ RULES: dict[str, str] = {
     "deal_sessions.json": "постоянно: запись на чат, перезаписывается каждым раном",
     "reaction_notes.json": "постоянно: опустошается следующим ходом лички",
     # Ждут решения Ивана (вопрос 09.11.2026): невоспроизводимое или без копии.
-    "otkliki": "постоянно до решения Ивана: история откликов с текстами черновиков (вопрос 09.11.2026)",
-    "outbox": "постоянно до решения Ивана: файлы для SEND_FILE, часть без копии (вопрос 09.11.2026)",
-    "diary": "остаток дневника бота (код снят 07.10.2026, канон в Obsidian): удалить по «ок» Ивана",
-    "diary_audio": "остаток дневника бота: удалить по «ок» Ивана",
-    "diary_evening": "остаток дневника бота: удалить по «ок» Ивана",
-    "diary_snooze.json": "остаток дневника бота: удалить по «ок» Ивана",
+    # Решение Ивана 09.11.2026.
+    "otkliki": (f"уборка бота: итоговые по otklik.DONE_STATUSES (sent, skipped, failed, включая failed"
+                f" с кнопкой ↩️) {OTKLIK_DONE_DAYS} дней от updated; остальные постоянно; нерешённые пачки"
+                " batches 7 дней (otklik.BATCH_KEEP_SEC); замок .lock постоянно"),
+    "outbox": "уборка бота: файлы для SEND_FILE 30 дней от позднего из mtime и ctime, как telegram-send",
+    # Остатки дневника бота (код снят 07.10.2026, канон в Obsidian): удалить,
+    # «ок» Ивана 09.11.2026; снимок ~/tmp/2026-11-09-uborka-snimok. После удаления правила снять.
+    "diary": "остаток дневника бота: удалить («ок» Ивана 09.11.2026)",
+    "diary_audio": "остаток дневника бота: удалить («ок» Ивана 09.11.2026)",
+    "diary_evening": "остаток дневника бота: удалить («ок» Ивана 09.11.2026)",
+    "diary_snooze.json": "остаток дневника бота: удалить («ок» Ивана 09.11.2026)",
     "claude_limits.json": "постоянно: одна запись",
     "login_expiry.json": "постоянно: одна запись", "model_overrides.json": "постоянно: настройки",
     "model_pending_overrides.json": "постоянно: настройки",
