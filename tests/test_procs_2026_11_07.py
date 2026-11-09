@@ -452,7 +452,6 @@ class ReapAndBornTests(unittest.IsolatedAsyncioTestCase):
 # procs.run_bounded(_sync).
 SPAWN_ALLOWED = {
     "src/claude_tg_bot/local_stt_worker.py::_decode": "воркер под python -I без пакета бота",
-    "src/claude_tg_bot/tg_probe.py::ensure_voice": "замерщик сессии tg-probe, ffmpeg без потомков",
     "src/claude_tg_bot/restart.py::git_state": "git rev-parse/status без потомков, timeout",
     "src/claude_tg_bot/restart.py::changed_since": "git diff без потомков, timeout",
     "src/claude_tg_bot/handoff.py::crop_image": "ffmpeg без потомков, timeout",

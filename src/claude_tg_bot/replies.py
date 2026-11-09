@@ -20,9 +20,8 @@ from typing import Any, Awaitable, Callable
 
 from telegram import MessageEntity, ReplyParameters, Update
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
-from telegram.ext import ContextTypes
 
-from . import jsonstore, reactions, tg_api
+from . import jsonstore, paths, reactions, tg_api
 from .claude_runner import ClaudeResult
 from .config import Config
 from .i18n import _
@@ -510,16 +509,28 @@ def render_markup(text: str) -> tuple[str, list[MessageEntity]]:
 #   <<SEND_FILE:/tmp/track.gpx>>
 # Маркер вырезается из текста перед отправкой. Безопасность: путь должен
 # резолвиться внутри одного из whitelist root'ов (см. send_file_whitelist),
-# файл существует, не директория, ≤50 МБ (лимит bot API).
+# файл существует, не директория, не больше предела отправки: 50 МБ у
+# облачного Bot API, 2000 МБ у своего сервера (send_file_max_bytes).
 _SEND_FILE_MAX_BYTES = 50 * 1024 * 1024
+_SEND_FILE_MAX_LOCAL = 2000 * 1024 * 1024
+
+
+def send_file_max_bytes(cfg: Config) -> int:
+    return _SEND_FILE_MAX_LOCAL if tg_api.on_local_server(cfg) else _SEND_FILE_MAX_BYTES
+
+
 _SEND_FILE_RE = re.compile(r"<<SEND_FILE:([^>\n]+)>>")
 
 
 def send_file_whitelist(cfg: Config) -> list[Path]:
+    """Корни маркера: `SEND_FILE_WHITELIST_PATHS` (через `:`) или по умолчанию
+    `/tmp`, `state/outbox` и папка отправки `telegram-send`. Её агент берёт по
+    правилу персоны для send_file, и маркер с ней отклонялся (09.11.2026)."""
     raw = os.environ.get("SEND_FILE_WHITELIST_PATHS", "")
     if raw.strip():
-        return [Path(p).expanduser().resolve() for p in raw.split(":") if p.strip()]
-    return [Path("/tmp").resolve(), (cfg.state_dir / "outbox").resolve()]
+        return [Path(p.strip()).expanduser().resolve() for p in raw.split(":") if p.strip()]
+    return [Path("/tmp").resolve(), (cfg.state_dir / "outbox").resolve(),
+            paths.TELEGRAM_SEND_DIR.resolve()]
 
 
 def _is_under(p: Path, root: Path) -> bool:
@@ -556,6 +567,7 @@ def _is_secret_file(p: Path) -> bool:
 
 def extract_send_file_markers(
     text: str, whitelist: list[Path], refuse_reason: str = "",
+    max_bytes: int = _SEND_FILE_MAX_BYTES,
 ) -> tuple[list[Path], str]:
     """Парсит <<SEND_FILE:path>> маркеры. Возвращает (валидные пути, текст без маркеров).
 
@@ -584,8 +596,8 @@ def extract_send_file_markers(
             return None, f"stat failed: {e}"
         if size == 0:
             return None, "empty file"
-        if size > _SEND_FILE_MAX_BYTES:
-            return None, f"too large ({size} bytes, max {_SEND_FILE_MAX_BYTES})"
+        if size > max_bytes:
+            return None, f"too large ({size} bytes, max {max_bytes})"
         return p, None
 
     def _sub(m: re.Match[str]) -> str:
@@ -621,13 +633,14 @@ _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
     """Первый валидный <<ASK:...>> → ((вопрос, варианты), текст без маркера).
 
-    Маркеры внутри ``` ``` ``` игнорируются: Claude может цитировать файл,
-    README или свой же формат, и это не должно превращаться в кнопки.
+    Маркеры в коде (блок ```, одиночный `код`, незакрытый блок) игнорируются:
+    Claude может цитировать файл, README или свой же формат, и это не должно
+    превращаться в кнопки (одиночный код с 08.11.2026).
     Невалидные маркеры (нет вариантов, слишком длинные) и второй маркер
     остаются в тексте как есть — пользователь хотя бы прочитает вопрос.
     """
-    # Диапазоны кодовых блоков: маркеры внутри них не трогаем.
-    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    # Диапазоны кода: маркеры внутри них не трогаем.
+    fences = _code_spans(text)
 
     def _in_fence(pos: int) -> bool:
         return any(start <= pos < end for start, end in fences)
@@ -655,6 +668,24 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
     return (found[0] if found else None), cleaned
 
 
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Участки кода, где метки не действуют: блоки ```, одиночные `кода` и
+    незакрытый блок до конца текста."""
+    spans = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    # Одиночные кавычки ищутся вне блоков: иначе ``` склеился бы с соседней.
+    outside = _FENCE_RE.sub(lambda f: " " * len(f.group(0)), text)
+    spans += [(m.start(), m.end()) for m in _INLINE_CODE_RE.finditer(outside)]
+    opened = re.search(r"(?m)^[ \t]*```", outside)
+    if opened:
+        # Незакрытый блок (оборванный ответ) идёт до конца текста (ревью Codex
+        # 04.11.2026); ``` посреди строки текста блоком не считается (ревью Opus).
+        spans.append((opened.start(), len(text)))
+    return spans
+
+
 # Метка звука: ран без звука (/event с silent и wake) зовёт владельца со звуком
 # одним итоговым ответом, когда уверен, что нужна его реакция (решение Ивана
 # 26.10.2026: «пробуждение слушателя не равно пробуждению меня»). Вырезается
@@ -662,9 +693,10 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
 _LOUD_RE = re.compile(r"[ \t]*<<LOUD>>")
 
 
-def extract_loud_marker(text: str) -> tuple[bool, str]:
-    """Есть ли <<LOUD>> вне кодовых блоков → (да или нет, текст без меток)."""
-    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+def _extract_flag_marker(rx: re.Pattern[str], text: str) -> tuple[bool, str]:
+    """Метка-флаг вне кода (блоков ``` и `одиночного`) → (да или нет, текст без
+    меток). Метка, упомянутая в `коде` (рассказ о самом боте), не срабатывает."""
+    fences = _code_spans(text)
     found = False
 
     def _sub(m: re.Match[str]) -> str:
@@ -674,10 +706,28 @@ def extract_loud_marker(text: str) -> tuple[bool, str]:
         found = True
         return ""
 
-    cleaned = _LOUD_RE.sub(_sub, text)
+    cleaned = rx.sub(_sub, text)
     if not found:
         return False, text
     return True, cleaned.strip()
+
+
+def extract_loud_marker(text: str) -> tuple[bool, str]:
+    """Есть ли <<LOUD>> вне кодовых блоков → (да или нет, текст без меток)."""
+    return _extract_flag_marker(_LOUD_RE, text)
+
+
+# Метка голоса: модель сама решает, что Иван просит ответ голосом в любой
+# форме («ответь голосовым», «скажи вслух», «перешли то же голосом», «voice
+# please»), и ставит <<VOICE>>; бот озвучивает этот ответ. Жёсткий список слов
+# до 08.11.2026 ловил «почему голосом?» и пропускал «давай аудио». Вырезается
+# из любого ответа; внутри блока ``` остаётся как есть, как и LOUD.
+_VOICE_RE = re.compile(r"[ \t]*<<VOICE>>")
+
+
+def extract_voice_marker(text: str) -> tuple[bool, str]:
+    """Есть ли <<VOICE>> вне кодовых блоков → (да или нет, текст без меток)."""
+    return _extract_flag_marker(_VOICE_RE, text)
 
 
 # Метка тишины: ран сторожа или слушателя, где от Ивана ничего не нужно, не шлёт
@@ -688,18 +738,7 @@ _QUIET_RE = re.compile(r"[ \t]*<<QUIET>>")
 
 def extract_quiet_marker(text: str) -> tuple[bool, str]:
     """Есть ли <<QUIET>> вне кодовых блоков → (да или нет, текст без меток)."""
-    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
-    found = False
-
-    def _sub(m: re.Match[str]) -> str:
-        nonlocal found
-        if any(start <= m.start() < end for start, end in fences):
-            return m.group(0)
-        found = True
-        return ""
-
-    cleaned = _QUIET_RE.sub(_sub, text)
-    return (True, cleaned.strip()) if found else (False, text)
+    return _extract_flag_marker(_QUIET_RE, text)
 
 
 # Повторная проверка, которую агент назначает себе сам (идея agent-autoloop,
@@ -707,7 +746,6 @@ def extract_quiet_marker(text: str) -> tuple[bool, str]:
 # tg_at.schedule_later, здесь только форма. Устроено как ASK, но «>» в тексте
 # допустим, а цитата формата в `коде` маркером не считается (ревью 04.11.2026).
 _LATER_RE = re.compile(r"<<LATER:([^\n]+?)>>")
-_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 LATER_MAX_ABOUT_LEN = 200
 
 
@@ -720,15 +758,7 @@ def extract_later_marker(text: str) -> tuple[tuple[str, str] | None, str]:
     ответа не срабатывает (ревью 04.11.2026). Без «|», с пустой частью или
     длинным текстом маркер остаётся в тексте как есть, другие тоже.
     """
-    fences = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
-    # Одиночные кавычки ищутся вне блоков: иначе ``` склеился бы с соседней.
-    outside = _FENCE_RE.sub(lambda f: " " * len(f.group(0)), text)
-    fences += [(m.start(), m.end()) for m in _INLINE_CODE_RE.finditer(outside)]
-    opened = re.search(r"(?m)^[ \t]*```", outside)
-    if opened:
-        # Незакрытый блок (оборванный ответ) идёт до конца текста (ревью Codex
-        # 04.11.2026); ``` посреди строки текста блоком не считается (ревью Opus).
-        fences.append((opened.start(), len(text)))
+    fences = _code_spans(text)
     marks = [m for m in _LATER_RE.finditer(text)
              if not any(start <= m.start() < end for start, end in fences)]
     if not marks:
@@ -837,16 +867,40 @@ def _cost_line(cfg: Config, result: ClaudeResult, model_note: str, warn_reset: b
 # Случай 25.10.2026: GPX 2 МБ загружен, но ответ Telegram не пришёл за 5 с
 # (умолчание read_timeout), бот написал «не удалось», а файл дошёл.
 _SEND_FILE_TIMEOUT = 120
+_SEND_FILE_TIMEOUT_MAX = 3600
 
 
-async def send_files(update: Update, files: list[Path]) -> None:
+def _send_file_timeout(size: int) -> int:
+    """Свой сервер отвечает на sendDocument, когда сам загрузил файл в
+    Telegram: срок растёт с размером (около 0,25 МБ/с, оценка, не замер)."""
+    return min(_SEND_FILE_TIMEOUT_MAX, max(_SEND_FILE_TIMEOUT, 60 + size // (256 * 1024)))
+
+
+async def send_files(update: Update, files: list[Path], *, local: bool = False,
+                     max_bytes: int = _SEND_FILE_MAX_BYTES) -> None:
+    """local: свой сервер Bot API: файл уходит ему путём (local_mode PTB шлёт
+    file://, сервер читает с диска сам), без загрузки байтов по HTTP; в облако
+    открытым файлом. Размер проверяется ещё раз: файл мог вырасти после
+    разбора маркера."""
     msg = update.message
     for fpath in files:
         try:
-            with fpath.open("rb") as fh:
-                await msg.reply_document(document=fh, filename=fpath.name,
-                                         read_timeout=_SEND_FILE_TIMEOUT, write_timeout=_SEND_FILE_TIMEOUT)
-            log.info("SEND_FILE sent: %s (%d bytes)", fpath, fpath.stat().st_size)
+            size = fpath.stat().st_size
+            if size > max_bytes:
+                log.warning("SEND_FILE skipped %s: grew to %d bytes", fpath, size)
+                await msg.reply_text(_("⚠️ SEND_FILE({raw}) пропущен: {error}").format(
+                    raw=fpath, error=f"too large ({size} bytes, max {max_bytes})"))
+                continue
+            # Облако отвечает, когда приняло байты по HTTP: прежние 120 с.
+            wait = _send_file_timeout(size) if local else _SEND_FILE_TIMEOUT
+            if local:
+                await msg.reply_document(document=fpath, filename=fpath.name,
+                                         read_timeout=wait, write_timeout=wait)
+            else:
+                with fpath.open("rb") as fh:
+                    await msg.reply_document(document=fh, filename=fpath.name,
+                                             read_timeout=wait, write_timeout=wait)
+            log.info("SEND_FILE sent: %s (%d bytes)", fpath, size)
         except Exception as e:
             log.exception("SEND_FILE failed for %s", fpath)
             # Тайм-аут чтения: файл обычно загружен, не пришло подтверждение (но не всегда).

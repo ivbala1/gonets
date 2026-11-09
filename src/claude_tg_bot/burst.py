@@ -115,9 +115,6 @@ def burst_duration_for_decision(decision: str) -> int | None:
         return BURST_DEFAULT_SEC
     if decision == "auto60":
         return BURST_LONG_SEC
-    if decision == "auto":
-        # Backward compatibility for already-sent Telegram cards from older bot versions.
-        return BURST_DEFAULT_SEC
     return None
 
 

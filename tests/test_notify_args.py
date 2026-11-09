@@ -56,6 +56,69 @@ class NotifyArgsTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual((payload["chat_id"], payload["message_thread_id"]), (-1, 9))
 
+    def test_here_goes_to_run_chat_and_thread(self):
+        # Перевод текста людям рядом с карточкой отправки (решение 08.11.2026).
+        cfg = _fake_cfg()
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-100500:77"}):
+            with patch.object(notify, "load_config", return_value=cfg):
+                with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                    rc = notify.main(["--here", "перевод"])
+        self.assertEqual(rc, 0)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual((payload["chat_id"], payload["message_thread_id"]), (-100500, 77))
+
+    def test_here_private_chat_without_thread(self):
+        cfg = _fake_cfg()
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "111"}):
+            with patch.object(notify, "load_config", return_value=cfg):
+                with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                    rc = notify.main(["--here", "перевод"])
+        self.assertEqual(rc, 0)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["chat_id"], 111)
+        self.assertNotIn("message_thread_id", payload)
+
+    def test_here_workshop_goes_where_card_is(self):
+        # Ран мастерской: карточка в личке (CLAUDE_TG_SHOW_CHAT_KEY), перевод туда же.
+        cfg = _fake_cfg()
+        env = {"CLAUDE_TG_CHAT_KEY": "-100500:77", "CLAUDE_TG_SHOW_CHAT_KEY": "111"}
+        with patch.dict(notify.os.environ, env):
+            with patch.object(notify, "load_config", return_value=cfg):
+                with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
+                    rc = notify.main(["--here", "перевод"])
+        self.assertEqual(rc, 0)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["chat_id"], 111)
+        self.assertNotIn("message_thread_id", payload)
+
+    def test_here_without_run_is_error_not_primary(self):
+        env = {k: v for k, v in notify.os.environ.items()
+               if k not in ("CLAUDE_TG_CHAT_KEY", "CLAUDE_TG_SHOW_CHAT_KEY")}
+        with patch.dict(notify.os.environ, env, clear=True):
+            with patch.object(notify, "load_config", return_value=_fake_cfg()):
+                with patch.object(notify.httpx, "post") as post:
+                    with redirect_stderr(io.StringIO()):
+                        rc = notify.main(["--here", "перевод"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+
+    def test_here_with_explicit_chat_is_error(self):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-1:5"}):
+            with patch.object(notify.httpx, "post") as post:
+                with redirect_stderr(io.StringIO()):
+                    rc = notify.main(["--here", "--chat-id", "-1", "т"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+
+    def test_here_foreign_chat_refused(self):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-999:1"}):
+            with patch.object(notify, "load_config", return_value=_fake_cfg()):
+                with patch.object(notify.httpx, "post") as post:
+                    with redirect_stderr(io.StringIO()):
+                        rc = notify.main(["--here", "т"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+
     def test_dash_leading_text_after_separator(self):
         # Текст, начинающийся с «-», не должен парситься как опция (находка 17).
         cfg = _fake_cfg()

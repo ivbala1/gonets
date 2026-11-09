@@ -105,6 +105,8 @@ def test_location_goes_as_text(tmp_path):
     text = dispatch.await_args.args[2]
     assert "48.85840, 2.29450" in text and "```\nКафе Зима, Улица 1\n```" in text
     assert "mlat=48.85840&mlon=2.29450" in text
+    # Без send_voice_reply _dispatch_to_claude_impl падал TypeError (обязательный аргумент).
+    assert dispatch.await_args.kwargs["send_voice_reply"] is False
 
 
 def test_location_denied_for_stranger(tmp_path):

@@ -702,11 +702,10 @@ class ComposeVoiceTests(_Base):
             await botmod.on_go(_update(_msg("/go")), self.ctx)
         return disp.await_args.kwargs["send_voice_reply"]
 
-    async def test_forwarded_voice_words_do_not_switch_voice(self) -> None:
-        self.assertFalse(await self._go(("Озвучь это вслух", True), ("моё дополнение", False)))
-
-    async def test_own_voice_words_switch_voice(self) -> None:
-        self.assertTrue(await self._go(("пересланное", True), ("озвучь ответ", False)))
+    async def test_voice_words_leave_choice_to_model(self) -> None:
+        # С 08.11.2026 слова голос не включают ни в своём, ни в пересланном:
+        # просьбу узнаёт модель меткой <<VOICE>>.
+        self.assertFalse(await self._go(("Озвучь это вслух", True), ("озвучь ответ", False)))
 
 
 # ---- B26: /cancel при идущем ране выбрасывает ждущее склейки ----

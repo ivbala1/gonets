@@ -16,14 +16,13 @@ class ComposeBuffer:
     sealed ставит первый /go, дальше буфер только дозаполняется — второй /go
     не отправит то же самое повторно.
     cancelled ставит /compose cancel: /go, ждущий куски, ничего не отправляет.
-    voice: свой кусок просил голосовой ответ; /go берёт флаг отсюда, а не
-    ищет слова по всему промпту вместе с пересланным (ревью 12.10.2026).
+    Голосового флага у буфера нет (с 08.11.2026): ответ после /go озвучивает
+    метка <<VOICE>>, если об этом просят свои слова, а не пересланные.
     """
     generation: int
     items: list[str | None] = field(default_factory=list)
     sealed: bool = False
     cancelled: bool = False
-    voice: bool = False
     # Идущие большие загрузки (MTProto) в слотах буфера: /go ждёт их дольше 30 с.
     slow: int = 0
 
@@ -70,7 +69,6 @@ def _compose_current(
 
 def _compose_fill(
     ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reservation, piece: str,
-    *, voice: bool = False,
 ) -> int | None:
     """Заполнить зарезервированный слот. None — если буфер уехал по /go или был
     отменён (тогда обработчик шлёт кусок обычным путём, не теряя его; кусок
@@ -79,7 +77,6 @@ def _compose_fill(
     if buf is None:
         return None
     buf.items[res[1]] = piece
-    buf.voice = buf.voice or voice
     return buf.filled
 
 
@@ -107,13 +104,13 @@ def _compose_release(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, res: Reserva
 
 
 def _compose_add(
-    ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, piece: str, *, voice: bool = False,
+    ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, piece: str,
 ) -> int | None:
     """Резерв+заполнение одним шагом: для текста, где долгой обработки нет."""
     res = _b._compose_reserve(ctx, chat_key)
     if res is None:
         return None
-    return _compose_fill(ctx, chat_key, res, piece, voice=voice)
+    return _compose_fill(ctx, chat_key, res, piece)
 
 
 # В конце: bot импортирует этот модуль при своей загрузке. Имена bot и

@@ -10,13 +10,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Исключения по вызову (файл, текст вызова), а не файлом целиком: докачка
-# файла (bigfile), PDF счёта (invoicing), временный замерщик tg_probe (звук и
-# свой журнал замеров, удаляется после перехода, BACKLOG).
+# файла (bigfile), PDF счёта (invoicing).
 ALLOWED = {
     ("src/claude_tg_bot/bigfile.py", "os.replace(part, target)"),
     ("src/claude_tg_bot/invoicing/render.py", "shutil.move(pdf, out)"),
-    ("src/claude_tg_bot/tg_probe.py", "os.replace(tmp, path)"),
-    ("src/claude_tg_bot/tg_probe.py", 'f.write(json.dumps(r, ensure_ascii=False) + "\\n")'),
 }
 STDIO = {"sys.stdout", "sys.stderr"}
 SKIP_FILES = {"src/claude_tg_bot/jsonstore.py"}

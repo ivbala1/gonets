@@ -6,8 +6,9 @@
 или окружение. Только стандартная библиотека системного Python. Токен и чат
 берутся из .env рядом; в сообщение не идёт ничего из журнала. Шлёт ботом
 тревог (ALERT_BOT_TOKEN, ALERT_CHAT_ID, ALERT_THREAD_ID: тот же бот и тема,
-что у сторожа ПК на роутере) прямо в облако; его нет или он не отправил:
-основным ботом в личку по TELEGRAM_BOT_API_URL.
+что у сторожа ПК на роутере) прямо в облако (с токеном основного: по адресу
+основного); его нет или он не отправил: основным ботом в личку по
+TELEGRAM_BOT_API_URL.
 """
 from __future__ import annotations
 
@@ -146,7 +147,15 @@ def main() -> int:
             "journalctl --user -u claude-tg-bot -n 50, then systemctl --user restart claude-tg-bot."
             + (f"\nBad {API_URL_ENV} in .env: the bot does not start with it." if bad_url else "")
         )
-    if alert is not None and send(DEFAULT_API_URL, *alert, text):
+    # Бот тревог шлёт в облако. С токеном основного это вернуло бы основного
+    # туда со своего сервера (ревью 08.11.2026): тогда в тот же чат по адресу
+    # основного, а при негодном адресе не шлём им вовсе.
+    alert_base: str | None = DEFAULT_API_URL
+    if alert is not None and token and alert[0] == token.strip():
+        alert_base = None if bad_url else base
+        print("bot-down-notify: ALERT_BOT_TOKEN совпадает с основным, шлю его по адресу основного"
+              + (": адрес негоден, не шлю" if bad_url else ""), file=sys.stderr)
+    if alert is not None and alert_base is not None and send(alert_base, *alert, text):
         return 0
     if not token or not users:
         return 1
@@ -194,6 +203,12 @@ def alert_target(env: dict[str, str]) -> tuple[str, int | str, int | None] | Non
 RETRY_DELAYS = (5.0, 15.0)
 
 
+def _no_proxy_open(req: urllib.request.Request, timeout: float):
+    """К своему серверу на loopback без прокси из окружения: http-прокси увидел
+    бы токен (то же правило, что tg_api.is_local)."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+
+
 def send(base: str, token: str, chat: int | str, thread: int | None, text: str, sleep=None) -> bool:
     """sendMessage со звуком (тревога), до трёх попыток."""
     payload: dict[str, object] = {"chat_id": chat, "text": text}
@@ -203,11 +218,12 @@ def send(base: str, token: str, chat: int | str, thread: int | None, text: str, 
         f"{base}/bot{token}/sendMessage", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
+    local = _loopback(urllib.parse.urlsplit(base).hostname or "")
     delays = iter(RETRY_DELAYS)
     while True:
         flood = 0.0
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with (_no_proxy_open if local else urllib.request.urlopen)(req, timeout=15) as r:
                 if json.load(r).get("ok") is True:
                     return True
                 what = "ok=false"

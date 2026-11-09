@@ -1,4 +1,9 @@
-"""Вложения больше 20 МБ: скачивание через MTProto под токеном бота (Telethon).
+"""Вложения больше 20 МБ: скачивание через MTProto под токеном бота (Telethon);
+копия файла своего сервера Bot API (--local) с его диска (copy_local, внизу).
+
+С 08.11.2026 бот работает через свой сервер, и там вложения любого размера
+идут через getFile (tg_download._fetch_local); MTProto остался запасным
+путём и путём облака после отката.
 
 Зачем: облачный Bot API отдаёт getFile только до 20 МБ, и запись созвона
 27,3 МБ 19.10.2026 не дошла. Решение Ивана 19.10: большие файлы качать
@@ -91,6 +96,9 @@ class Progress:
     done: int = 0
     total: int = 0
     started: float = field(default_factory=time.monotonic)
+    phase: str = ""  # "server": ждём свой сервер; "copy": копия с его диска
+    stopped: bool = False  # итог уже пишется: тикер больше не правит
+    editing: bool = False  # правка тикера в полёте: её ждут, не отменяют
 
     def update(self, done: int, total: int) -> None:
         self.done = done
@@ -233,3 +241,96 @@ class BotMTProto:
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.disconnect()
+
+
+# ---- свой сервер Bot API (--local): getFile отдаёт путь на диске ----
+
+class LocalUnusable(Exception):
+    """Свой сервер ответил, но его файлом воспользоваться нельзя (путь не
+    в его каталоге, файла нет, размер не сошёлся): дальше идёт MTProto."""
+
+
+_COPY_CHUNK = 8 * 1024 * 1024
+
+
+class _Stopped(Exception):
+    """Копию остановила отмена (флаг между кусками)."""
+
+
+def server_file(file_path: str | None, server_dir: Path, expected: int | None) -> Path:
+    """Путь из ответа getFile своего сервера: абсолютный, после разрешения
+    ссылок внутри каталога сервера, обычный файл, размер как в ответе.
+    Чужой путь по сети не качаем (PTB сделал бы это сам)."""
+    if not file_path or not os.path.isabs(file_path):
+        raise LocalUnusable("not an absolute path")
+    try:
+        p = Path(file_path).resolve(strict=True)
+        root = server_dir.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise LocalUnusable("file is gone") from None
+    if not p.is_relative_to(root) or not p.is_file():
+        raise LocalUnusable("outside the server directory or not a regular file")
+    size = p.stat().st_size
+    if expected and size != expected:
+        raise LocalUnusable(f"size {size} != {expected}")
+    return p
+
+
+def _copy_chunks(src: Path, part: Path, stop: Any, progress: Progress) -> int:
+    """Копия кусками в потоке; stop (threading.Event) проверяется между
+    кусками. Пишет только .part; при сбое и остановке .part удаляется."""
+    done = 0
+    try:
+        fd = os.open(part, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with open(src, "rb") as fin, os.fdopen(fd, "wb") as fout:
+            while True:
+                if stop.is_set():
+                    raise _Stopped
+                chunk = fin.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                fout.write(chunk)
+                done += len(chunk)
+                progress.update(done, progress.total)
+        return done
+    except BaseException:
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+
+
+async def copy_local(src: Path, target: Path, size: int, progress: Progress) -> int:
+    """Скопировать файл сервера в target через .part, не останавливая цикл
+    событий. Отмена ждёт фактического выхода потока (иначе повтор свайпом
+    писал бы в тот же .part, пока старый поток ещё пишет), повторная отмена
+    во время ожидания тоже. Прежний target при сбое не трогается."""
+    import threading
+    part = target.with_name(target.name + PART_SUFFIX)
+    stop = threading.Event()
+    progress.update(0, size)
+    fut = asyncio.ensure_future(asyncio.to_thread(_copy_chunks, src, part, stop, progress))
+    # asyncio.wait ожидаемое не отменяет: отмена нашей задачи до потока не
+    # доходит (shield писал бы её исход в журнал как ошибку, ревью 09.11.2026).
+    try:
+        await asyncio.wait({fut})
+    except asyncio.CancelledError:
+        stop.set()
+        while not fut.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({fut})
+        with contextlib.suppress(BaseException):
+            fut.result()
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+    try:
+        written = fut.result()
+        if written != size:
+            raise LocalUnusable(f"copied {written} of {size}")
+        os.replace(part, target)
+    except BaseException:
+        # .part голосового лежит в /tmp, clean_parts его не найдёт.
+        with contextlib.suppress(OSError):
+            part.unlink()
+        raise
+    return written

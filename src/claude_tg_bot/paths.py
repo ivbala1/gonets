@@ -15,6 +15,9 @@ from pathlib import Path
 BOT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = BOT_ROOT / ".env"
 VENV_PYTHON = BOT_ROOT / ".venv" / "bin" / "python"
+# Папка отправки файлов: копии для send_file сервера telegram-mcp, вложения
+# mailsend и корень маркера SEND_FILE по умолчанию.
+TELEGRAM_SEND_DIR = Path.home() / ".local" / "share" / "telegram-send"
 
 
 def env_path(name: str, default: str) -> Path:
