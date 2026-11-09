@@ -800,6 +800,20 @@ def _untrusted_tool_allowed(tool_name: str, tool_input: dict[str, Any], mcp_re: 
     return bool(mcp_re is not None and mcp_re.fullmatch(short_tool)) or _mcp_args_readonly(short_tool, tool_input)
 
 
+# Запуск сессии мимо рана: app_launch now/launch и прямой claude --bg или
+# --remote-control (отказ в фоновом ране, handle_approve). Это преграда от
+# случайного запуска, не замок: собранную по частям команду или скрипт из
+# файла она не узнает, а вложенный агент и так идёт без карточки (решение
+# Ивана 04.11.2026). Широко: имя модуля и слово запуска где угодно в команде;
+# лишний отказ в фоновом ране дешевле пропуска.
+# Слово запуска сразу после имени модуля (текст промта в heredoc у `add` не
+# в счёт) или вызов launch()/main() из python; claude отдельным словом, не
+# claude-tg-bot и не ~/.claude.
+_APP_LAUNCH_RE = re.compile(
+    r"app_launch(?:\.py)?['\"]?[\s,\\]+['\"]?(?:now|launch)\b"
+    r"|app_launch\b[^\n]*?\.(?:launch|main)\("
+    r"|(?<![\w.-])claude(?![\w-]).*?[\s'\",\[](?:--bg|--background|--remote-control|--rc)\b", re.S)
+
 AGENT_MODELS = frozenset({"haiku", "sonnet", "opus"})
 AGENT_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
@@ -1432,6 +1446,18 @@ async def handle_approve(request: web.Request) -> web.Response:
                                 tool_input=tool_input, decision="deny:outbound-unattended",
                                 why=sorted(danger_why))
         return web.json_response({"decision": "deny", "reason": _(outbound.UNATTENDED_HINT)})
+    # Запуск сессии приложения (app_launch.py, проект Домового 09.11.2026)
+    # только по нажатию Ивана в живом ране: фоновый ран так ушёл бы из-под
+    # своих ограничений в сессию без надзора.
+    if (is_unattended and tool_name in ("Bash", "Monitor")
+            and _APP_LAUNCH_RE.search(str(tool_input.get("command", "")))):
+        aid = uuid.uuid4().hex[:12]
+        log.info("approve deny aid=%s tool=%s target=%s (deny:app-launch-unattended)", aid, tool_name, target_key)
+        await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
+                                tool_input=tool_input, decision="deny:app-launch-unattended")
+        return web.json_response({"decision": "deny", "reason": _(
+            "Сессию приложения из фонового рана не запускают: отложи её (app_launch add), "
+            "запустит Иван кнопкой ▶️ в закреплённом списке")})
     # Отправка от имени Ивана: себе без карточки, отказ с причиной (пересылка,
     # письмо не уйдёт, фоновый ран, путь файла) или карточка мимо всех
     # автоаппрувов ниже (outbound.decide).

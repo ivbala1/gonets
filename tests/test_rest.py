@@ -524,7 +524,7 @@ class FooterTrailTests(_CrashBase):
 
     async def test_foreign_and_old_events_ignored(self) -> None:
         self.event("allow:whitelist", "/старое.md")
-        path = self.state / "audit.jsonl"
+        path = audit.month_file(self.state / "audit.jsonl")
         old = json.loads(path.read_text())
         old["ts"] = "2020-01-01T00:00:00+03:00"
         path.write_text(json.dumps(old, ensure_ascii=False) + "\n")

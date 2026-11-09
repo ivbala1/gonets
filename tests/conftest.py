@@ -17,3 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from claude_tg_bot import i18n  # noqa: E402
 
 i18n.set_language(os.environ.get("CLAUDE_TG_BOT_TEST_LANG", "ru"))
+
+# Настоящий .env бота (load_config зовёт load_dotenv) не должен задавать тестам
+# адрес Bot API: с 08.11.2026 там свой сервер, и подменённые httpx.post получали
+# trust_env. load_dotenv заданное не перезаписывает; тест ставит свой адрес сам.
+os.environ["TELEGRAM_BOT_API_URL"] = ""

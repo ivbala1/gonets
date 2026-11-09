@@ -19,6 +19,7 @@ from .claude_runner import ClaudeResult, SessionStore
 from .config import Config, now_local
 from .i18n import _
 from .replies import (_send_retrying, extract_later_marker, extract_loud_marker, extract_quiet_marker,
+                      extract_voice_marker,
                       is_unconfirmed, split_for_telegram)
 from .skills.news_digest import core as news
 
@@ -834,7 +835,7 @@ def _task_exec_finish(cfg: Config, ref: dict, result: ClaudeResult, stopping: bo
     ok = summary is not None and not tasks.exec_failed(summary)
     text = summary or (result.text if result.is_error else _(tasks.EXEC_UNCONFIRMED))
     # Итог хранится до доставки и может уйти отдельно: метка звука в нём лишняя.
-    text = extract_later_marker(extract_quiet_marker(extract_loud_marker(text)[1])[1])[1]
+    text = extract_later_marker(extract_voice_marker(extract_quiet_marker(extract_loud_marker(text)[1])[1])[1])[1]
     try:
         with tasks.locked(tasks.registry_dir(cfg.state_dir)) as data:
             current = data.get(ref["id"])

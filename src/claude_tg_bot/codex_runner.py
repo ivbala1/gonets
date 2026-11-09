@@ -10,7 +10,7 @@ ChatGPT (OAuth, без доплат за токены — расходуется
 - свой набор инструментов и своя sandbox-модель (не hook-approve бота);
 - сеть в sandbox закрыта, пока не передан network_access (см. run_codex): ни
   read-only, ни workspace-write сами по себе её не открывают;
-- persona и scope темы добавляет `bot._build_codex_prompt`; истории диалога всё равно нет.
+- persona и scope темы добавляет `codex_fallback._build_codex_prompt`; истории диалога всё равно нет.
 
 WSL-нюанс: `codex` из PATH — это Windows-npm-шим, который из Linux-cwd падает
 на UNC-путь (\\wsl.localhost\...). Поэтому зовём нативный Linux-бинарь по

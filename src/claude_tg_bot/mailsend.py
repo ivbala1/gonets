@@ -57,9 +57,7 @@ TICKET_TTL_SEC = 600
 # (send_file). Лимит вместе: Gmail режет письмо на 25 МБ,
 # base64 раздувает вложения на треть.
 ATTACH_DIRS_VAR = "MAILSEND_ATTACH_DIRS"
-DEFAULT_ATTACH_DIRS = (
-    Path.home() / ".local" / "share" / "telegram-send",
-)
+DEFAULT_ATTACH_DIRS = (paths.TELEGRAM_SEND_DIR,)
 MAX_BYTES_VAR = "MAILSEND_MAX_BYTES"
 DEFAULT_MAX_BYTES = 18 * 1024 * 1024
 

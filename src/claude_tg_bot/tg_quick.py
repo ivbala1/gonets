@@ -132,7 +132,7 @@ async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     gslot = _b._gather_reserve(update, ctx, chat_key)
     if gslot is not None and _b._gather_fill(gslot, text):
         return
-    await _b._dispatch_to_claude(update, ctx, text)
+    await _b._dispatch_to_claude(update, ctx, text, send_voice_reply=False)
 
 
 def codex_check_markup(ctx: ContextTypes.DEFAULT_TYPE, question: str, answer: str) -> InlineKeyboardMarkup | None:

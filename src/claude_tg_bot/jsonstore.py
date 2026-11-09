@@ -21,8 +21,9 @@
 
 JSONL: `jsonl_append` дописывает строку под flock самого файла и
 `jsonl_trim` подрезает его под тем же замком, поэтому дописывание из другого
-процесса во время подрезки не теряется. `jsonl_tail` читает хвост, битые
-строки и не-словари пропускает.
+процесса во время подрезки не теряется; `jsonl_prepend` вставляет строки в
+начало под тем же замком. `jsonl_tail` читает хвост, битые строки и
+не-словари пропускает.
 """
 from __future__ import annotations
 
@@ -57,19 +58,19 @@ def _tmp_for(path: Path, mode: int) -> tuple[int, str]:
     return fd, tmp
 
 
-def _write_tmp(path: Path, data: str, mode: int) -> str:
+def _write_tmp(path: Path, data: str | bytes, mode: int) -> str:
     fd, tmp = _tmp_for(path, mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(data)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
     return tmp
 
 
-def write_text(path: Path, data: str, *, mode: int = MODE) -> None:
-    """Атомарно заменить файл текстом (utf-8)."""
+def write_text(path: Path, data: str | bytes, *, mode: int = MODE) -> None:
+    """Атомарно заменить файл текстом (utf-8) или байтами как есть."""
     path = Path(path)
     tmp = _write_tmp(path, data, mode)
     try:
@@ -361,6 +362,26 @@ def jsonl_trim(path: Path, max_bytes: int, keep_bytes: int, *, mode: int = MODE)
             Path(tmp).unlink(missing_ok=True)
             raise
     return True
+
+
+def jsonl_prepend(path: Path, data: bytes, *, mode: int = MODE) -> None:
+    """Вставить готовые строки JSONL (кончаются на \\n) перед содержимым файла,
+    под замком дописывания: строка, дописанная другим процессом в это время,
+    не теряется. Нет файла: он создаётся."""
+    path = Path(path)
+    if data and not data.endswith(b"\n"):
+        data += b"\n"
+    with _locked_append_fd(path, mode) as fd:
+        with open(path, "rb") as f:
+            old = f.read()
+        tmp_fd, tmp = _tmp_for(path, mode)
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(data + old)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
 
 def jsonl_tail(path: Path, max_bytes: int | None = None) -> list[dict]:

@@ -80,6 +80,11 @@ def test_build_app_uses_config_url() -> None:
     with patch.object(bot_mod, "_SilentAwareBot", fake_bot), pytest.raises(Stop):
         bot_mod.build_app(cfg)
     assert seen["base_url"] == f"{LOCAL}/bot" and seen["base_file_url"] == f"{LOCAL}/file/bot"
+    assert seen["local_mode"] is True
+    cfg.telegram_bot_api_url = tg_api.DEFAULT_URL
+    with patch.object(bot_mod, "_SilentAwareBot", fake_bot), pytest.raises(Stop):
+        bot_mod.build_app(cfg)
+    assert seen["local_mode"] is False and seen["base_url"] == f"{tg_api.DEFAULT_URL}/bot"
 
 
 def test_config_rejects_bad_url(monkeypatch) -> None:
@@ -267,9 +272,8 @@ def test_no_hand_built_bot_api_urls() -> None:
     src = ROOT / "src" / "claude_tg_bot"
     bad = []
     for path in src.rglob("*.py"):
-        # serious: шаблоны распознавания; tg_probe: замерщик нарочно меряет
-        # облачный путь своей настройкой TG_PROBE_BOT_API_URL (выключить до перехода).
-        if path.name in ("tg_api.py", "serious.py", "tg_probe.py"):
+        # serious: шаблоны распознавания.
+        if path.name in ("tg_api.py", "serious.py"):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         docs = {id(n.body[0].value) for n in ast.walk(tree)
@@ -345,6 +349,7 @@ def test_bot_down_posts_to_configured_url(tmp_path, monkeypatch, value, want) ->
         bodies.append(req.data.decode())
         return Resp()
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(mod, "_no_proxy_open", urlopen)
     assert mod.main() == 0
     assert seen == [f"{want}/bot{TOKEN}/sendMessage"]
     assert ("TELEGRAM_BOT_API_URL" in bodies[0]) == (want != value)
@@ -389,6 +394,7 @@ def _run_bot_down(tmp_path, monkeypatch, env_text: str, fail_tokens=()):
                 raise OSError(f"down {req.full_url}")
         return Resp(True)
     monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(mod, "_no_proxy_open", urlopen)
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     return mod.main(), sent
 
@@ -504,6 +510,22 @@ def test_bot_down_half_configured_alert_warns(tmp_path, monkeypatch, capsys) -> 
     assert "ALERT_CHAT_ID" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("url,want", [
+    (LOCAL, [f"{LOCAL}/bot{TOKEN}/sendMessage"]),
+    ("", [f"https://api.telegram.org/bot{TOKEN}/sendMessage"]),
+    ("http://10.0.0.1:8081", []),
+])
+def test_bot_down_alert_token_equal_to_main(tmp_path, monkeypatch, capsys, url, want) -> None:
+    """Бот тревог с токеном основного: в тот же чат, но по адресу основного; при негодном адресе не шлём."""
+    rc, sent = _run_bot_down(tmp_path, monkeypatch, MAIN_ENV + f"TELEGRAM_BOT_API_URL={url}\n"
+                             f"ALERT_BOT_TOKEN={TOKEN}\nALERT_CHAT_ID=-1005\nALERT_THREAD_ID=77\n")
+    assert [u for u, _b in sent] == want and rc == (0 if want else 1)
+    if want:
+        assert sent[0][1]["chat_id"] == -1005 and sent[0][1]["message_thread_id"] == 77
+    err = capsys.readouterr().err
+    assert "совпадает с основным" in err and TOKEN not in err
+
+
 def test_bot_down_alert_only_and_bad_alert(tmp_path, monkeypatch) -> None:
     rc, sent = _run_bot_down(tmp_path, monkeypatch, ALERT_ENV)
     assert rc == 0 and len(sent) == 1
@@ -566,3 +588,54 @@ def test_webfetch_docs_page_free() -> None:
 def test_webfetch_local_bot_api_send_is_card() -> None:
     found = serious.send_reasons("WebFetch", {"url": f"{LOCAL}/bot123456:AAA/sendMessage?chat_id=1"}, None)
     assert found and not serious.sends(found)
+
+
+def test_token_log_filter_scrubs_message_args_and_traceback() -> None:
+    import io
+    import logging
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(tg_api.TokenLogFilter(TOKEN))
+    log = logging.getLogger("test_token_log_filter")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        log.warning("path %s", f"/x/{TOKEN}/voice/1.oga")
+        try:
+            raise FileNotFoundError(f"/x/{TOKEN}/documents/a.bin")
+        except FileNotFoundError:
+            log.exception("download failed")
+    finally:
+        log.removeHandler(handler)
+    out = stream.getvalue()
+    assert TOKEN not in out and out.count("<token>") == 2 and "FileNotFoundError" in out
+    assert tg_api.TokenLogFilter("").filter(logging.makeLogRecord({"msg": "x"}))
+    bad = logging.makeLogRecord({"msg": "a %s %s", "args": (TOKEN,)})
+    assert tg_api.TokenLogFilter(TOKEN).filter(bad) and TOKEN not in bad.getMessage()
+
+
+def test_cleanup_bot_api_files_keeps_server_state(tmp_path) -> None:
+    import os
+    import time as _time
+    from claude_tg_bot import bot as bot_mod
+    bot_dir = tmp_path / "123:abc"
+    (bot_dir / "voice").mkdir(parents=True)
+    (bot_dir / "documents").mkdir()
+    old = _time.time() - 5 * 86400
+    files = {"binlog": bot_dir / "td.binlog", "old": bot_dir / "voice" / "a.oga",
+             "new": bot_dir / "documents" / "b.bin", "top": tmp_path / "x",
+             "tmp": tmp_path / "tmp" / "upload"}
+    files["tmp"].parent.mkdir()
+    other = tmp_path / "999:zzz" / "voice"
+    other.mkdir(parents=True)
+    files["other"] = other / "c.oga"
+    for f in files.values():
+        f.write_bytes(b"1")
+    for k in ("binlog", "old", "top", "tmp", "other"):
+        os.utime(files[k], (old, old))
+    assert bot_mod._cleanup_bot_api_files(tmp_path, "123:abc", 2) == 2
+    assert not files["old"].exists() and not files["tmp"].exists()
+    assert all(files[k].exists() for k in ("binlog", "new", "top", "other"))
+    assert bot_mod._cleanup_bot_api_files(tmp_path / "нет", "123:abc", 2) == 0
+    for bad in ("", ".", ".."):
+        assert bot_mod._cleanup_bot_api_files(tmp_path / "123:abc", bad, 2) == 0

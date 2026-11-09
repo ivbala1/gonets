@@ -4,6 +4,7 @@ Usage:
     python -m claude_tg_bot.notify "текст"                    # в личку (primary_chat_id)
     echo "длинный текст" | python -m claude_tg_bot.notify     # то же, из stdin
     python -m claude_tg_bot.notify --chat-id -1001 --thread-id 42 "текст"
+    python -m claude_tg_bot.notify --here "текст"             # в чат и тему этого рана бота
     python -m claude_tg_bot.notify --html --no-preview --silent ... "<b>текст</b>"
     python -m claude_tg_bot.notify --silent --pin "текст"     # закрепить, последней строкой message_id: N
     python -m claude_tg_bot.notify --unpin N                  # открепить (в чат/тему тот же --chat-id)
@@ -19,6 +20,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -29,6 +31,7 @@ import httpx
 from .config import load_config, local_zone
 from .i18n import _
 from . import jsonstore, reactions, tg_api
+from .handoff import CHAT_KEY_ENV, SHOW_CHAT_KEY_ENV, parse_chat_key
 from .buttons import keyboard
 
 
@@ -67,6 +70,11 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
     parser.add_argument("--chat-id", type=int, default=None, help="целевой чат (default: личка)")
     parser.add_argument(
         "--thread-id", type=int, default=None, help="forum-тема; требует --chat-id"
+    )
+    parser.add_argument(
+        "--here", action="store_true",
+        help=(f"туда, куда бот шлёт карточку рана ({SHOW_CHAT_KEY_ENV}, иначе {CHAT_KEY_ENV}); "
+              "вне рана ошибка"),
     )
     parser.add_argument(
         "--buttons",
@@ -115,6 +123,23 @@ def _run(argv: list[str] | None = None, *, any_chat: bool = True) -> tuple[int, 
         except (ValueError, KeyError, TypeError) as e:
             print(_("notify: --buttons невалиден: {error}").format(error=e), file=sys.stderr)
             return 1, None
+
+    if args.here:
+        # Перевод текста людям рядом с карточкой отправки (решение Ивана
+        # 08.11.2026): та же тема, куда бот шлёт карточку рана. Без ключа не в
+        # личку по умолчанию, а ошибка: сообщение ушло бы не туда. Ран
+        # мастерской показывает карточку в личке (approval.py, SHOW_CHAT_KEY),
+        # туда же и перевод, как у handoff.
+        if args.chat_id is not None or args.thread_id is not None:
+            print(_("notify: --here вместе с --chat-id или --thread-id нельзя"), file=sys.stderr)
+            return 1, None
+        here = parse_chat_key(os.environ.get(SHOW_CHAT_KEY_ENV, "").strip()
+                              or os.environ.get(CHAT_KEY_ENV, ""))
+        if here is None:
+            print(_("notify: --here только из рана бота (нет {env})").format(env=CHAT_KEY_ENV),
+                  file=sys.stderr)
+            return 1, None
+        args.chat_id, args.thread_id = here
 
     if args.thread_id is not None and args.chat_id is None:
         print(_("notify: --thread-id требует --chat-id"), file=sys.stderr)

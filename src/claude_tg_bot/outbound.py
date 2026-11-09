@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import mailsend, otklik
+from . import mailsend, otklik, paths
 from .i18n import _, N_
 
 log = logging.getLogger(__name__)
@@ -575,7 +575,7 @@ _BAD_PATH_CHARS = ("*", "?", "[", "]", "{", "}", "~", "\x00")
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 ALBUM_MIN, ALBUM_MAX = 2, 10
 # Каталог для копии файла, который лежит вне корней (подсказка агенту).
-_SEND_DIR_NAME = "telegram-send"
+_SEND_DIR_NAME = paths.TELEGRAM_SEND_DIR.name
 # realpath на /mnt/c бывает медленным: не успел, значит проверки нет.
 PATH_CHECK_SEC = 3.0
 # Корни по юниту: путь -> (mtime_ns, корни или None).

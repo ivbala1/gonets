@@ -977,8 +977,7 @@ async def run_claude(
                                 evt.get("type") == "result" and evt.get("is_error") is not True):
                             blocked_tools.append(_("(событие init не пришло)"))
                         if blocked_tools:
-                            log.error("%s run stopped chat=%s: no lock for tools %s",
-                                      "untrusted" if untrusted_sids is not None else "read-only",
+                            log.error("untrusted run stopped chat=%s: no lock for tools %s",
                                       chat_key, ", ".join(blocked_tools))
                             kill_process_tree(proc, signal.SIGKILL)
                             stderr_task.cancel()
@@ -1055,17 +1054,13 @@ async def run_claude(
                     stdout, stderr = b"", b""
             else:
                 stdout, stderr = await _drive()
-        except asyncio.CancelledError:
-            # Task отменяется (shutdown, gather cancel и т.п.). Без kill claude
-            # и его дети (Bash и пр.) останутся зомбями: finally только убирает
-            # из registry, а shutdown-cleanup уже не увидит этот proc.
+        except (asyncio.CancelledError, Exception):
+            # Отмена задачи (shutdown, gather cancel и т.п.) или ошибка потока
+            # (ревью 12.10.2026). Без kill claude и его дети (Bash и пр.)
+            # останутся зомбями: finally только убирает из registry, а
+            # shutdown-cleanup уже не увидит этот proc.
             kill_process_tree(proc, signal.SIGKILL)
             # _reap_proc: shield от повторного cancel + таймаут против D-state.
-            await _reap_proc(proc)
-            raise
-        except Exception:
-            # Ошибка потока тоже завершает группу до снятия регистрации (ревью 12.10.2026).
-            kill_process_tree(proc, signal.SIGKILL)
             await _reap_proc(proc)
             raise
         finally:

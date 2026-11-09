@@ -20,7 +20,7 @@ from datetime import datetime
 from collections.abc import Collection
 from pathlib import Path
 
-from . import jsonstore
+from . import audit, jsonstore
 
 log = logging.getLogger(__name__)
 
@@ -98,13 +98,14 @@ def note_sid(state_dir: Path, rids: Collection[str | None], sid: str) -> None:
 
 
 def footer_trail(audit_path: Path, sid: str | None, since: float | None) -> list[tuple[str, str]]:
-    """Отметки футера оборванного рана из state/audit.jsonl: при SIGKILL футера
+    """Отметки футера оборванного рана из журнала действий (audit_path базовый,
+    файлы месячные, `audit.tail`): при SIGKILL футера
     нет, а записи без карточки и подачи в память были. Виды как у
     approval.add_run_note. Журнал только дополняет весть: его сбой молчит."""
     out: list[tuple[str, str]] = []
     if not sid or since is None:
         return out
-    for ev in jsonstore.jsonl_tail(audit_path, AUDIT_TAIL):
+    for ev in audit.tail(audit_path, AUDIT_TAIL):
         with contextlib.suppress(ValueError, KeyError, TypeError):
             kind, snippet = AUDIT_KINDS.get(ev["decision"]), ev["snippet"][-60:]
             if (kind and ev.get("sid") == sid and "--dry-run" not in ev["snippet"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import urlsplit
 import contextlib
 import contextvars
 import io
@@ -60,7 +61,7 @@ from .claude_runner import ClaudeResult, SessionStore, kill_process_tree, run_cl
 from .overrides import PersistentDict
 from .config import Config, EFFORT_LEVELS, agent_env, local_zone, now_local
 from . import procs as procs_mod
-from . import bigfile, buttons, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, tasks, tg_api, transcripts
+from . import audit, bot_api_server, buttons, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, retention, tasks, tg_api, transcripts
 from .skills.news_digest import core as news
 from .replies import (
     extract_ask_marker,
@@ -68,6 +69,8 @@ from .replies import (
     extract_loud_marker,
     extract_quiet_marker,
     extract_send_file_markers,
+    send_file_max_bytes,
+    extract_voice_marker,
     is_unconfirmed,
     load_full_text,
     plan_voice_series,
@@ -92,87 +95,82 @@ from .compose import (  # noqa: F401  перенесено из bot.py
     _compose_current, _compose_fill, _compose_release, _compose_reserve,
 )
 from .codex_fallback import (  # noqa: F401  перенесено из bot.py
-    _build_codex_prompt, _codex_as_claude_result, _is_claude_unavailable,
+    _codex_as_claude_result, _is_claude_unavailable,
 )
+try:  # личная очередь «в приложение» (app_launch), в открытую копию не входит
+    from .tg_app_launch import on_app_queue_pick
+except ModuleNotFoundError as e:
+    if e.name != f"{__package__}.tg_app_launch":
+        raise
+    on_app_queue_pick = None
 from .tg_otklik import (  # noqa: F401  перенесено из bot.py
-    _OTKLIK_SHOW_LOCKS, _otklik_close_attempts, _otklik_edit, _otklik_markup, _otklik_show,
-    _otklik_sync, _otklik_target, _otklik_unknown_notice, on_otklik_all_pick, on_otklik_pick,
+    _otklik_close_attempts, _otklik_sync, _otklik_unknown_notice, on_otklik_all_pick,
+    on_otklik_pick,
 )
 from .tg_deals import (  # noqa: F401  перенесено из bot.py
-    DEAL_FIRST_NOTE, _deal_finish, _deal_open, _deal_reply_target, _deal_settle, _deal_swipe,
-    _deal_turn, _deal_update, _deals_base, _deals_resume, _news_edit, _news_file_to_backlog,
-    _send_deal_card, on_deal_pick, on_news_pick,
+    DEAL_FIRST_NOTE, _deal_finish, _deal_open, _deal_reply_target, _deal_swipe, _deal_turn,
+    _deal_update, _deals_resume, _news_edit, _send_deal_card, on_deal_pick, on_news_pick,
 )
 from .tg_tasks import (  # noqa: F401  перенесено из bot.py
-    ADD_PENDING, _StaleCard, _edit_settled, _is_task_ask_reply, _markup, _reply_quietly, _task_add,
-    _task_add_cost, _task_add_run, _task_add_settle, _task_assign_name, _task_base_name, _task_card,
-    _task_command, _task_cost_seen, _task_create, _task_do, _task_exec, _task_exec_admit,
-    _task_exec_finish, _task_exec_release, _task_for, _task_forget, _task_from_http, _task_intro,
-    _task_live, _task_new, _task_new_card, _task_news_item, _task_note, _task_offer_do,
-    _task_post_result, _task_release_after_exit, _task_seen_sha, _task_start, _task_start_admitted,
-    _task_text, _task_thought, _task_topic_icon, _task_touch, _task_touch_now, _task_turn,
-    _task_unborn, _task_update, _tasks_chat_id, _tasks_housekeeping, _tasks_recover, _tasks_startup,
-    on_task, on_task_pick,
+    ADD_PENDING, _is_task_ask_reply, _task_add_cost, _task_add_run, _task_card, _task_command,
+    _task_cost_seen, _task_do, _task_exec_finish, _task_for, _task_from_http, _task_note,
+    _task_seen_sha, _task_start, _task_thought, _task_touch, _task_touch_now, _task_turn,
+    _task_update, _tasks_housekeeping, _tasks_recover, _tasks_startup, on_task, on_task_pick,
 )
 from .tg_at import (  # noqa: F401  перенесено из bot.py
-    _at_fire, _at_fire_dispatch, _at_fire_running, on_at, _parse_at_when, _schedule_at_job,
-    schedule_later,
+    _at_fire, on_at, _parse_at_when, _schedule_at_job, schedule_later,
 )
 from .tg_quick import (  # noqa: F401  реакции, геометка, проверка Кодексом
     codex_check_markup, drop_reaction_notes, on_codex_check, on_location, on_reaction, reaction_note_text,
     reaction_notes,
 )
 from .tg_warm import (  # noqa: F401  перенесено из bot.py
-    _warm_after_run, _warm_cancel, WARM_EARLY_SEC, _warm_forget, _warm_prompt, WARM_RUNTIME_SEC,
-    _warm_schedule, _warm_signature, _warm_skip_reason, _warm_tick,
+    _warm_after_run, _warm_forget, _warm_schedule, _warm_signature, _warm_skip_reason, _warm_tick,
 )
 from .tg_download import (  # noqa: F401  перенесено из bot.py
-    _DOWNLOAD_READ_TIMEOUT, _DOWNLOAD_RETRY_DELAYS, _download_retrying, DownloadJob,
-    _downloads_cancel, _fetch_attachment, _fetch_big, _media_busy, _mtproto, _PROGRESS_EVERY_SEC,
-    _progress_ticker, _quiet_edit, _slot_holders,
+    _DOWNLOAD_READ_TIMEOUT, _DOWNLOAD_RETRY_DELAYS, _download_retrying, _downloads_cancel,
+    _fetch_attachment, _fetch_big, _media_busy, _PROGRESS_EVERY_SEC, _slot_holders,
 )
 from .tg_login import (  # noqa: F401  перенесено из bot.py
     _login_keyboard, _offer_login, on_auth_update, on_login_callback, _start_login,
 )
 from .tg_limits import (  # noqa: F401  перенесено из bot.py
-    _limit_after_error, _limit_defer, _limit_follow_up, _limit_handle, _limit_hold,
-    _limit_movable, _limit_note_once, LIMIT_RETRY_HEAD, _limit_retry_pending, _limit_talk_prompt,
-    LIMIT_TODO_MARK,
+    _limit_after_error, _limit_defer, _limit_follow_up, _limit_handle, _limit_hold, _limit_movable,
+    LIMIT_RETRY_HEAD, _limit_retry_pending, _limit_talk_prompt, LIMIT_TODO_MARK,
 )
 from .tg_events import (  # noqa: F401  перенесено из bot.py
-    _event_expired_note, _event_mark, _event_ref, _event_show_target, _events_resume,
-    _make_event_wake,
+    _event_ref, _events_resume, _make_event_wake,
 )
 from .lifecycle import (  # noqa: F401  перенесено из bot.py
-    _compose_lost_notice, _on_error, _on_post_init, _on_post_shutdown, _on_post_stop,
-    on_restart_pick, _on_stop_signal, _parse_chat_key, _restart_abort, _restart_active,
-    _restart_announce, _restart_begin, _restart_begin_locked, _restart_exit, _restart_keyboard,
-    _restart_notify, _restart_reschedule_at, _restart_wait_workshop,
-    _send_shutdown_notice_via_api, _STOP_GRACE_SEC, _terminate_and_wait, _terminate_runs,
-    _workshop_busy,
+    _on_error, _on_post_init, _on_post_shutdown, _on_post_stop, on_restart_pick, _on_stop_signal,
+    _parse_chat_key, _restart_active, _restart_begin, _restart_reschedule_at, _STOP_GRACE_SEC,
+    _terminate_and_wait, _terminate_runs, _workshop_busy,
 )
 from .tg_queue import (  # noqa: F401  перенесено из bot.py
-    _busy_notice, _drop_busy_notice, _gather_cancel, _gather_close, _gather_fill, _gather_flush,
-    _gather_flush_impl, GATHER_LATE_LOG_SEC, GATHER_MAX_WAIT_SEC, _gather_pending, _gather_react,
-    _gather_release, _gather_reserve, _gather_send_now, _gather_stop_defer, _gather_take,
-    GATHER_WINDOW_SEC, GatherBatch, GatherSlot, _pack_cancel, PACK_NOTE, _pack_prompt, PackItem,
-    _prestart_cancel, RunPrestart, _turn_packs, TurnPack,
+    _busy_notice, _drop_busy_notice, _gather_cancel, _gather_fill, _gather_flush,
+    _gather_flush_impl, GATHER_MAX_WAIT_SEC, _gather_pending, _gather_react, _gather_release,
+    _gather_reserve, _gather_send_now, _gather_take, GATHER_WINDOW_SEC, GatherBatch, GatherSlot,
+    _pack_cancel, PACK_NOTE, _pack_prompt, PackItem, _prestart_cancel, RunPrestart, _turn_packs,
+    TurnPack,
 )
 from .tg_cards import (  # noqa: F401  перенесено из bot.py
-    _ask_answer_queued, _ASK_BUTTON_CAP, _ask_button_label, _ask_cards_changed, _ask_cards_of,
-    _ask_pick_finish, _ask_pick_refusal, _ask_picks_queued, ASK_REPEAT_HOLD_SEC, ASK_TTL_SEC,
-    _ask_waiting, _bump_plan_generation, _card_msg_matches, _dispatch_ask_answer,
-    _dropped_plan_note, on_ask_pick, on_plan_pick, _plan_generation, _plan_snapshot,
-    _retire_ask_cards, _send_ask_card, _send_plan_card, _take_ask_cards,
+    _ask_answer_queued, _ask_button_label, _ask_cards_changed, _ask_pick_refusal, _ask_picks_queued,
+    ASK_REPEAT_HOLD_SEC, ASK_TTL_SEC, _ask_waiting, _bump_plan_generation, _card_msg_matches,
+    _dropped_plan_note, on_ask_pick, on_plan_pick, _plan_generation, _plan_snapshot, _send_ask_card,
+    _send_plan_card, _take_ask_cards,
 )
 from .tg_runstatus import (  # noqa: F401  перенесено из bot.py
-    on_run_watch_pick, _run_waits_approval, _RunStatus, _typing_indicator, _typing_loop,
+    on_run_watch_pick, _run_waits_approval, _RunStatus, _typing_indicator,
 )
 
 log = logging.getLogger(__name__)
 
 # Один день в секундах — TTL-cleanup для state/attachments/.
 _CLEANUP_INTERVAL_SEC = 24 * 3600
+# Файлы своего сервера Bot API (--local сам их не удаляет): бот копирует
+# вложение к себе сразу, а удалённое сервер по getFile скачает заново
+# (опыт 08.11.2026). td.binlog в корне каталога бота не трогаем.
+BOT_API_FILES_TTL_DAYS = 2
 # Оболочки слоя живут в репозитории кода Свода: после разделения у корня
 # памяти своего bin/ нет. Каталог конфигурации подставляется явно, иначе
 # слой ищет её рядом с кодом, где лежат только образцы.
@@ -1104,9 +1102,8 @@ async def on_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(_("Буфер пуст — нечего отправлять."))
         return
     prompt = "\n\n---\n\n".join(pieces)
-    # Флаг голоса из своих кусков: слова «озвучь» в пересланном, цитатах и
-    # заголовках файлов голосовой ответ не включают (ревью 12.10.2026).
-    await _dispatch_to_claude(update, ctx, prompt, send_voice_reply=buf.voice)
+    # Голос после /go включает только метка <<VOICE>> модели (с 08.11.2026).
+    await _dispatch_to_claude(update, ctx, prompt, send_voice_reply=False)
 
 
 async def on_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1707,7 +1704,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "«стоп» или /cancel: остановить; «ничего не отправляй»: остановить и ждать\n"
         "«!текст»: прервать и сразу отправить поправку\n"
         "остальное, что напишешь, уйдёт одним следующим сообщением\n"
-        "На голосовое ответ голосом; в тексте попроси «голосом» или «озвучь».\n\n"
+        "На голосовое ответ голосом; в тексте попроси ответить голосом своими словами.\n\n"
         "Команды:\n"
         "/status: что сейчас происходит\n"
         "/reset [force]: новый разговор в этой теме (force = сначала остановить ответ)\n"
@@ -2049,7 +2046,6 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = ctx.application.bot_data["cfg"]
     if not _is_allowed(cfg, update):
         return
-    store: SessionStore = ctx.application.bot_data["sessions"]
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
     active_sessions: dict[str, str] = ctx.application.bot_data["active_sessions"]
     started: float = ctx.application.bot_data["started_at"]
@@ -2617,8 +2613,8 @@ async def _dispatch_to_claude_impl(
     on_run_start: Callable[[], None] | None = None,
     reply_sink: list | None = None,
     reply_sent: list | None = None,
-    think_marks: list | None = None,
-    warm_after: list | None = None,
+    think_marks: list,
+    warm_after: list,
     admitted: bool = False,
     deferred: bool = False,
     allow_codex_fallback: bool = True,
@@ -2629,9 +2625,9 @@ async def _dispatch_to_claude_impl(
     event_ref: dict | None = None,
     ask_ref: dict | None = None,
     deal: dict | None = None,
-    pack_out: list | None = None,
-    turn_notes: list[str] | None = None,
-    rids: list[str | None] | None = None,
+    pack_out: list,
+    turn_notes: list[str],
+    rids: list[str | None],
     carried: str | None = None,
     read_only: bool = False,
     step_note: str = "",
@@ -2751,11 +2747,11 @@ async def _dispatch_to_claude_impl(
     pack: TurnPack | None = None
     carried_jids = [carried] if carried else []
     at_store: SessionStore | None = ctx.application.bot_data.get("at_jobs")
-    if joinable and pack_out is not None:
+    if joinable:
         packs = _turn_packs(ctx)
         item = PackItem(prompt_text, msg, voice=send_voice_reply, ask_ref=ask_ref,
                         expect_epoch=expect_epoch if ask_ref is not None else None, admitted=admitted,
-                        carried=carried, rids=rids or [])
+                        carried=carried, rids=rids)
         open_pack = packs.get(chat_key)
         if open_pack is not None and not open_pack.taken:
             # Тема занята, пачку уже везут: дописаться и ждать её хода. Без
@@ -2828,7 +2824,7 @@ async def _dispatch_to_claude_impl(
             # Ждало замка до начала ожидания перезапуска: в отложенные с
             # временем прихода, перед написанным позже.
             text = _drain_defer(ctx, update, prompt_text, voice=send_voice_reply, arrived=arrived_at,
-                                rids=[r for i in pack.items for r in i.rids] if pack is not None else rids or (),
+                                rids=[r for i in pack.items for r in i.rids] if pack is not None else rids,
                                 replaces=carried_jids)
             if pack is not None:
                 pack.deferred = True
@@ -3015,11 +3011,7 @@ async def _dispatch_to_claude_impl(
                     # ответом (ux.md 12); ход без ответа отдаст её в конце.
                     note = (_("🆕 новая сессия (в теме давно не было активности).")
                             + _model_reverted_note(ctx, cfg, chat_key, ended_model))
-                    if turn_notes is not None:
-                        turn_notes.append(note)
-                    else:
-                        with contextlib.suppress(Exception):
-                            await msg.reply_text(note)
+                    turn_notes.append(note)
             # resume_target сбросит сессию, если скоуп сменился мимо /scope и
             # переименования (занятый чат, рестарт): эпоха поднимается здесь,
             # чтобы кнопки старой сессии не ответили в новую (ревью 12.10.2026).
@@ -3093,7 +3085,7 @@ async def _dispatch_to_claude_impl(
                 # (_dispatch_to_claude), оставшуюся после аварии бота находит
                 # старт (разбор 19.10.2026: оборванное обдумывание молчало 7,5 часа).
                 with contextlib.suppress(OSError, ValueError):
-                    if _task_update(cfg, task["id"], think_open=think_rev) is not None and think_marks is not None:
+                    if _task_update(cfg, task["id"], think_open=think_rev) is not None:
                         think_marks.append((task["id"], think_rev))
             run_epoch = _session_epoch(ctx, chat_key)  # после сбросов выше
             foreign_running: dict[str, Any] = ctx.application.bot_data.setdefault("foreign_running", {})
@@ -3187,7 +3179,7 @@ async def _dispatch_to_claude_impl(
                         # Отмена пришла до процесса: гасится до промпта, как у пачки.
                         _track_cancel_task(ctx.application, asyncio.create_task(
                             _terminate_and_wait(chat_key, proc)))
-            if rids is not None and side is None:
+            if side is None:
                 note_base = run_start_cb
 
                 def run_start_cb() -> None:
@@ -3260,8 +3252,7 @@ async def _dispatch_to_claude_impl(
                 if notes_bucket is not None:
                     if run_notes.get(notes_key) is notes_bucket:
                         run_notes.pop(notes_key, None)
-                    if turn_notes is not None:
-                        turn_notes.extend(format_run_notes(notes_bucket))
+                    turn_notes.extend(format_run_notes(notes_bucket))
                 if prestart is not None and prestarts.get(chat_key) is prestart:
                     prestarts.pop(chat_key, None)
                 if stop_mark is not None and _run_stops(ctx).get(chat_key) is stop_mark:
@@ -3274,8 +3265,7 @@ async def _dispatch_to_claude_impl(
                     # этот ран отметку не двигает. Назначает его _dispatch_to_claude,
                     # когда замок уже свободен, и при исключении рана тоже (проект
                     # шага 1, 2.5; ревью Codex 26.10.2026).
-                    if warm_after is not None:
-                        warm_after.append(chat_key)
+                    warm_after.append(chat_key)
                 # Под замком темы: следующий ран этого чата не начался, его
                 # попытки отправки откликов мертвы (ревью Codex 22.10.2026).
                 # До finish: отмена на его await не пропустит закрытие.
@@ -3421,10 +3411,7 @@ async def _dispatch_to_claude_impl(
         # Ран по чужому тексту и так каждый раз свежий: сессию темы он не терял.
         # Строкой футера (ux.md 15): ответ этого хода идёт следом.
         note = _("⚠️ не удалось закрепить session_id: следующее сообщение начнёт новый разговор.")
-        if turn_notes is not None:
-            turn_notes.append(note)
-        else:
-            await msg.reply_text(note)
+        turn_notes.append(note)
 
     # Маркер проекта решения в теме задачи (tasks.extract_do): Иван его не
     # видит, кнопку «Делай» бот ставит сам. Из ответа GPT и с ошибкой маркер
@@ -3439,8 +3426,8 @@ async def _dispatch_to_claude_impl(
         earlier = list(texts)
         if not codex_fallback and earlier[-1] == result.text:
             earlier.pop()
-        earlier = [extract_later_marker(extract_quiet_marker(extract_loud_marker(
-                       extract_ask_marker(tasks.extract_do(t)[1])[1])[1])[1])[1]
+        earlier = [extract_later_marker(extract_voice_marker(extract_quiet_marker(extract_loud_marker(
+                       extract_ask_marker(tasks.extract_do(t)[1])[1])[1])[1])[1])[1]
                    for t in earlier]
         reply = tasks.run_reply(earlier + [reply], reply)
     if think_rev is not None:
@@ -3457,12 +3444,25 @@ async def _dispatch_to_claude_impl(
     files_to_send, reply = extract_send_file_markers(
         reply, send_file_whitelist(cfg),
         refuse_reason=_("ран по чужому тексту (untrusted)") if untrusted else "",
+        max_bytes=send_file_max_bytes(cfg),
     )
     # ASK-маркер: вопрос с вариантами уедет кнопками после основного ответа.
     ask, reply = extract_ask_marker(reply)
     loud, reply = extract_loud_marker(reply)
     quiet, reply = extract_quiet_marker(reply)
+    # Метки-флаги до LATER: тот срабатывает, только если стоит последним.
+    voice_asked, reply = extract_voice_marker(reply)
     later, reply = extract_later_marker(reply)
+    if voice_asked and not send_voice_reply:
+        if untrusted or unattended or deal is not None:
+            # Голос просит только сам Иван в живом ране: метка из чужого текста
+            # или фонового пробуждения не тратит синтез (решение 08.11.2026).
+            # Ход дела идёт текстом с ярлыком: голос был бы дублем без ярлыка.
+            log.info("voice marker ignored chat=%s untrusted=%s unattended=%s deal=%s",
+                     chat_key, untrusted, unattended, deal is not None)
+        else:
+            log.info("voice marker chat=%s", chat_key)
+            send_voice_reply = True
     # Тире на дефис здесь, а не хуком: строка «Исправлено» хука подменяла
     # ответ, ведь в чат уходит только последний текст рана (решение 22.10.2026).
     reply = soften_dashes(reply)
@@ -3490,11 +3490,7 @@ async def _dispatch_to_claude_impl(
                 # Сбой постановки не отнимает готовый ответ.
                 log.exception("later: schedule failed chat=%s", chat_key)
                 later_note = _("⏰ «позже» не поставлено: сбой записи задания, смотри журнал бота")
-        if turn_notes is not None:
-            turn_notes.append(later_note)
-        else:
-            with contextlib.suppress(Exception):
-                await msg.reply_text(later_note, disable_notification=True)
+        turn_notes.append(later_note)
     if (quiet and not reply.strip() and not loud and not result.is_error and ask is None
             and not files_to_send and (untrusted or _SILENT_RUN.get())):
         # Только весь ответ целиком и только в ране без звука: метка рядом с
@@ -3505,11 +3501,7 @@ async def _dispatch_to_claude_impl(
         # Шаг проверки «позже» (tg_at): первой из служебных строк футера ответа,
         # а не отдельным сообщением до рана. Ран не состоялся или промолчал
         # меткой QUIET: строки нет.
-        if turn_notes is not None:
-            turn_notes.insert(0, step_note)
-        else:
-            with contextlib.suppress(Exception):
-                await msg.reply_text(step_note, disable_notification=True)
+        turn_notes.insert(0, step_note)
     if (workshop or untrusted) and ask is not None:
         # Тема мастерской заглушена, кнопки там никто не увидит: вопрос текстом
         # в ответ, ответ пересылается в личку (проект Домового 22.10.2026).
@@ -3582,13 +3574,14 @@ async def _dispatch_to_claude_impl(
         log.info("hangs appended chat=%s n=%d", chat_key, hang_text.count("\n") + 1)
     if reply_sent is not None:
         reply_sent.append(True)
-    await send_files(update, files_to_send)
+    await send_files(update, files_to_send, local=tg_api.on_local_server(cfg),
+                     max_bytes=send_file_max_bytes(cfg))
     if task_cost is not None:
         # В теме задачи футер называет и расход задачи (проект шага 3, 1.6).
         model_note = " · ".join(n for n in (model_note, tasks.cost_note(task_cost[2])) if n)
     if await send_cost_footer(cfg, update, result, model_note,
                               warn_reset=not _autocompact_for(cfg, chat_key),
-                              notes=turn_notes or ()) and turn_notes:
+                              notes=turn_notes) and turn_notes:
         turn_notes.clear()
     if task_cost is not None:
         await _task_cost_seen(ctx, *task_cost)
@@ -3621,20 +3614,6 @@ async def _dispatch_to_claude_impl(
             )
         else:
             await _send_plan_card(ctx, update, chat_key, plan_snapshot)
-
-
-# Триггеры, при которых бот озвучивает ответ на ТЕКСТОВЫЙ запрос. Сценарий:
-# Иван за рулём, печатает с телефона, но хочет услышать ответ. Substring-match
-# по lowercase: false-positive вроде «не голосом, а текстом» сюда тоже попадёт,
-# но это редкий случай и явный текст «голосом» проще трактовать как запрос voice.
-_VOICE_REPLY_TRIGGERS = ("голосом", "озвучь", "озвучи", "продиктуй", "надиктуй",
-                         # Английские для открытой копии: в русской речи не встречаются.
-                         "by voice", "read it aloud", "read aloud", "voice reply")
-
-
-def _wants_voice_reply(text: str) -> bool:
-    lowered = text.lower()
-    return any(t in lowered for t in _VOICE_REPLY_TRIGGERS)
 
 
 def _forward_note(msg: Any) -> str:
@@ -3849,11 +3828,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # «Делай» под проектом в теме задачи: одобрение, в Claude не идёт.
         return
     # Пометка до проверки «!»: пересланный чужой текст с «!» в начале это
-    # данные, а не поправка пользователя, прерывать ран он не должен. По той же
-    # причине «озвучь» в чужом тексте голосовой ответ не включает.
+    # данные, а не поправка пользователя, прерывать ран он не должен.
     note = _forward_note(msg)
     text = note + (msg.text or "")
-    voice_trigger = not note and _wants_voice_reply(text)
+    # Текст сам голос не включает: просьбу ответить голосом в любой форме узнаёт
+    # модель и ставит метку <<VOICE>> (persona). Флаг поднимают только
+    # склеенные с поправкой голосовые сообщения.
+    voice_trigger = False
     chat_key, _unused, _unused = _chat_key(update)
 
     # Мягкий interrupt «! поправка». Проверяем ПЕРВЫМ делом, по исходному тексту:
@@ -3920,7 +3901,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = _text_in_context(cfg, msg, text)
 
     # Compose-буфер: копим вместо отправки.
-    n = _compose_add(ctx, chat_key, text, voice=voice_trigger)
+    n = _compose_add(ctx, chat_key, text)
     if n is not None:
         await msg.reply_text(_("📥 в буфере {n}. /go — отправить").format(n=n))
         return
@@ -4039,7 +4020,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     target = attachments_dir / f"{msg.message_id}{suffix}"
     got = await _fetch_attachment(
         update, ctx, file_obj=src, size=file_size, target=target, label=label,
-        chat_key=chat_key, gslot=gslot, slot=slot, hold=True)
+        chat_key=chat_key, gslot=gslot, slot=slot, hold=True, max_bytes=cfg.photo_max_size_bytes)
     if got is None:
         _compose_release(ctx, chat_key, slot)
         _gather_release(gslot)
@@ -4456,13 +4437,13 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _gather_release(gslot)
         return
     note = _forward_note(msg)
-    # Для /go: голосовой ответ просят свои слова, не пересланные (ревью 12.10.2026).
-    voice_words = not note and _wants_voice_reply(heard)
     heard = note + heard
     # Голосовой ответ на пункт подборки («поставь это») тоже несёт его источник и правило.
     heard = _news_context(cfg, msg, heard)
     if slot is not None:
-        n = _compose_fill(ctx, chat_key, slot, heard, voice=voice_words)
+        # В буфере /go голосовое голос не включает: ответ после /go озвучит
+        # метка <<VOICE>>, если об этом просят свои слова (не пересланные).
+        n = _compose_fill(ctx, chat_key, slot, heard)
         if n is not None:
             _gather_release(gslot)
             await msg.reply_text(_("📥 в буфере {n}. /go — отправить").format(n=n))
@@ -4677,44 +4658,122 @@ async def on_approval_full(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         log.exception("full view send failed")
 
 
-def _cleanup_tree(root: Path, ttl_days: int) -> int:
-    """Удалить в дереве файлы старше ttl_days. ttl_days<=0 = дерево не трогаем."""
-    if ttl_days <= 0 or not root.exists():
-        return 0
-    cutoff = time.time() - ttl_days * 86400
+def _cleanup_bot_api_files(work_dir: Path, token: str, ttl_days: int) -> int:
+    """Старые файлы своего сервера Bot API: подкаталоги каталога этого бота
+    (documents, voice, temp...) и временный tmp/ сервера. Служебные файлы
+    (td.binlog, *.binlog в корне) лежат выше и не трогаются, каталоги других
+    ботов тоже: им копию никто не обещал. Отказ доступа к одному каталогу не
+    останавливает остальные; путь в журнал не идёт: в имени каталога токен."""
     removed = 0
-    for f in root.rglob("*"):
-        if not f.is_file():
-            continue
+    try:
+        removed += _cleanup_tree(work_dir / "tmp", ttl_days)
+    except OSError:
+        log.warning("cleanup bot-api-files: server tmp is not readable")
+    bot_dir = work_dir / token
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) or bot_dir.is_symlink() or not bot_dir.is_dir():
+        return removed
+    try:
+        subs = [d for d in bot_dir.iterdir() if d.is_dir() and not d.is_symlink()]
+    except OSError:
+        log.warning("cleanup bot-api-files: the bot directory is not readable")
+        return removed
+    for sub in subs:
         try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-                removed += 1
+            removed += _cleanup_tree(sub, ttl_days)
         except OSError:
-            pass
+            log.warning("cleanup bot-api-files: a subdirectory is not readable")
     return removed
+
+
+def _cleanup_tree(root: Path, ttl_days: int, stats: dict | None = None, now: float | None = None) -> int:
+    """Удалить в дереве файлы старше ttl_days. ttl_days<=0 = дерево не трогаем.
+    Судит по lstat (retention.age_time): символическая ссылка удаляется сама, без перехода по ней,
+    в ссылки на каталоги обход не заходит; корень-ссылку не трогаем. stats:
+    счётчики отчёта (freed, errors, sample); now: момент прохода (один на
+    уборку и проверку просроченного)."""
+    if ttl_days <= 0 or root.is_symlink() or not root.is_dir():
+        return 0
+    cutoff = (now if now is not None else time.time()) - ttl_days * 86400
+    removed = 0
+
+    def unreadable(e: OSError) -> None:
+        # Нечитаемый каталог дерева: ошибка в отчёт, а не молчаливый пропуск.
+        # Исчезнувший (в том числе только что удалённая ссылка) не ошибка.
+        if stats is not None and not isinstance(e, FileNotFoundError):
+            stats["errors"] = stats.get("errors", 0) + 1
+            stats.setdefault("sample", []).append(f"{Path(e.filename or '').name}: {type(e).__name__}")
+
+    for top, _dirs, names in os.walk(root, followlinks=False, onerror=unreadable):
+        for name in names + [d for d in _dirs if os.path.islink(os.path.join(top, d))]:
+            f = Path(top, name)
+            try:
+                st = f.lstat()
+                if retention.age_time(st, root) < cutoff:
+                    f.unlink()
+                    removed += 1
+                    if stats is not None:
+                        stats["freed"] = stats.get("freed", 0) + st.st_size
+            except FileNotFoundError:
+                continue  # исчез сам между обходом и удалением: не ошибка
+            except OSError as e:
+                if stats is not None:
+                    stats["errors"] = stats.get("errors", 0) + 1
+                    stats.setdefault("sample", []).append(f"{name}: {type(e).__name__}")
+    return removed
+
+
+def _state_cleanup_pass(cfg: Config, trees: list[tuple[Path, int, str]]) -> None:
+    """Один проход уборки state/: деревья со сроком, журнал действий по
+    месяцам (разнос прежнего файла, срок audit.KEEP_MONTHS), отчёт для
+    doctor Свода (retention.write_report)."""
+    stats: dict = {}
+    deleted = 0
+    now = time.time()
+    for root, ttl, name in trees:
+        removed = _cleanup_tree(root, ttl, stats, now)
+        deleted += removed
+        if removed:
+            log.info("cleanup %s: removed %d old files", name, removed)
+    base = cfg.state_dir / AUDIT_LOG_NAME
+    try:
+        moved = audit.split_legacy(base)
+        if moved:
+            log.info("cleanup audit: %d lines moved to month files", moved)
+        gone = audit.prune(base)
+        deleted += len(gone)
+        if gone:
+            log.info("cleanup audit: removed %d month files", len(gone))
+    except OSError as e:
+        stats["errors"] = stats.get("errors", 0) + 1
+        stats.setdefault("sample", []).append(f"audit: {type(e).__name__}")
+        log.exception("cleanup audit failed")
+    overdue = len(retention.due_files(trees, now))
+    retention.write_report(cfg.state_dir, deleted=deleted, freed=stats.get("freed", 0),
+                           errors=stats.get("errors", 0), sample=stats.get("sample", []),
+                           overdue=overdue)
 
 
 async def _attachment_cleanup_loop(cfg: Config) -> None:
     """Раз в сутки чистит state/attachments/ и state/memory-drafts/
-    (attachment_ttl_days).
-
-    TTL = 0: loop не нужен, выходим сразу.
-    """
-    trees = [
-        (cfg.state_dir / "attachments", cfg.attachment_ttl_days, "attachments"),
-        # Черновики записей памяти: тело уже в git памяти, файл нужен минуты.
-        (cfg.state_dir / "memory-drafts", cfg.attachment_ttl_days, "memory-drafts"),
-    ]
+    (attachment_ttl_days, 0: не трогать), state/2mind/ (retention.TWO_MIND_TTL_DAYS),
+    папку отправки и кэш telegram-mcp (retention.TELEGRAM_FILES_TTL_DAYS),
+    журнал действий по месяцам (audit.prune), пишет отчёт state/cleanup/last.json
+    и чистит файлы своего сервера Bot API (BOT_API_FILES_TTL_DAYS, пока бот на нём).
+    Правила всего state/: retention.RULES."""
+    # Деревья и сроки: retention.trees (state/ и корни сервера telegram-mcp).
+    trees = retention.trees(cfg.state_dir, cfg.attachment_ttl_days)
     active = [(root, ttl, name) for root, ttl, name in trees if ttl > 0]
     for root, ttl, name in trees:
         if ttl <= 0:
             log.info("cleanup: %s disabled (ttl=%d)", name, ttl)
-    if not active:
-        return
+    # Только свой сервер этого модуля (bot_api_server, порт PORT): другой
+    # адрес на loopback это другой сервер со своим каталогом.
+    bot_api_local = (tg_api.is_local(cfg.telegram_bot_api_url)
+                     and urlsplit(cfg.telegram_bot_api_url).port == bot_api_server.PORT)
     log.info(
         "cleanup loop started: %s",
-        ", ".join(f"{name} ttl={ttl}d" for _unused, ttl, name in active),
+        ", ".join([f"{name} ttl={ttl}d" for _unused, ttl, name in active]
+                  + ([f"bot-api-files ttl={BOT_API_FILES_TTL_DAYS}d"] if bot_api_local else [])),
     )
     first = True
     while True:
@@ -4725,10 +4784,14 @@ async def _attachment_cleanup_loop(cfg: Config) -> None:
             if not first:
                 await asyncio.sleep(_CLEANUP_INTERVAL_SEC)
             first = False
-            for root, ttl, name in active:
-                removed = await asyncio.to_thread(_cleanup_tree, root, ttl)
+            await asyncio.to_thread(_state_cleanup_pass, cfg, active)
+            # Только пока бот на своём сервере: после отката в облако сервер
+            # мог остаться для другого бота, его файлы не наши.
+            if bot_api_local:
+                removed = await asyncio.to_thread(_cleanup_bot_api_files, bot_api_server.WORK_DIR,
+                                                  cfg.telegram_bot_token, BOT_API_FILES_TTL_DAYS)
                 if removed:
-                    log.info("cleanup %s: removed %d old files", name, removed)
+                    log.info("cleanup bot-api-files: removed %d old files", removed)
         except asyncio.CancelledError:
             log.info("cleanup loop cancelled")
             raise
@@ -4790,15 +4853,28 @@ ALLOWED_UPDATES = [Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY,
 
 def build_app(cfg: Config) -> Application:
     base_url, base_file_url = tg_api.ptb_urls(cfg.telegram_bot_api_url)
+    local = tg_api.is_local(cfg.telegram_bot_api_url)
+    # Своему серверу на loopback прокси из окружения не нужен, а http-прокси
+    # увидел бы токен открытым текстом (как tg_api.post). Оба клиента PTB:
+    # getUpdates свой, PTB создал бы его сам с прокси из окружения.
+    httpx_kwargs = {"trust_env": False} if local else None
     app = (
         Application.builder()
         # Свой класс бота ради ранов без звука. Пул соединений задан явно, как
         # у ApplicationBuilder с .token() (256): с .bot() пул ставит не builder,
         # и так он не зависит от умолчания HTTPXRequest в другой версии PTB.
         # Адрес сервера Bot API общий с notify и прочими (tg_api, TELEGRAM_BOT_API_URL).
+        # Свой сервер запущен с --local: getFile отдаёт путь на диске, PTB
+        # копирует файл оттуда, если путь виден процессу (тот же пользователь,
+        # каталог 0700). local_mode PTB для этого не нужен, он о другом: строка
+        # и Path при отправке уходят серверу как file://; ставим по документации.
         .bot(_SilentAwareBot(cfg.telegram_bot_token, base_url=base_url, base_file_url=base_file_url,
+                             local_mode=local,
                              request=HTTPXRequest(connection_pool_size=256,
-                                                  read_timeout=TELEGRAM_READ_TIMEOUT)))
+                                                  read_timeout=TELEGRAM_READ_TIMEOUT,
+                                                  httpx_kwargs=httpx_kwargs),
+                             get_updates_request=HTTPXRequest(connection_pool_size=1,
+                                                              httpx_kwargs=httpx_kwargs)))
         .concurrent_updates(True)
         .post_init(_on_post_init)
         .post_stop(_on_post_stop)
@@ -4916,6 +4992,10 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CallbackQueryHandler(on_task_pick, pattern=r"^nt:"))
     app.add_handler(CallbackQueryHandler(on_otklik_pick, pattern=r"^otk:"))
     app.add_handler(CallbackQueryHandler(on_otklik_all_pick, pattern=r"^otka:"))
+    if on_app_queue_pick is not None:
+        app.add_handler(CallbackQueryHandler(on_app_queue_pick, pattern=r"^appq:"))
+    else:
+        log.warning("tg_app_launch not found: app queue buttons (appq:) are not handled")
     app.add_handler(CallbackQueryHandler(on_handoff_pick, pattern=r"^ho:"))
     app.add_handler(CallbackQueryHandler(on_plan_pick, pattern=r"^plan:"))
     app.add_handler(CallbackQueryHandler(on_model_pick, pattern=r"^model:"))

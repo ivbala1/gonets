@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ContextTypes
 
-from . import bigfile
+from . import bigfile, bot_api_server, tg_api
 from .config import Config
 from .i18n import _
 
@@ -61,17 +61,59 @@ async def _quiet_edit(status: Any, text: str) -> None:
         log.debug("download status edit failed (ignored)", exc_info=True)
 
 
-async def _progress_ticker(status: Any, progress: bigfile.Progress, label: str) -> None:
+async def _progress_ticker(status: Any, progress: bigfile.Progress, label: str,
+                           size_text: str | None = None) -> None:
+    """Ход большой загрузки раз в _PROGRESS_EVERY_SEC. MTProto: проценты.
+    Свой сервер (size_text задан): пока сервер качает, хода нет (длина его
+    недокачанного файла не равна скачанному), только секунды; копия с его
+    диска в процентах."""
     last = ""
     while True:
         await asyncio.sleep(_b._PROGRESS_EVERY_SEC)
-        if not progress.total:
+        if progress.stopped:
+            return
+        if progress.phase == "copy" and progress.total:
+            text = _("⏳ копирую «{name}» с диска сервера: {pct}%").format(
+                name=label, pct=progress.percent)
+        elif progress.total and progress.phase != "server":
+            text = _("⏳ качаю «{name}», {size}: {pct}%").format(
+                name=label, size=bigfile.mb(progress.total), pct=progress.percent)
+        elif size_text is not None:
+            text = _("⏳ качаю «{name}», {size}: {sec} с").format(
+                name=label, size=size_text, sec=int(time.monotonic() - progress.started))
+        else:
             continue
-        text = _("⏳ качаю «{name}», {size}: {pct}%").format(
-            name=label, size=bigfile.mb(progress.total), pct=progress.percent)
         if text != last:
-            await _quiet_edit(status, text)
+            progress.editing = True
+            try:
+                await _quiet_edit(status, text)
+            finally:
+                progress.editing = False
             last = text
+            if progress.stopped:
+                return
+
+
+_TICKER_EDIT_WAIT = 15.0
+
+
+async def _stop_ticker(ticker: asyncio.Task | None, progress: bigfile.Progress) -> None:
+    """Остановить ход до итоговой строки. Спящий тикер отменяется сразу;
+    правку, уже ушедшую в сеть, отмена не отзывает (сервер её выполнит и она
+    ляжет после «✅»), поэтому её ждём до ответа, тикер выходит по флагу
+    (перепроверка ревью 09.11.2026). Отмена нас самих проходит наружу."""
+    if ticker is None:
+        return
+    progress.stopped = True
+    if progress.editing:
+        await asyncio.wait({ticker}, timeout=_TICKER_EDIT_WAIT)
+    ticker.cancel()
+    await asyncio.wait({ticker})
+
+
+def _first_status(label: str, size_text: str, busy: bool) -> str:
+    return (_("⏳ «{name}», {size}: жду, пока докачается другой файл").format(name=label, size=size_text)
+            if busy else _("⏳ качаю «{name}», {size}").format(name=label, size=size_text))
 
 
 def _mtproto(app: Any, cfg: Config) -> bigfile.BotMTProto:
@@ -155,26 +197,39 @@ def _media_busy(app: Any, msg: Any) -> bool:
     key = _media_key(msg)
     if key in (app.bot_data.get("media_busy") or set()):  # голосовое распознаётся
         return True
+    # Отменённая загрузка тоже занята, пока не вышла: поток копии своего
+    # сервера ещё пишет .part той же цели (второе мнение 08.11.2026).
     jobs: dict[int, DownloadJob] = app.bot_data.get("downloads") or {}
-    return any(j.msg_key == key and not j.cancelled for j in jobs.values())
+    return any(j.msg_key == key for j in jobs.values())
 
 
 async def _fetch_attachment(
     update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_obj: Any, size: int | None,
     target: Path, label: str, chat_key: str, gslot: _b.GatherSlot | None,
     slot: _b.Reservation | None, hold: bool, fail_text: str | None = None,
+    max_bytes: int | None = None,
 ) -> str | None:
-    """Скачать вложение или голосовое в target. До 20 МБ через Bot API
-    (getFile), больше через MTProto под токеном бота. Неизвестный размер идёт
-    через Bot API, отказ «File is too big» переводит на MTProto, тайм-аут
-    Bot API тоже (если MTProto настроен), а сбой MTProto после тайм-аута
-    ещё раз пробует Bot API.
+    """Скачать вложение или голосовое в target.
+
+    Свой сервер Bot API (TELEGRAM_BOT_API_URL на loopback): любой размер через
+    getFile, см. _fetch_local. Облако: до 20 МБ через Bot API (getFile),
+    больше через MTProto под токеном бота. Неизвестный размер идёт через
+    Bot API, отказ «File is too big» переводит на MTProto, тайм-аут Bot API
+    тоже (если MTProto настроен), а сбой MTProto после тайм-аута ещё раз
+    пробует Bot API. max_bytes: предел вида вложения (по умолчанию
+    DOCUMENT_MAX_SIZE_BYTES), повторно проверяется по ответу сервера.
 
     "small"/"big" при успехе, None при сбое или отмене (Ивану уже сказано словами).
     "big" с hold=True: вызывающий держит единицу active_work (перезапуск ждёт
     файл до Claude) и обязан её вернуть или передать пачке склейки.
     """
     msg = update.message
+    if _on_local_server(ctx):
+        cfg: Config = ctx.application.bot_data["cfg"]
+        return await _fetch_local(
+            update, ctx, file_obj=file_obj, size=size, target=target, label=label,
+            chat_key=chat_key, gslot=gslot, slot=slot, hold=hold, fail_text=fail_text,
+            max_bytes=cfg.document_max_size_bytes if max_bytes is None else max_bytes)
     if bigfile.needs_mtproto(size):
         return await _b._fetch_big(update, ctx, size=size, target=target, label=label,
                                    chat_key=chat_key, gslot=gslot, slot=slot, hold=hold)
@@ -254,10 +309,14 @@ async def _fetch_big(
     update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE, *, size: int | None, target: Path,
     label: str, chat_key: str, gslot: _b.GatherSlot | None, slot: _b.Reservation | None,
     hold: bool, job: DownloadJob | None = None,
-    retry: Callable[[], Awaitable[None]] | None = None,
+    retry: Callable[[], Awaitable[None]] | None = None, status: Any = None,
+    quiet: bool = False,
 ) -> str | None:
     """retry: файл меньше 20 МБ после тайм-аута Bot API; вызывается вместо
-    отказа при перезапуске и после сбоя MTProto (код-ревью 07.11.2026)."""
+    отказа при перезапуске и после сбоя MTProto (код-ревью 07.11.2026).
+    status: сообщение о загрузке, уже показанное своим сервером: его правим,
+    второе не шлём. quiet: мелкий файл, который не отдал свой сервер: без
+    «⏳» и «✅», как после тайм-аута в облаке."""
     cfg: Config = ctx.application.bot_data["cfg"]
     app = ctx.application
     bd = app.bot_data
@@ -275,11 +334,10 @@ async def _fetch_big(
             return None
         return got
     if bd.get("draining") or bd.get("stopping"):
-        await _say(msg, _("♻️ бот готовится к перезапуску: большой файл не скачиваю, "
-                               "пришли его после рестарта"))
+        await _say_or_edit(msg, status, _drain_text())
         return None
     if not cfg.telegram_api_id or not cfg.telegram_api_hash:
-        await _say(msg, _(
+        await _say_or_edit(msg, status, _(
             "⚠️ файл «{name}» ({size}) больше 20 МБ, а скачивание больших файлов не настроено: "
             "нет TELEGRAM_API_ID и TELEGRAM_API_HASH в .env бота"
         ).format(name=label, size=size_text))
@@ -299,19 +357,19 @@ async def _fetch_big(
     jobs: dict[int, DownloadJob] = bd.setdefault("downloads", {})
     jobs[id(job)] = job
     progress = bigfile.Progress()
-    status = None
     ticker: asyncio.Task | None = None
     try:
-        # Маленький файл после тайм-аута Bot API качается секунды: без «⏳»
-        # и «✅», иначе альбом дал бы по сообщению на фото (код-ревью 07.11.2026).
-        try:
-            status = None if retry is not None and not client.busy else await msg.reply_text(
-                _("⏳ «{name}», {size}: жду, пока докачается другой файл").format(name=label, size=size_text)
-                if client.busy else
-                _("⏳ качаю «{name}», {size}").format(name=label, size=size_text)
-            )
-        except Exception:
-            log.debug("download status send failed (ignored)", exc_info=True)
+        first = _first_status(label, size_text, client.busy)
+        if status is not None:
+            await _quiet_edit(status, first)
+        else:
+            # Маленький файл после тайм-аута Bot API качается секунды: без «⏳»
+            # и «✅», иначе альбом дал бы по сообщению на фото (код-ревью 07.11.2026).
+            try:
+                status = (None if (retry is not None or quiet) and not client.busy
+                          else await msg.reply_text(first))
+            except Exception:
+                log.debug("download status send failed (ignored)", exc_info=True)
         ticker = asyncio.ensure_future(_progress_ticker(status, progress, label))
         dl = asyncio.ensure_future(client.download(
             msg.chat_id, msg.message_id, target, max_bytes=cfg.document_max_size_bytes,
@@ -320,7 +378,10 @@ async def _fetch_big(
         if job.cancelled:  # /cancel пришёл, пока отправлялось сообщение «качаю»
             dl.cancel()
         try:
-            got = await dl
+            try:
+                got = await dl
+            finally:
+                await _stop_ticker(ticker, progress)
         except asyncio.CancelledError:
             if not job.cancelled:
                 raise
@@ -353,10 +414,7 @@ async def _fetch_big(
                 return None
             if got_retry is not None:
                 return got_retry
-        if status is not None:
-            await _quiet_edit(status, text)
-        else:
-            await _say(msg, text)
+        await _say_or_edit(msg, status, text)
         return None
     finally:
         if ticker is not None:
@@ -374,13 +432,22 @@ async def _end_cancelled(ctx: ContextTypes.DEFAULT_TYPE, msg: Any, status: Any, 
     статус «отменена»; остановка бота просит прислать файл заново (раньше
     это говорил _dispatch_to_claude, ревью 07.11.2026)."""
     if ctx.application.bot_data.get("stopping"):
-        text = _("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта")
-        if status is not None:
-            await _quiet_edit(status, text)
-        else:
-            await _say(msg, text)
+        await _say_or_edit(msg, status, _(
+            "⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
     else:
         await _quiet_edit(status, _("🗑 загрузка «{name}» отменена").format(name=label))
+
+
+def _drain_text() -> str:
+    return _("♻️ бот готовится к перезапуску: большой файл не скачиваю, "
+             "пришли его после рестарта")
+
+
+async def _say_or_edit(msg: Any, status: Any, text: str) -> None:
+    if status is not None:
+        await _quiet_edit(status, text)
+    else:
+        await _say(msg, text)
 
 
 async def _say(msg: Any, text: str) -> None:
@@ -419,6 +486,179 @@ async def _retry_bot_api(
     await _quiet_edit(status, _("✅ скачал «{name}», {size}").format(
         name=label, size=bigfile.mb(target.stat().st_size)))
     return "small"
+
+
+# ---- свой сервер Bot API (--local) ----
+# getFile там отвечает, когда сервер сам скачал файл из Telegram (любой
+# размер), и отдаёт путь на диске; копию бот делает сам (bigfile.copy_local),
+# не PTB: тот копирует синхронно и на сотнях МБ остановил бы весь бот.
+# Тайм-аут getFile почти всегда значит «сервер ещё качает», поэтому один
+# общий срок на всю операцию, короткие повторы только на сбой связи.
+_LOCAL_SMALL_DEADLINE = 300.0
+_LOCAL_RETRY_DELAYS = _DOWNLOAD_RETRY_DELAYS
+
+
+def _on_local_server(ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    return tg_api.on_local_server(ctx.application.bot_data["cfg"])
+
+
+async def _local_get(file_obj: Any, target: Path, *, size: int | None, big: bool,
+                     max_bytes: int, min_free: int, read_timeout: float,
+                     progress: bigfile.Progress) -> int:
+    """getFile своего сервера и копия в target. FetchError: сказать словами,
+    MTProto не поможет (предел, место). Прочее: сервер не отдал файл."""
+    if big and size:
+        # Сервер кладёт свою копию на тот же диск: место под обе.
+        bigfile.check_disk(target.parent, 2 * size, min_free)
+    delays = iter(_LOCAL_RETRY_DELAYS)
+    while True:
+        try:
+            tg_file = await file_obj.get_file(read_timeout=read_timeout)
+            break
+        except BadRequest:
+            raise
+        except NetworkError as e:
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            log.warning("local getFile failed (%s), retry in %.0fs", type(e).__name__, delay)
+            await asyncio.sleep(delay)
+    reported = getattr(tg_file, "file_size", None)
+    if max_bytes > 0 and reported and reported > max_bytes:
+        raise bigfile.FetchError(bigfile.limit_text(reported, max_bytes))
+    src = bigfile.server_file(getattr(tg_file, "file_path", None), bot_api_server.WORK_DIR, reported)
+    real = src.stat().st_size
+    if max_bytes > 0 and real > max_bytes:
+        raise bigfile.FetchError(bigfile.limit_text(real, max_bytes))
+    bigfile.check_disk(target.parent, real, min_free if real > bigfile.BOT_API_MAX_BYTES else 0)
+    progress.phase = "copy"
+    return await bigfile.copy_local(src, target, real, progress)
+
+
+async def _fetch_local(
+    update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE, *, file_obj: Any, size: int | None,
+    target: Path, label: str, chat_key: str, gslot: _b.GatherSlot | None,
+    slot: _b.Reservation | None, hold: bool, fail_text: str | None, max_bytes: int,
+) -> str | None:
+    """Вложение любого размера через свой сервер. Больше 20 МБ и неизвестный
+    размер («большой»): сообщение о ходе, единица active_work (перезапуск
+    ждёт; с hold=True вызывающий её держит дальше, как у _fetch_big), запас
+    диска, очередь по одному. Мелкий идёт молча. Сервер не отдал файл
+    (срок, сбой связи, отказ, путь не годится): MTProto, если настроен."""
+    cfg: Config = ctx.application.bot_data["cfg"]
+    bd = ctx.application.bot_data
+    msg = update.message
+    big = size is None or size > bigfile.BOT_API_MAX_BYTES
+    size_text = bigfile.mb(size) if size else _("размер неизвестен")
+    if big and (bd.get("draining") or bd.get("stopping")):
+        await _say(msg, _drain_text())
+        return None
+    # Проверка draining выше и счёт работы без await между ними.
+    if big:
+        bd["active_work"] = bd.get("active_work", 0) + 1
+    job = DownloadJob(chat_key=chat_key, generation=slot[0] if slot is not None else None,
+                      msg_key=_media_key(msg))
+    jobs: dict[int, DownloadJob] = bd.setdefault("downloads", {})
+    jobs[id(job)] = job
+    # Склейка и /go ждут файл всё время: очередь, getFile, повторы, копия.
+    holders = tuple(h for h in _slot_holders(ctx, chat_key, gslot, slot) if h is not None)
+    for h in holders:
+        h.slow += 1
+    keep = False
+    status = None
+    tickers: list[asyncio.Task] = []
+    progress = bigfile.Progress()
+    queue: asyncio.Semaphore = bd.setdefault("local_big_queue", asyncio.Semaphore(1))
+    deadline = float(cfg.big_download_timeout_sec) if big else _LOCAL_SMALL_DEADLINE
+    fallback: Exception | None = None
+
+    async def run() -> int:
+        progress.started = time.monotonic()
+        progress.phase = "server"
+        if big and status is not None:
+            tickers.append(asyncio.ensure_future(_progress_ticker(status, progress, label, size_text)))
+        return await asyncio.wait_for(
+            _local_get(file_obj, target, size=size, big=big, max_bytes=max_bytes,
+                       min_free=cfg.download_min_free_bytes, read_timeout=deadline,
+                       progress=progress), deadline)
+
+    async def queued() -> int:
+        if not big:
+            return await run()
+        async with queue:
+            if status is not None and queue_was_busy:
+                await _quiet_edit(status, _first_status(label, size_text, False))
+            return await run()
+
+    try:
+        queue_was_busy = big and queue.locked()
+        if big:
+            try:
+                status = await msg.reply_text(_first_status(label, size_text, queue_was_busy))
+            except Exception:
+                log.debug("download status send failed (ignored)", exc_info=True)
+        try:
+            try:
+                got = await _cancellable(job, queued())
+            finally:
+                for t in tickers:
+                    await _stop_ticker(t, progress)
+        except asyncio.CancelledError:
+            if not job.cancelled:
+                raise
+            log.info("download cancelled chat_key=%s", chat_key)
+            await _end_cancelled(ctx, msg, status, label)
+            return None
+        except bigfile.FetchError as e:
+            if job.cancelled:
+                await _end_cancelled(ctx, msg, status, label)
+                return None
+            log.warning("local download refused chat_key=%s: %s", chat_key, e)
+            await _say_or_edit(msg, status, str(e))
+            return None
+        except Exception as e:  # noqa: BLE001 любой отказ сервера: запасной путь ниже
+            if job.cancelled:
+                await _end_cancelled(ctx, msg, status, label)
+                return None
+            fallback = e
+        else:
+            if job.cancelled:  # /cancel успел, пока задача уже кончилась
+                await _end_cancelled(ctx, msg, status, label)
+                return None
+            if not big:
+                return "small"
+            elapsed = time.monotonic() - progress.started
+            log.info("local download done chat_key=%s size=%d sec=%.1f", chat_key, got, elapsed)
+            await _quiet_edit(status, _("✅ скачал «{name}», {size} за {sec} с").format(
+                name=label, size=bigfile.mb(got), sec=int(elapsed)))
+            keep = hold
+            return "big"
+    finally:
+        for t in tickers:
+            t.cancel()
+        jobs.pop(id(job), None)
+        for h in holders:
+            h.slow -= 1
+        if big and not keep:
+            bd["active_work"] -= 1
+    # Сервер не отдал файл: MTProto идёт к Telegram своим путём. Слоты и
+    # работа выше уже отданы, _fetch_big берёт их заново.
+    reason = "timeout" if isinstance(fallback, TimeoutError) else type(fallback).__name__
+    if _mtproto_configured(ctx) and not bd.get("stopping") and (big or not bd.get("draining")):
+        log.warning("local bot api did not give the file chat_key=%s (%s), using mtproto",
+                    chat_key, reason)
+        return await _b._fetch_big(update, ctx, size=size, target=target, label=label,
+                                   chat_key=chat_key, gslot=gslot, slot=slot, hold=hold,
+                                   status=status, quiet=not big)
+    log.warning("local bot api did not give the file chat_key=%s (%s)", chat_key, reason,
+                exc_info=fallback)
+    if isinstance(fallback, TimeoutError):
+        text = _("⚠️ «{name}» не скачался за {min} мин, пришли его ещё раз").format(
+            name=label, min=max(1, int(deadline // 60)))
+    else:
+        text = fail_text or _("⚠️ не удалось скачать «{name}»: {err}").format(name=label, err=reason)
+    await _say_or_edit(msg, status, text)
+    return None
 
 
 # В конце: bot импортирует этот модуль при своей загрузке. Имена bot и

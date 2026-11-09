@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import tg_api
 from .config import load_config
 
 
@@ -42,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
     # пишется в plain-text и расходится через journalctl-export. Поднимаем
     # его до WARNING — теряем низкоуровневые HTTP-логи, но защищаем токен.
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(tg_api.TokenLogFilter(cfg.telegram_bot_token))
     log = logging.getLogger("claude_tg_bot")
 
     if args.check:

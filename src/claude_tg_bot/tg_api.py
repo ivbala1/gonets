@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import time
 from typing import Any, Mapping
@@ -89,10 +90,16 @@ def api_url(env: Mapping[str, str] | None = None) -> str:
     return parse_url((os.environ if env is None else env).get(ENV))
 
 
-def _local(url: str) -> bool:
+def is_local(url: str) -> bool:
     """Свой сервер на loopback: прокси из окружения ему не нужен, а http-прокси
     увидел бы токен открытым текстом."""
     return _loopback(urlsplit(url).hostname or "")
+
+
+def on_local_server(cfg: Any) -> bool:
+    """Бот работает через свой сервер Bot API (--local): вложения любого
+    размера через getFile, отправка файлов путём до 2000 МБ."""
+    return is_local(getattr(cfg, "telegram_bot_api_url", "") or "")
 
 
 def ptb_urls(url: str) -> tuple[str, str]:
@@ -130,10 +137,47 @@ def not_modified(r: httpx.Response) -> bool:
     return r.status_code == 400 and not_modified_text(r.text)
 
 
+class TokenLogFilter(logging.Filter):
+    """Токен бота в записи журнала заменяется на <token>: на своём сервере он
+    стоит в пути к файлам (~/.local/share/telegram-bot-api/<токен>/), и ошибка
+    копирования вложения печатала бы его с трассировкой. Ставится на обработчики."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self.token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not self.token:
+            return True
+        # Handler.handle зовёт фильтр вне своей защиты: исключение отсюда
+        # уронило бы место вызова журнала. Сообщение, которое не собирается,
+        # заменяем целиком: handleError напечатал бы аргументы как есть.
+        try:
+            if record.exc_info and not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            msg = record.getMessage()
+            if self.token in msg:
+                record.msg, record.args = scrub(msg, self.token), None
+            if record.exc_text:
+                record.exc_text = scrub(record.exc_text, self.token)
+            if record.stack_info:
+                record.stack_info = scrub(record.stack_info, self.token)
+        except Exception:  # noqa: BLE001
+            record.msg, record.args = "<сообщение журнала не собрано>", None
+            record.exc_info, record.exc_text, record.stack_info = None, None, None
+        return True
+
+
+def scrub(text: str, *tokens: str) -> str:
+    """Токены в тексте на <token> (пустые пропускаются)."""
+    for token in tokens:
+        if token:
+            text = text.replace(token, "<token>")
+    return text
+
+
 def _clean(e: Exception, token: str) -> Exception:
-    text = str(e)
-    if token:
-        text = text.replace(token, "<token>")
+    text = scrub(str(e), token)
     if isinstance(e, httpx.InvalidURL):
         return httpx.RequestError(text)
     try:
@@ -154,7 +198,7 @@ def post(token: str, method: str, *, json: Any = None, data: Any = None, files: 
     target = f"{base}/bot{token}/{method}"
     kwargs: dict[str, Any] = {k: v for k, v in (("json", json), ("data", data), ("files", files))
                               if v is not None}
-    if _local(base):
+    if is_local(base):
         kwargs["trust_env"] = False
     retry = retry_not_sent or retry_any
     delays = iter(RETRY_DELAYS if retry else ())
@@ -192,7 +236,7 @@ async def apost(token: str, method: str, *, json: Any = None, timeout: float = 1
     base = api_url()
     target = f"{base}/bot{token}/{method}"
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=not _local(base)) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=not is_local(base)) as client:
             return await asyncio.wait_for(client.post(target, json=json), timeout)
     except (httpx.HTTPError, httpx.InvalidURL) as e:
         err: Exception = e
