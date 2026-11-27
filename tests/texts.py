@@ -13,6 +13,11 @@ import string
 from claude_tg_bot.i18n import _
 
 
+def stop_word() -> str:
+    """Слово остановки в тексте бота («стоп» / «stop»), из каталога."""
+    return _(". Остановить: «стоп»").rsplit(" ", 1)[-1]
+
+
 def msg_re(msgid: str) -> str:
     """Регулярка для assertRegex: перевод msgid, подстановки {name} любым текстом."""
     out = []

@@ -42,7 +42,7 @@ from claude_tg_bot.bot import (  # noqa: E402
     _synthetic_update,
 )
 from claude_tg_bot.replies import (  # noqa: E402
-    extract_ask_marker,
+    extract_ask_markers,
     extract_loud_marker,
     load_full_text,
     plan_voice_series,
@@ -54,7 +54,6 @@ from claude_tg_bot.replies import (  # noqa: E402
     voice_text,
     with_counter,
 )
-from telegram import MessageEntity  # noqa: E402
 import httpx  # noqa: E402
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut  # noqa: E402
 
@@ -66,34 +65,34 @@ def _ctx(bot_data: dict | None = None) -> SimpleNamespace:
 
 class AskMarkerTests(unittest.TestCase):
     def test_marker_parsed_and_removed(self) -> None:
-        ask, cleaned = extract_ask_marker(
+        asks, cleaned = extract_ask_markers(
             "Есть два пути.\n\n<<ASK:Что делаем?|Откатить|Чинить>>"
         )
-        self.assertEqual(ask, ("Что делаем?", ["Откатить", "Чинить"]))
+        self.assertEqual(asks, [("Что делаем?", ["Откатить", "Чинить"])])
         self.assertEqual(cleaned, "Есть два пути.")
 
     def test_marker_without_options_is_left_as_text(self) -> None:
         # Одного вопроса без вариантов мало для кнопок — пользователь должен
         # хотя бы прочитать вопрос, а не потерять его вместе с маркером.
-        ask, cleaned = extract_ask_marker("<<ASK:А просто вопрос?>>")
-        self.assertIsNone(ask)
+        asks, cleaned = extract_ask_markers("<<ASK:А просто вопрос?>>")
+        self.assertEqual(asks, [])
         self.assertIn("просто вопрос", cleaned)
 
-    def test_only_first_marker_becomes_buttons_second_stays_readable(self) -> None:
-        ask, cleaned = extract_ask_marker("<<ASK:A?|1|2>> хвост <<ASK:B?|3|4>>")
-        self.assertEqual(ask[0], "A?")
-        # Второй вопрос кнопками не станет, но и потеряться не должен.
-        self.assertIn("B?", cleaned)
+    def test_two_markers_become_buttons_third_stays_readable(self) -> None:
+        asks, cleaned = extract_ask_markers("<<ASK:A?|1|2>> хвост <<ASK:B?|3|4>> <<ASK:C?|5|6>>")
+        self.assertEqual([a[0] for a in asks], ["A?", "B?"])
+        # Третий вопрос кнопками не станет, но и потеряться не должен.
+        self.assertIn("<<ASK:C?|5|6>>", cleaned)
 
     def test_options_capped_at_four(self) -> None:
-        ask, _ = extract_ask_marker("<<ASK:Q?|1|2|3|4|5|6>>")
-        self.assertEqual(len(ask[1]), 4)
+        asks, _ = extract_ask_markers("<<ASK:Q?|1|2|3|4|5|6>>")
+        self.assertEqual(len(asks[0][1]), 4)
 
     def test_marker_inside_code_fence_ignored(self) -> None:
         """Claude цитирует README/файл с примером маркера — это не вопрос."""
         text = "Формат такой:\n```\n<<ASK:Пример?|да|нет>>\n```\nвот и всё"
-        ask, cleaned = extract_ask_marker(text)
-        self.assertIsNone(ask)
+        asks, cleaned = extract_ask_markers(text)
+        self.assertEqual(asks, [])
         self.assertIn("<<ASK:Пример?|да|нет>>", cleaned)
 
     def test_loud_marker_removed(self) -> None:
@@ -114,13 +113,13 @@ class AskMarkerTests(unittest.TestCase):
 
     def test_overlong_option_rejected(self) -> None:
         """Хвост, который не влезет на кнопку, не должен уходить в промпт."""
-        ask, cleaned = extract_ask_marker(f"<<ASK:Q?|ок|{'x' * 200}>>")
-        self.assertIsNone(ask)
+        asks, cleaned = extract_ask_markers(f"<<ASK:Q?|ок|{'x' * 200}>>")
+        self.assertEqual(asks, [])
         self.assertIn("ASK:Q?", cleaned)
 
     def test_plain_text_untouched(self) -> None:
-        ask, cleaned = extract_ask_marker("обычный ответ без маркеров")
-        self.assertIsNone(ask)
+        asks, cleaned = extract_ask_markers("обычный ответ без маркеров")
+        self.assertEqual(asks, [])
         self.assertEqual(cleaned, "обычный ответ без маркеров")
 
 
@@ -511,7 +510,7 @@ class SendFilesTests(unittest.TestCase):
     def _send(self, err: Exception | None) -> SimpleNamespace:
         msg = SimpleNamespace(reply_document=AsyncMock(side_effect=err), reply_text=AsyncMock())
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / "track.gpx"
+            f = Path(d).resolve() / "track.gpx"
             f.write_text("x")
             asyncio.run(send_files(SimpleNamespace(message=msg), [f]))
         return msg

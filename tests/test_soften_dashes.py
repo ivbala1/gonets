@@ -3,7 +3,7 @@
 import unittest
 
 from claude_tg_bot.dashes import soften_dashes
-from claude_tg_bot.replies import extract_ask_marker
+from claude_tg_bot.replies import extract_ask_markers
 
 EM, EN = "—", "–"
 
@@ -61,7 +61,7 @@ class SoftenDashesTests(unittest.TestCase):
 
     def test_ask_parts_softened_after_marker_extracted(self) -> None:
         text = f"Файл /tmp/a{EN}b.txt?\n<<ASK:Запускаем {EM} сейчас?|Да {EM} сразу|Нет>>"
-        ask, rest = extract_ask_marker(text)
+        (ask,), rest = extract_ask_markers(text)
         self.assertEqual(soften_dashes(rest), "Файл /tmp/a-b.txt?")
         self.assertEqual(soften_dashes(ask[0]), "Запускаем - сейчас?")
         self.assertEqual([soften_dashes(o) for o in ask[1]], ["Да - сразу", "Нет"])

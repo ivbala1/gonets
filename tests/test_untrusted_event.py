@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "1:test")
 os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
-from claude_tg_bot import approval, claude_runner, config  # noqa: E402
+from claude_tg_bot import approval, claude_runner, config, untrusted  # noqa: E402
 from claude_tg_bot.skills import _oneshot  # noqa: E402
 
 
@@ -209,6 +209,17 @@ class UntrustedInitGuardTests(unittest.TestCase):
     def test_known_tools_pass(self) -> None:
         self.assertEqual(claude_runner.untrusted_unknown_tools(self.TOOLS_1019), [])
 
+    def test_mcp_task_tools_known_2026_11_24(self) -> None:
+        """Claude Code 2.1.331: McpTaskCheck остановил ран сторожа 24.11.2026."""
+        tools = [*self.TOOLS_1019, "McpTaskCheck", "McpTaskResumePolling", "McpTaskShowQuestion"]
+        self.assertEqual(claude_runner.untrusted_unknown_tools(tools), [])
+        self.assertTrue(untrusted.tool_allowed("McpTaskCheck", None))
+        # В правилах ask он бы получил отказ режима dontAsk при allow хуков.
+        self.assertNotIn("McpTaskCheck", claude_runner.UNTRUSTED_ASK_TOOLS)
+        for name in ("McpTaskResumePolling", "McpTaskShowQuestion"):
+            self.assertFalse(untrusted.tool_allowed(name, None))
+            self.assertIn(name, claude_runner.UNTRUSTED_ASK_TOOLS)
+
     def test_new_builtin_blocks(self) -> None:
         self.assertEqual(claude_runner.untrusted_unknown_tools([*self.TOOLS_1019, "Teleport"]), ["Teleport"])
         for bad in (None, [], [{"name": "Teleport"}], "Bash"):
@@ -280,18 +291,26 @@ class UntrustedGuardHookTests(unittest.TestCase):
     def test_decisions(self) -> None:
         from claude_tg_bot import untrusted
         allowed = ("Read", "ToolSearch", "mcp__telegram__get_messages", "mcp__claude_ai_Gmail__search_threads",
-                   "mcp__claude_ai_Google_Calendar__list_events")
+                   "mcp__claude_ai_Google_Calendar__list_events",
+                   # Чтение вложений поимённо (26.11.2026).
+                   "mcp__claude_ai_Gmail__download_gmail_attachment", "mcp__telegram__inspect_document")
         denied = ("Bash", "Write", "Edit", "WebFetch", "Task", "Agent", "Skill", "CronCreate", "TaskStop",
                   "Teleport", "mcp__telegram__send_message", "mcp__claude_ai_Gmail__create_draft",
                   "mcp__claude_ai_Google_Drive__search_files", "mcp__new_server__delete_items",
                   # Чужой сервер закрыт и для «чтения»: query(sql=...) по имени не отличить от записи.
                   "mcp__new_server__list_items", "mcp__db__query",
-                  "mcp__telegram__get_invite_link", "mcp__x", "")
+                  "mcp__telegram__get_invite_link", "mcp__x", "",
+                  # Пишут файл по пути из аргумента; движок распознавания выбирает аргумент.
+                  "mcp__telegram__download_media", "mcp__telegram__open_photo",
+                  "mcp__telegram__transcribe_voice")
         for t in allowed:
             self.assertTrue(untrusted.tool_allowed(t, self.RE), t)
         for t in denied:
             self.assertFalse(untrusted.tool_allowed(t, self.RE), t)
         self.assertFalse(untrusted.tool_allowed("mcp__telegram__get_messages", None))
+        # open_photo пишет по save_path: закрыт и при шаблоне, пропускающем open_*.
+        self.assertFalse(untrusted.tool_allowed("mcp__telegram__open_photo", re.compile(r"(open|get)[A-Za-z_]*")))
+        self.assertIn("mcp__telegram__open_photo", untrusted.UNTRUSTED_ASK_TOOLS)
 
     def _main(self, stdin: str) -> str:
         from claude_tg_bot import untrusted
@@ -408,6 +427,16 @@ class HandleApproveUntrustedTests(unittest.TestCase):
     def test_untrusted_allows_read_only_mcp(self) -> None:
         out = self._decide("mcp__telegram__get_messages", {}, untrusted=True)
         self.assertEqual(out["decision"], "allow")
+
+    def test_untrusted_allows_attachment_reads_without_card(self) -> None:
+        # Вложения поимённо (26.11.2026): мимо шаблона имён, без карточки.
+        for name, args in (("mcp__claude_ai_Gmail__download_gmail_attachment",
+                            {"messageId": "m", "attachmentId": "a", "filename": "img311.jpg"}),
+                           ("mcp__telegram__inspect_document", {"chat_id": 1, "message_id": 2})):
+            self.assertEqual(self._decide(name, args, untrusted=True)["decision"], "allow", name)
+        out = self._decide("mcp__telegram__transcribe_voice", {"chat_id": 1, "message_id": 2, "engine": "groq"},
+                           untrusted=True)
+        self.assertEqual(out["decision"], "deny")
 
     def test_trusted_run_unchanged(self) -> None:
         self.assertEqual(self._decide("Bash", {"command": "ls"}, untrusted=False)["decision"], "allow")

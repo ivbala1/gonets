@@ -118,7 +118,9 @@ async def _limit_hold(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, msg: Any, cha
         text = head + _(": запрос не ушёл в Claude, повтори после {when}.").format(when=limits.clock(fire_at))
     if text:
         with contextlib.suppress(Exception):
-            await msg.reply_text(text)
+            # Из фоновой темы строка в личку: иначе ✅ отклика вернулся бы с
+            # кнопками без понятной причины (ревью 11.11.2026).
+            await _b._say(ctx, chat_key, msg, text)
     return True
 
 

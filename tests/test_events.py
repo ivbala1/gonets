@@ -155,7 +155,6 @@ class EventHttpTests(unittest.TestCase):
 
     def test_repeat_while_receiving_waits(self) -> None:
         import asyncio
-        import json
         from types import SimpleNamespace
         from unittest.mock import AsyncMock
 

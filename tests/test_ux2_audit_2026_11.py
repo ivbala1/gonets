@@ -26,8 +26,9 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import approval, bot, limits, replies  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult  # noqa: E402
-from tests.test_review_bot_main import GROUP, _Base, _msg  # noqa: E402
+from tests.test_review_bot_main import GROUP, _Base  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import stop_word  # noqa: E402
 
 CHAT = -100
 THREAD = 5
@@ -95,10 +96,10 @@ class StatusHeadlineTests(unittest.TestCase):
             text = asyncio.run(go())
         first = text.splitlines()[0]
         self.assertTrue(first.startswith("▶️"), text)
-        self.assertIn(_("4м05с"), first)
+        self.assertIn(_("{m}м{s:02d}с").format(m=4, s=5), first)
         self.assertIn("Bash: pytest -q", first)
         self.assertIn(_("шаг {steps}").format(steps=1), first)
-        self.assertIn("«стоп»", first)
+        self.assertIn(stop_word(), first)
 
     def test_idle_first_line(self) -> None:
         text = asyncio.run(_call_status(_status_ctx()))
@@ -109,7 +110,7 @@ class StatusHeadlineTests(unittest.TestCase):
         ctx = _status_ctx(procs={KEY: SimpleNamespace(returncode=None, pid=42)}, waiting=2)
         first = asyncio.run(_call_status(ctx)).splitlines()[0]
         self.assertTrue(first.startswith("▶️"), first)
-        self.assertIn("«стоп»", first)
+        self.assertIn(stop_word(), first)
         self.assertIn(_("в очереди {n}").format(n=2), first)
 
     def test_uptime_in_hours_and_limit(self) -> None:
@@ -206,7 +207,7 @@ class CardDeadlineTests(unittest.TestCase):
                 patch.object(approval.serious, "send_reasons", return_value={"тестовая причина"}), \
                 patch.object(approval.audit, "write_event"):
             resp = asyncio.run(approval.handle_approve(request))
-        self.assertIn("не ответил на карточку", json.loads(resp.text)["reason"])
+        self.assertEqual(json.loads(resp.text)["reason"], _(approval.CARD_TIMEOUT_HINT).format(mins=1))
         self.assertEqual(tg.sent, [])
         self.assertEqual(len(tg.edits), 1)
         edit = tg.edits[0]

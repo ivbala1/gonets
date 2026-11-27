@@ -9,7 +9,8 @@
   чтение; его matcher видит Bash, Write, Edit, WebFetch, MCP;
 - этот модуль, запущенный хуком на все инструменты (matcher "*") без
   обращения к серверу бота: пропускает только чтение (UNTRUSTED_READ_TOOLS и
-  MCP на чтение по APPROVE_MCP_AUTO_ALLOW_REGEX у UNTRUSTED_MCP_READ_SERVERS),
+  MCP на чтение по APPROVE_MCP_AUTO_ALLOW_REGEX у UNTRUSTED_MCP_READ_SERVERS,
+  вложения поимённо по UNTRUSTED_ATTACHMENT_TOOLS),
   остальному отказ. Отказ хука сильнее allow другого хука; у обоих хуков
   onFailure block, сбой и таймаут тоже отказ;
 - для перечисленных в UNTRUSTED_ASK_TOOLS ещё режим dontAsk с правилами
@@ -47,6 +48,8 @@ UNTRUSTED_ALLOWED_TOOLS = ("Read", "ToolSearch", *SEARCH_TOOLS)
 UNTRUSTED_READ_TOOLS = (
     "Read", "ToolSearch", "Grep", "Glob", "ListMcpResourcesTool", "ReadMcpResourceTool",
     "ReadMcpResourceDirTool", "CronList", "ListAgents",
+    # Состояние фоновой задачи MCP (Claude Code 2.1.331, isReadOnly; 24.11.2026).
+    "McpTaskCheck",
 )
 _ASK_BUILTIN = (
     "Bash", "Monitor", "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
@@ -58,6 +61,9 @@ _ASK_BUILTIN = (
     "CronCreate", "CronDelete", "RemoteTrigger", "PushNotification", "SendMessage",
     "Skill", "Workflow", "TaskStop", "EnterWorktree", "ExitWorktree", "ExitPlanMode",
     "ReportFindings",
+    # Фоновые задачи MCP (2.1.331): возобновить слежение и показать вопрос
+    # задачи действуют, рану по чужому тексту они не нужны.
+    "McpTaskResumePolling", "McpTaskShowQuestion",
 )
 # MCP, которые ран по чужому тексту не читает, закрыты целиком (ask на сервер
 # закрывает и чтение); у Telegram, Gmail и календаря поимённо те, что
@@ -70,6 +76,9 @@ _ASK_MCP_TOOLS = {
     "telegram": (
         "send_message", "send_file", "reply_to_message", "export_chat_invite", "export_contacts",
         "get_invite_link", "download_media",
+        # Пишет копию по save_path из аргумента; закрыт поимённо, а не только
+        # шаблоном имён (ревью Codex 26.11.2026).
+        "open_photo",
     ),
     "claude_ai_Gmail": (
         "send_message", "reply", "forward", "create_draft", "update_draft", "delete_draft",
@@ -85,6 +94,17 @@ _ASK_MCP_TOOLS = {
 # чтение по имени. Прочие серверы закрыты по умолчанию: инструмент вроде
 # query(sql=...) по имени не отличить от записи (ревью Codex 19.10.2026).
 UNTRUSTED_MCP_READ_SERVERS = ("telegram", "claude_ai_Gmail", "claude_ai_Google_Calendar")
+# Чтение вложений поимённо, мимо шаблона имён (решение Ивана 26.11.2026:
+# «пусть читает вложения»; сторож не открыл скан письма). Файл Gmail кладёт
+# сам Claude Code в tool-results сессии, inspect_document читает в памяти.
+# download_media и open_photo с save_path пишут файл по пути из аргумента:
+# закрыты, фото и документы сообщений читает inspect_document. Закрыт и
+# transcribe_voice: аргумент engine выбирает движок мимо настройки сервера,
+# с groq звук ушёл бы стороннему сервису.
+UNTRUSTED_ATTACHMENT_TOOLS = (
+    "mcp__claude_ai_Gmail__download_gmail_attachment",
+    "mcp__telegram__inspect_document",
+)
 UNTRUSTED_ASK_TOOLS = (
     *_ASK_BUILTIN,
     *(f"mcp__{server}" for server in _ASK_MCP_SERVERS),
@@ -103,7 +123,7 @@ def unknown_tools(tools: object) -> list[str]:
 
 def tool_allowed(tool_name: str, mcp_re: re.Pattern[str] | None) -> bool:
     """Решение независимой проверки: только чтение."""
-    if tool_name in UNTRUSTED_READ_TOOLS:
+    if tool_name in UNTRUSTED_READ_TOOLS or tool_name in UNTRUSTED_ATTACHMENT_TOOLS:
         return True
     parts = tool_name.split("__", 2)
     if len(parts) != 3 or parts[0] != "mcp" or mcp_re is None or parts[1] not in UNTRUSTED_MCP_READ_SERVERS:

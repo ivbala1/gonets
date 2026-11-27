@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import stat
 import tempfile
 import time
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from claude_tg_bot import login_expiry as le
+from tests.texts import msg_re
 
 TZ = ZoneInfo("Asia/Dubai")
 DAY = 86400
@@ -74,7 +76,7 @@ def test_thresholds_count_to_earliest_end() -> None:
     # Окно открыто, дата CLI ещё впереди: последний порог, не «кончился».
     assert le.due_notice(EXPIRES, EARLIEST + 3600, {}, TZ)[0] == "1"
     assert le.due_notice(EXPIRES, EARLIEST, {}, TZ)[0] == "1"
-    assert "любой момент" in le.notice_text("1", EXPIRES, EARLIEST, TZ)
+    assert re.search(ANYTIME_RE, le.notice_text("1", EXPIRES, EARLIEST, TZ))
 
 
 def test_transient_logout_does_not_repeat_end() -> None:
@@ -141,20 +143,25 @@ def test_relogin_resets_marks() -> None:
     assert key is None and state == {"expires_at": later, "sent": []}
     assert le.due_notice(later, later - 9 * DAY, state, TZ)[0] == "10"
 
+# Подписи сверяются по каталогу текущего языка (tests/texts.py), не русскими обрывками.
+ENDED_RE = msg_re("⏳ Вход Claude на {host} кончился. Без него встанут бот, Домовой и сводки. Обнови:")
+ANYTIME_RE = msg_re("⏳ Вход Claude на {host} может кончиться в любой момент, не позже {date}. "
+                    "Без него встанут бот, Домовой и сводки. Обнови сейчас:")
+
 
 def test_notice_text_has_window_and_days() -> None:
     with patch.object(le.socket, "gethostname", return_value="pc-1"):
         text = le.notice_text("3", EXPIRES, EARLIEST - 2 * DAY + 3600, TZ)
         gone = le.notice_text("expired", EXPIRES, EXPIRES + 1, TZ)
     assert "pc-1" in text and "03.11" in text and "06.11" in text and " 2 " in text
-    assert "pc-1" in gone and "кончился" in gone and "06.11" not in gone
+    assert "pc-1" in gone and re.search(ENDED_RE, gone) and "06.11" not in gone
     # Окно открыто: «в любой момент», без «через 0 дн.».
     for now in (EARLIEST + 3600, EXPIRES - 3600):
         inside = le.notice_text("1", EXPIRES, now, TZ)
-        assert "06.11" in inside and "любой момент" in inside and " 0 " not in inside
+        assert "06.11" in inside and re.search(ANYTIME_RE, inside) and " 0 " not in inside
     # День раннего конца, окно ещё не открыто: время начала окна, не «в любой момент».
     before = le.notice_text("1", EXPIRES, EARLIEST - 3600, TZ)
-    assert "06:56" in before and "06.11" in before and "любой момент" not in before
+    assert "06:56" in before and "06.11" in before and not re.search(ANYTIME_RE, before)
 
 
 def _fake_claude(work: str, output: str, code: int = 0) -> str:
@@ -313,7 +320,7 @@ def test_job_announces_end_after_token_cleared() -> None:
         _run_job(state_dir, gone, EARLIEST + DAY + 60, send)
         assert send.await_count == 2
         args, kwargs = send.await_args
-        assert "кончился" in args[1]
+        assert re.search(ENDED_RE, args[1])
         assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "login:claude"
         # Перевход: новая дата сбрасывает отметки.
         _run_job(state_dir, EXPIRES + 30 * DAY, EARLIEST + DAY + 120, send)
@@ -355,7 +362,7 @@ def test_job_failed_send_then_token_cleared() -> None:
         _run_job(state_dir, gone, EARLIEST + DAY + 60, ok)
         _run_job(state_dir, gone, EARLIEST + DAY + 120, ok)
     assert failed.await_count == 1 and ok.await_count == 1
-    assert "кончился" in ok.await_args.args[1]
+    assert re.search(ENDED_RE, ok.await_args.args[1])
 
 
 def test_job_login_without_date_mutes_old_date() -> None:
@@ -386,7 +393,8 @@ def test_lifecycle_schedules_jobs() -> None:
             jobs[kw["name"]] = (node.func.attr, kw)
     assert jobs["'login-expiry'"][0] == "run_daily"
     assert jobs["'login-expiry'"][1]["time"] == "dtime(9, 30, tzinfo=local_zone())"
-    assert jobs["'login-expiry-start'"] == ("run_once", {"when": "60", "name": "'login-expiry-start'"})
+    assert jobs["'login-expiry-start'"] == ("run_once", {"when": "60", "name": "'login-expiry-start'",
+                                                         "job_kwargs": "late_ok"})
 
 
 def test_parallel_checks_send_once() -> None:

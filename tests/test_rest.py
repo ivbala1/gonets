@@ -8,8 +8,6 @@ import contextlib
 import json
 import re
 import time
-import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -144,7 +142,7 @@ class GatherOnStopTests(_CrashBase):
     """Сообщение в трёхсекундной склейке при остановке ложится в отложенное,
     а не просит повторить (пункт 2)."""
 
-    REFUSED = "сообщение не ушло"
+    REFUSED = botmod._("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта")
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
@@ -181,6 +179,9 @@ class GatherOnStopTests(_CrashBase):
         self.assertEqual(job["prompt"], "первое")
         self.assertIn(self.REFUSED, str(late.reply_text.await_args.args[0]))
         self.assertNotIn(self.REFUSED, str(self.first.reply_text.await_args.args[0]))
+        self.assertRegex(str(self.first.reply_text.await_args.args[0]),
+                         msg_re("♻️ бот ждёт конца работы для перезапуска: "
+                                "сообщение уйдёт в Claude сразу после него (отмена: /cancel)"))
 
     async def test_nothing_ready_refused(self) -> None:
         await self.flush(self.batch([None]))
@@ -276,7 +277,7 @@ class CarriedDeferredTests(_CrashBase):
         self.scheduled: list[dict] = []
         self.ctx.application.job_queue = SimpleNamespace(
             get_jobs_by_name=lambda _name: [],
-            run_once=lambda _cb, when, data, name: self.scheduled.append(data))
+            run_once=lambda _cb, when, data, name, **_kw: self.scheduled.append(data))
         patcher = patch.object(botmod, "_synthetic_update",
                                lambda bot, cid, tid: _update(_msg(chat_id=cid)))
         patcher.start()
@@ -541,7 +542,8 @@ class FooterTrailTests(_CrashBase):
     async def test_broken_journal_does_not_stop_notice(self) -> None:
         self.lost()
         (self.state / "audit.jsonl").write_bytes("не json\n{\"ts\": 5}\n".encode() + b"\xff\n")
-        self.assertRegex(await self.notice(), "ответ не дошёл")
+        self.assertRegex(await self.notice(), msg_re("⚠️ бот упал посреди работы и поднялся сам: ответ не дошёл "
+                                                      "(«{head}»). Повтори, если ещё нужно."))
 
     async def test_no_session_no_trail(self) -> None:
         self.add()
@@ -700,7 +702,8 @@ class ReviewRoundTests(_CrashBase):
             upd = _update(edited)
             upd.message, upd.edited_message, upd.effective_message = None, edited, edited
             await botmod.on_edited_text(upd, self.ctx)
-            self.assertIn("не дошла", str(edited.reply_text.await_args.args[0]))
+            self.assertRegex(str(edited.reply_text.await_args.args[0]),
+                             msg_re("✏️ правка до Claude не дошла: напиши поправку новым сообщением"))
             await asyncio.wait_for(asyncio.gather(*self.tasks, return_exceptions=True), 2)
         self.assertEqual(self.runs[1]["prompt"], "да")
 
@@ -720,7 +723,8 @@ class WaitNoteTests(_Base):
         self.lock = botmod._chat_lock(self.ctx, str(GROUP))
         await self.lock.acquire()
         self.bot_data["run_watch"] = {"r1": SimpleNamespace(
-            chat_key=str(GROUP), headline=lambda: "▶️ отвечаю 3м05с, шаг 2: Bash: pytest")}
+            chat_key=str(GROUP), headline=lambda: botmod._("▶️ отвечаю {dur}, шаг {steps}: {desc}").format(
+                dur=botmod._("{m}м{s:02d}с").format(m=3, s=5), steps=2, desc="Bash: pytest"))}
 
     def notes(self, msg: SimpleNamespace) -> list[str]:
         said = [str(c.args[0]) for c in msg.reply_text.await_args_list]
@@ -741,16 +745,17 @@ class WaitNoteTests(_Base):
         msg = _msg("новое")
         await self.waited(msg)
         [note] = self.notes(msg)
-        self.assertIn("отвечаю 3м05с, шаг 2: Bash: pytest", note)
+        self.assertIn(botmod._("▶️ отвечаю {dur}, шаг {steps}: {desc}").format(
+            dur=botmod._("{m}м{s:02d}с").format(m=3, s=5), steps=2, desc="Bash: pytest").removeprefix("▶️ "), note)
         self.assertNotIn("▶️", note)
         self.assertEqual([c.kwargs.get("disable_notification") for c in msg.reply_text.await_args_list
-                          if "жду" in str(c.args[0])], [True])
+                          if re.search(msg_re(self.NOTE), str(c.args[0]))], [True])
 
     async def test_unknown_holder(self) -> None:
         self.bot_data["run_watch"] = {}
         msg = _msg("новое")
         await self.waited(msg)
-        self.assertIn("прошлый ход", self.notes(msg)[0])
+        self.assertIn(botmod._("прошлый ход"), self.notes(msg)[0])
 
     async def test_short_wait_silent(self) -> None:
         msg = _msg("новое")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import signal
@@ -18,7 +19,7 @@ from . import bigfile, buttons, login_expiry, otklik, restart, tg_api
 from . import procs as procs_mod
 from .approval import ApprovalRegistry, warn_if_no_shared_secret
 from .claude_runner import SessionStore
-from .config import Config, local_zone
+from .config import Config, background_chat_keys, local_zone
 from .i18n import _
 from .voice import log_local_stt_status, make_client
 
@@ -39,8 +40,17 @@ async def _on_post_init(app: Application) -> None:
     # взятые без итога «результат неизвестен». До сервера событий и опроса
     # Telegram, чтобы ни один ран и ни одно нажатие не застали старое.
     otklik_base = otklik.otklik_dir(cfg.state_dir)
+    # Одобренные на срок ждут своего запуска из очереди /at, а не кнопок.
+    # Пара (id, поколение): задание прежнего одобрения (до ✋) запись не держит.
+    scheduled: set[tuple[str, int]] = set()
+    at_jobs = app.bot_data.get("at_jobs")
+    for entry in list((at_jobs.data if at_jobs is not None else {}).values()):
+        with contextlib.suppress(Exception):
+            job = json.loads(entry["v"])
+            if oid := job.get("otklik"):
+                scheduled.add((str(oid), int(job.get("otklik_gen") or 0)))
     try:
-        recovered = await asyncio.to_thread(otklik.recover, otklik_base)
+        recovered = await asyncio.to_thread(otklik.recover, otklik_base, frozenset(scheduled))
     except Exception:
         log.exception("otklik: startup recovery failed")
         recovered = []
@@ -49,6 +59,13 @@ async def _on_post_init(app: Application) -> None:
             log.warning("otklik %s: %s after restart", rec["id"], rec["status"])
             if rec["status"] == "unknown":
                 await _b._otklik_unknown_notice(app.bot, rec, otklik_base)
+            elif rec.get("at") and rec["status"] == "pending":
+                # Запуск в срок оборвал перезапуск (ран начался, текст не взят):
+                # Иван в это время не смотрит, правки карточки мало.
+                await _b._otklik_show(app.bot, rec, otklik_base)
+                await _b._otklik_loud(app.bot, rec, _(
+                    "⚠️ Отклик «{title}» в срок {when} не ушёл: бот перезапускался. Кнопки вернулись.").format(
+                    title=rec.get("title"), when=otklik.at_label(rec)))
         # Остальное перерисует синхронизация: восстановленные в pending и
         # отставшие с прошлых сбоев.
         await _b._otklik_sync(app.bot, otklik_base)
@@ -66,6 +83,12 @@ async def _on_post_init(app: Application) -> None:
     app.bot_data["restart_begin"] = lambda chat_key, reason, commit: _restart_begin(
         app, chat_key, reason, commit)
 
+    # Прогрев до моста: ран по событию иначе записал бы неполный набор
+    # отметок поверх файла (ревью Codex 25.11.2026).
+    try:
+        _b.warm_restore(app)
+    except Exception:
+        log.exception("warm: restore after start failed")
     aio_app = _b.build_aiohttp_app(app, cfg, registry, session_targets)
     runner = web.AppRunner(aio_app)
     await runner.setup()
@@ -118,18 +141,27 @@ async def _on_post_init(app: Application) -> None:
         await _b._tasks_recover(ContextTypes.DEFAULT_TYPE(application=app))
     except (OSError, ValueError) as e:
         log.error("news tasks recovery failed: %s", e)
+    # Срок опоздания без предела у всех: у APScheduler он 1 с, и запуск,
+    # проспавший срок (сон ПК, занятый цикл), выбрасывался молча.
+    late_ok = {"misfire_grace_time": None}
     app.job_queue.run_daily(_b._tasks_housekeeping, name="news-tasks",
-                            time=dtime(8, 45, tzinfo=local_zone()))
-    app.job_queue.run_once(_b._tasks_startup, when=30, name="news-tasks-start")
+                            time=dtime(8, 45, tzinfo=local_zone()), job_kwargs=late_ok)
+    app.job_queue.run_once(_b._tasks_startup, when=30, name="news-tasks-start", job_kwargs=late_ok)
     # Конец сохранённого входа claude.ai: напоминание владельцу заранее.
     app.job_queue.run_daily(login_expiry.check_login_expiry, name="login-expiry",
-                            time=dtime(9, 30, tzinfo=local_zone()))
-    app.job_queue.run_once(login_expiry.check_login_expiry, when=60, name="login-expiry-start")
+                            time=dtime(9, 30, tzinfo=local_zone()), job_kwargs=late_ok)
+    app.job_queue.run_once(login_expiry.check_login_expiry, when=60, name="login-expiry-start",
+                           job_kwargs=late_ok)
+    # Сессии «в приложение» на ПК: весть об остановке, состояние в списке (личный модуль).
+    if _b.start_app_queue_watch is not None:
+        _b.start_app_queue_watch(app)
     # Сообщение о перезапуске по заявке: после старта приёма обновлений.
-    app.job_queue.run_once(_restart_announce, when=3, name="restart-announce")
+    # Очередь стартует после post_init: весть, опоздавшая больше секунды, без
+    # late_ok пропадала бы молча.
+    app.job_queue.run_once(_restart_announce, when=3, name="restart-announce", job_kwargs=late_ok)
     # Работа, оборванная аварией прошлого процесса: забрать до приёма обновлений.
     _b._inflight_recover(app)
-    app.job_queue.run_once(_b._inflight_announce, when=3, name="inflight-announce")
+    app.job_queue.run_once(_b._inflight_announce, when=3, name="inflight-announce", job_kwargs=late_ok)
 
     # Восстановить отложенные /at-промпты после рестарта. Просроченные (бот
     # лежал в момент срабатывания) уходят сразу (delay клампится к 1с).
@@ -143,6 +175,14 @@ async def _on_post_init(app: Application) -> None:
         except Exception:
             log.exception("at-job %s повреждён — удаляю", jid)
             at_store.remove(jid)
+            # Отправка отклика в срок без задания: recover выше её оставил
+            # одобренной. Карточку перерисует ближайшая синхронизация (она
+            # могла уже пройти); случай почти невозможный, строки Ивану нет.
+            with contextlib.suppress(Exception):
+                job = json.loads(entry["v"])
+                if job.get("otklik"):
+                    otklik.revert_untaken(otklik_base, str(job["otklik"]), int(job.get("otklik_gen") or 0),
+                                          _("не поставилось в очередь, см. журнал бота"))
     if restored:
         log.info("restored %d scheduled /at job(s)", restored)
 
@@ -249,23 +289,31 @@ def _terminate_runs(app: Application) -> None:
 
 # --- перезапуск по заявке (restart.py) -----------------------------------------
 
-def _workshop_busy(app: Application) -> bool:
+def _background_busy(app: Application) -> set[str]:
+    """Фоновые темы (мастерская, отклики), где идёт ран или ждёт очередь."""
     cfg: Config = app.bot_data["cfg"]
-    key = getattr(cfg, "workshop_chat_key", "")
-    lock = app.bot_data.get("chat_locks", {}).get(key) if key else None
-    waiting = app.bot_data.get("lock_waiting", {}).get(key, 0) if key else 0
-    return bool(lock is not None and lock.locked()) or waiting > 0
+    return {key for key in background_chat_keys(cfg) if _b._chat_load(app.bot_data, key)}
 
 
 async def _restart_wait_workshop(app: Application, req: dict, drain: Any) -> None:
-    """Первый шаг перезапуска: дождаться конца работы мастерской. Личка и её
-    события тем временем работают; «/cancel мастерская» ускорит."""
-    run = app.bot_data.get("workshop_run") or {}
-    since = _b._workshop_since(run)
-    await _restart_notify(app, req, _("♻️ Перезапуск ждёт конца работы мастерской «{what}» с {since}; "
-                                      "личка работает как обычно. «/cancel мастерская» ускорит.").format(
-        what=run.get("what") or "?", since=since), True)
-    while _workshop_busy(app) and not drain.cancelled and not drain.now_event.is_set():
+    """Первый шаг перезапуска: дождаться конца работы фоновых тем (мастерская,
+    отправка откликов). Личка и её события тем временем работают; «/cancel
+    мастерская» ускорит."""
+    cfg: Config = app.bot_data["cfg"]
+    busy = _background_busy(app)
+    lines = []
+    if getattr(cfg, "workshop_chat_key", "") in busy:
+        run = app.bot_data.get("workshop_run") or {}
+        since = _b._workshop_since(run)
+        lines.append(_("♻️ Перезапуск ждёт конца работы мастерской «{what}» с {since}; "
+                       "личка работает как обычно. «/cancel мастерская» ускорит.").format(
+            what=run.get("what") or "?", since=since))
+    if getattr(cfg, "otklik_chat_key", "") in busy:
+        # Новые ✅ в это время тоже идут и тоже дожидаются: «Перезапустить сейчас» не ждёт.
+        lines.append(_("♻️ Перезапуск ждёт конца отправки откликов; личка работает как обычно."))
+    if lines:  # фоновая тема могла освободиться до этой строки: пустое Telegram не примет
+        await _restart_notify(app, req, "\n".join(lines), True)
+    while _background_busy(app) and not drain.cancelled and not drain.now_event.is_set():
         await asyncio.sleep(5)
 
 
@@ -357,17 +405,19 @@ async def _restart_begin_locked(app: Application, chat_key: str, reason: str,
     problem = await asyncio.to_thread(restart.code_problem, commit)
     if problem:
         return 409, {"error": problem}
-    if _b._is_workshop(cfg, chat_key):
-        # Заявка из мастерской: ход перезапуска и кнопки в личке, тема заглушена.
+    if _b._is_background(cfg, chat_key):
+        # Заявка из фоновой темы: ход перезапуска и кнопки в личке, тема заглушена.
         chat_key = str(cfg.primary_chat_id)
     req = restart.new_request(chat_key, reason, commit)
     restart.save_request(cfg.state_dir, req)
     # Ожидание в два шага (проект Домового 22.10.2026): пока идёт наряд
     # мастерской, новую работу не берёт только она, личка работает; общее
     # ожидание начинается, когда мастерская свободна (_restart_run).
-    workshop_busy = _workshop_busy(app)
+    workshop_busy = bool(_background_busy(app))
     if workshop_busy:
-        app.bot_data["draining_keys"] = {cfg.workshop_chat_key}
+        # Новую работу не берёт только мастерская (её наряды долгие); ✅ на
+        # отклике в это время идёт темой откликов, первый шаг дождётся и его.
+        app.bot_data["draining_keys"] = {getattr(cfg, "workshop_chat_key", "")} - {""}
     else:
         app.bot_data["draining"] = True
 

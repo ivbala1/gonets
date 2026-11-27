@@ -63,7 +63,7 @@ class EditMessageCardTests(unittest.TestCase):
     def test_vote_poll_is_card_with_choice(self) -> None:
         self.assertTrue(outbound.is_send("mcp__telegram__vote_poll"))
         body = card("mcp__telegram__vote_poll", {"chat_id": "@team", "message_id": 42, "option_indices": [1, 3]})
-        self.assertIn("<b>кому:</b> <code>@team</code>", body)
+        self.assertIn(_("<b>кому:</b> <code>{to}</code>").format(to="@team"), body)
         self.assertIn(_("опрос в сообщении") + ": <code>42</code>", body)
         self.assertIn(_("голос за варианты по порядку создания опроса (если варианты не "
                         "перемешаны, это порядок сверху): <code>{n}</code>, заменит прежний голос, если был").format(
@@ -104,8 +104,8 @@ class EditMessageCardTests(unittest.TestCase):
         self.assertIn("<code>/b.jpg</code>, <code>/a.jpg</code>", body)
         body = card("mcp__claude_ai_Slack__slack_send_message",
                     {"chat_id": "@x", "channel_id": "C1", "message": "t"})
-        self.assertIn("<b>кому:</b> <code>@x</code>", body)
-        self.assertIn("C1", body.split(_("<i>прочее:</i>"))[1])
+        self.assertIn(_("<b>кому:</b> <code>{to}</code>").format(to="@x"), body)
+        self.assertIn("C1", body.split(_("<i>прочее:</i> <code>{rest}</code>").split(" ")[0])[1])
 
     def test_empty_emoji_not_shown(self) -> None:
         body = card("mcp__telegram__send_reaction", {"chat_id": "@x", "message_id": 4, "emoji": []})
@@ -187,7 +187,7 @@ class GmailReplyCardTests(unittest.TestCase):
     def test_reply_with_to_shows_list_plainly(self) -> None:
         body = card("mcp__claude_ai_Gmail__reply",
                     {"messageId": "m1", "body": "ok", "to": ["a@b.c", "d@e.f"]})
-        self.assertIn("<b>кому:</b> <code>a@b.c, d@e.f</code>", body)
+        self.assertIn(_("<b>кому:</b> <code>{to}</code>").format(to="a@b.c, d@e.f"), body)
         self.assertIn(_("ответ на письмо") + ": <code>m1</code>", body)
         self.assertNotIn(_(outbound.RECIPIENTS_CLIPPED), body)
 

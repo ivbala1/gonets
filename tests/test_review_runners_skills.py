@@ -30,6 +30,12 @@ def test_b16_writing_mcp_not_readonly():
     for name in ('download_media', 'get_invite_link'):
         assert not approval._untrusted_tool_allowed(f'mcp__telegram__{name}', {}, cfg.mcp_auto_allow_re)
     assert approval._untrusted_tool_allowed('mcp__telegram__get_messages', {}, cfg.mcp_auto_allow_re)
+    for name in ('mcp__claude_ai_Gmail__download_gmail_attachment', 'mcp__telegram__inspect_document'):
+        assert approval._untrusted_tool_allowed(name, {}, cfg.mcp_auto_allow_re), name
+    # Пустой шаблон чтения не закрывает вложения: они поимённо.
+    assert approval._untrusted_tool_allowed('mcp__telegram__inspect_document', {}, None)
+    for name in ('open_photo', 'transcribe_voice'):
+        assert not approval._untrusted_tool_allowed(f'mcp__telegram__{name}', {}, cfg.mcp_auto_allow_re), name
 
 
 async def run_fake(proc, **kw):

@@ -66,7 +66,7 @@ class OutboundCardTests(unittest.TestCase):
         out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"},
                                  unattended=True)
         self.assertEqual(out["decision"], "deny")
-        self.assertIn("черновик в отчёт", out["reason"])
+        self.assertEqual(out["reason"], _(outbound.UNATTENDED_HINT))
         card.assert_not_called()
 
     def test_send_not_allowed_in_burst_window(self) -> None:
@@ -250,7 +250,7 @@ class CardTimeoutTests(unittest.TestCase):
     def test_timed_out_card_is_not_resent_and_waits_for_press(self) -> None:
         out, card = self._decide("Bash", {"command": "rm -rf /srv/data"})
         self.assertEqual(card.await_count, 1)
-        self.assertEqual(out["reason"], "Иван не ответил на карточку за 1 мин: повтори, только если он попросит")
+        self.assertEqual(out["reason"], _(approval.CARD_TIMEOUT_HINT).format(mins=1))
 
     def test_outbound_card_still_retried(self) -> None:
         out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})

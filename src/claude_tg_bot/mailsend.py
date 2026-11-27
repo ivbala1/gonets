@@ -146,6 +146,13 @@ def _resolve(raw: str, base: Path | None) -> Path:
     return path
 
 
+def _read_capped(path: Path, cap: int) -> bytes:
+    # Не больше предела плюс байт: `/dev/zero` или огромный файл не съест
+    # память бота, строящего карточку; `stat` до чтения мало, файл меняется.
+    with path.open("rb") as f:
+        return f.read(max(cap, 0) + 1)
+
+
 def load_letter(args: argparse.Namespace, *, dirs: tuple[Path, ...], limit: int,
                 base: Path | None) -> Letter:
     """Письмо из аргументов и файлов. Все проверки здесь: карточка зовёт ту же
@@ -163,7 +170,9 @@ def load_letter(args: argparse.Namespace, *, dirs: tuple[Path, ...], limit: int,
         raise MailError(_("--reply-to-message-id нужен в виде <...@...>"))
     body_path = _resolve(args.body_file, base)
     try:
-        raw = body_path.read_bytes()
+        if not body_path.is_file():  # канал без писателя повесил бы open
+            raise FileNotFoundError(body_path)
+        raw = _read_capped(body_path, BODY_MAX_BYTES)
     except OSError as e:
         raise MailError(_("не прочитать текст письма {path}: {error}").format(
             path=body_path, error=type(e).__name__)) from e
@@ -190,7 +199,11 @@ def load_letter(args: argparse.Namespace, *, dirs: tuple[Path, ...], limit: int,
                 path=real, dirs=dirs))
         if not real.is_file():
             raise MailError(_("вложение {path} не обычный файл").format(path=real))
-        data = real.read_bytes()
+        try:
+            data = _read_capped(real, limit - total)
+        except OSError as e:
+            raise MailError(_("не прочитать вложение {path}: {error}").format(
+                path=real, error=type(e).__name__)) from e
         total += len(data)
         if total > limit:
             raise MailError(_("вложения больше {limit} байт вместе").format(limit=limit))

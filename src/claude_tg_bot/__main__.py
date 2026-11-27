@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from . import tg_api
-from .config import load_config
+from .config import load_config, zone_mismatch
 
 
 def _check_state_dir_writable(state_dir: Path) -> None:
@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     for handler in logging.getLogger().handlers:
         handler.addFilter(tg_api.TokenLogFilter(cfg.telegram_bot_token))
     log = logging.getLogger("claude_tg_bot")
+    if zone_warning := zone_mismatch():
+        log.warning("%s", zone_warning)
 
     if args.check:
         try:

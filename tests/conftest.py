@@ -14,11 +14,22 @@ from pathlib import Path
 # проверяли живой код (04.11.2026).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_tg_bot import i18n  # noqa: E402
+# Настоящий .env бота тестам не виден: load_config (load_dotenv) клал бы весь
+# его в os.environ процесса, и любой ключ оттуда (адрес Bot API, язык, пути)
+# молча менял бы тесты на ПК (ревью 08.11.2026). Модули берут путь из paths при
+# импорте (config.BOT_ENV_FILE, i18n.ENV_FILE), поэтому подмена до них. Тест со
+# своим .env ставит путь сам.
+from claude_tg_bot import paths  # noqa: E402
+
+paths.ENV_FILE = Path(__file__).resolve().parent / ".env-absent-in-tests"
+assert not paths.ENV_FILE.exists(), paths.ENV_FILE
+
+from claude_tg_bot import config, i18n  # noqa: E402
+
+assert config.BOT_ENV_FILE == i18n.ENV_FILE == paths.ENV_FILE, "модуль импортирован раньше conftest"
 
 i18n.set_language(os.environ.get("CLAUDE_TG_BOT_TEST_LANG", "ru"))
 
-# Настоящий .env бота (load_config зовёт load_dotenv) не должен задавать тестам
-# адрес Bot API: с 08.11.2026 там свой сервер, и подменённые httpx.post получали
-# trust_env. load_dotenv заданное не перезаписывает; тест ставит свой адрес сам.
+# Адрес Bot API из окружения процесса (агент, запущенный ботом, наследует его):
+# с ним подменённые httpx.post получали trust_env. Тест ставит свой адрес сам.
 os.environ["TELEGRAM_BOT_API_URL"] = ""

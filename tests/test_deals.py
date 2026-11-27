@@ -676,6 +676,244 @@ class DealDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get("1"), "sid-0")
 
 
+    # ---- Два вопроса одного ответа: две карточки (измеренная боль 11.11.2026) ----
+
+    TWO = "План.<<ASK:Звонить маме?|да|нет>>\nРитм.<<ASK:Бассейн в 19?|да|позже>>"
+
+    def _deals(self) -> list[dict]:
+        return sorted(deals.load(deals.deals_dir(self.state)).values(), key=lambda d: d["question"])
+
+    async def test_two_markers_two_deals_each_own_card(self) -> None:
+        await self._morning(self.TWO)
+        bassein, mama = self._deals()
+        self.assertEqual((mama["question"], bassein["question"]), ("Звонить маме?", "Бассейн в 19?"))
+        self.assertEqual(bassein["options"], ["да", "позже"])
+        self.assertNotEqual(mama["card_msg"], bassein["card_msg"])
+        self.assertEqual(self.bot_data.get("ask_options", {}), {})
+        cards = [c.args[0] for c in self.morning_msg.reply_text.await_args_list]
+        self.assertTrue(any(c.startswith(deals.head(mama)) for c in cards))
+        self.assertTrue(any(c.startswith(deals.head(bassein)) for c in cards))
+        reply = botmod.send_reply_text.await_args.args[2]
+        self.assertNotIn("<<ASK", reply)
+
+    async def test_tap_one_card_other_stays_then_tap_other(self) -> None:
+        await self._morning(self.TWO)
+        bassein, mama = self._deals()
+        self.ctx.bot.edit_message_reply_markup.reset_mock()
+        self.answer = "Позвоню."
+        await self._tap(mama)
+        self.assertEqual(self._deal(bassein["id"])["state"], "asked")
+        stripped = [c.kwargs.get("message_id") for c in self.ctx.bot.edit_message_reply_markup.await_args_list]
+        self.assertNotIn(bassein["card_msg"], stripped)
+        self.assertEqual(self._deal(mama["id"])["state"], "idle")
+        self.answer = "Записал бассейн."
+        await self._tap(bassein, 2)
+        run = self.runs[-1]
+        self.assertEqual(run["fork_at"], ("sid-0", "u-1"))
+        self.assertIn(_("[Ответ на вопрос «{question}»]: {answer}").format(question="Бассейн в 19?", answer="позже"),
+                      run["prompt"])
+        self.assertEqual(self._deal(bassein["id"])["state"], "idle")
+        self.assertNotEqual(self._deal(bassein["id"])["sid"], self._deal(mama["id"])["sid"])
+
+    async def test_third_marker_stays_text(self) -> None:
+        await self._morning(self.TWO + "<<ASK:Третий?|да|нет>>")
+        self.assertEqual(len(self._deals()), 2)
+        self.assertEqual(self.bot_data.get("ask_options", {}), {})
+        self.assertIn("<<ASK:Третий?|да|нет>>", botmod.send_reply_text.await_args.args[2])
+
+    async def test_one_open_deal_second_question_ordinary_card(self) -> None:
+        await self._morning("<<ASK:Вчерашнее?|да|нет>>")
+        await self._morning(self.TWO)
+        self.assertEqual([d["question"] for d in self._deals()], ["Вчерашнее?", "Звонить маме?"])
+        opts = self.bot_data["ask_options"]
+        self.assertEqual({v["question"] for v in opts.values()}, {"Бассейн в 19?"})
+        self.assertEqual(len(opts), 2)
+
+    async def test_words_with_two_cards_go_main_swipe_goes_to_its_deal(self) -> None:
+        await self._morning(self.TWO)
+        bassein, mama = self._deals()
+        # Слова без свайпа: ни одно дело, главный разговор (там оба вопроса видны).
+        plain = self._msg(text="бассейн да", reply_to_message=None)
+        self.assertIsNone(botmod._deal_reply_target(self.ctx, plain))
+        await botmod._dispatch_to_claude(self._update(plain), self.ctx, "бассейн да", send_voice_reply=False)
+        self.assertFalse(self.runs[-1]["deal"])
+        self.assertEqual(self.runs[-1]["resumed"], "sid-0")
+        self.assertEqual([d["state"] for d in self._deals()], ["asked", "asked"])
+        with patch.object(botmod, "_is_allowed", lambda *a: True), \
+                patch.object(botmod, "_handoff_reply", AsyncMock(return_value=False)), \
+                patch.object(botmod, "_task_touch", AsyncMock(return_value=False)):
+            reply_to = SimpleNamespace(from_user=SimpleNamespace(is_bot=True, id=99),
+                                       text=f"{deals.head(bassein)}\n❓ Бассейн в 19?", caption=None)
+            await botmod.on_text(self._update(self._msg(text="в 20", reply_to_message=reply_to)), self.ctx)
+        self.assertTrue(self.runs[-1]["deal"])
+        self.assertEqual(self.runs[-1]["fork_at"], ("sid-0", "u-1"))
+        self.assertEqual(self._deal(bassein["id"])["state"], "idle")
+        self.assertEqual(self._deal(mama["id"])["state"], "asked")
+
+    async def test_two_ordinary_cards_both_live_each_pressed(self) -> None:
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "вопрос", send_voice_reply=False)
+        opts = self.bot_data["ask_options"]
+        self.assertEqual(len(opts), 4)
+        cards = {v["card"]: v["msg"] for v in opts.values()}
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(len(set(cards.values())), 2)
+
+        async def press(question: str, answer: str) -> None:
+            token, v = next((t, v) for t, v in opts.items() if v["question"] == question and v["answer"] == answer)
+            card = SimpleNamespace(message_id=v["msg"][1], chat=SimpleNamespace(id=1), chat_id=1, text="❓",
+                                   message_thread_id=None, is_topic_message=False, set_reaction=AsyncMock(),
+                                   reply_text=self._msg().reply_text)
+            query = SimpleNamespace(data=f"ask:{token}", answer=AsyncMock(), message=card,
+                                    edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock())
+            update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
+                                     effective_chat=SimpleNamespace(id=1, type="private"), update_id=2)
+            with patch.object(botmod, "Update", lambda update_id, message: SimpleNamespace(
+                    update_id=update_id, message=message, effective_chat=SimpleNamespace(id=1))):
+                await botmod.on_ask_pick(update, self.ctx)
+
+        self.answer = "Позвоню."
+        await press("Звонить маме?", "да")
+        self.assertIn(_("[Ответ на вопрос «{question}»]: {answer}").format(question="Звонить маме?", answer="да"),
+                      self.runs[-1]["prompt"])
+        self.assertEqual({v["question"] for v in opts.values()}, {"Бассейн в 19?"})
+        await press("Бассейн в 19?", "позже")
+        self.assertIn(_("[Ответ на вопрос «{question}»]: {answer}").format(question="Бассейн в 19?", answer="позже"),
+                      self.runs[-1]["prompt"])
+        self.assertEqual(opts, {})
+
+    async def test_held_question_kept_new_second_card_added(self) -> None:
+        self.answer = "<<ASK:Звонить маме?|да|нет>>"
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "вопрос", send_voice_reply=False)
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "ещё", send_voice_reply=False)
+        opts = self.bot_data["ask_options"]
+        self.assertEqual(sorted(v["question"] for v in opts.values()),
+                         ["Бассейн в 19?", "Бассейн в 19?", "Звонить маме?", "Звонить маме?"])
+        self.assertIn(_("❓ Вопрос с кнопками выше ещё ждёт ответа."), botmod.send_reply_text.await_args.args[2])
+
+    def _live(self) -> list[str]:
+        return sorted({v["question"] for v in self.bot_data.get("ask_options", {}).values()})
+
+    async def test_held_plus_new_retires_stale_sibling(self) -> None:
+        # Ревью Opus 11.11.2026: прошлый ответ дал A и B, новый повторил A и
+        # спросил C: B гаснет, A ждёт, C новая.
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "вопрос", send_voice_reply=False)
+        self.answer = "<<ASK:Звонить маме?|да|нет>><<ASK:Новый?|да|нет>>"
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "ещё", send_voice_reply=False)
+        self.assertEqual(self._live(), ["Звонить маме?", "Новый?"])
+
+    async def test_first_card_failed_second_still_replaces_old(self) -> None:
+        self.answer = "<<ASK:Старый?|да|нет>>"
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "вопрос", send_voice_reply=False)
+        msg = self._msg()
+        ok = msg.reply_text.side_effect
+
+        def send(text, **kw):
+            if text.startswith("❓ Звонить маме?"):
+                raise RuntimeError("telegram down")
+            return ok(text, **kw)
+        msg.reply_text.side_effect = send
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(msg), self.ctx, "ещё", send_voice_reply=False)
+        self.assertEqual(self._live(), ["Бассейн в 19?"])
+
+    async def _press_in_window(self, whose: str) -> list:
+        msg = self._msg()
+        ok = msg.reply_text.side_effect
+
+        def send(text, **kw):
+            sent = ok(text, **kw)
+            if text.startswith("❓ Звонить маме?"):
+                # Нажатие, пока уходит вторая: ответ встал в очередь с номером карточки.
+                first = next(v["card"] for v in self.bot_data["ask_options"].values()
+                             if v["question"] == "Звонить маме?")
+                botmod._ask_picks_queued(self.ctx, "1").add(f"{first if whose == 'own' else 'other'}.x")
+            return sent
+        msg.reply_text.side_effect = send
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(msg), self.ctx, "вопрос", send_voice_reply=False)
+        return [c for c in msg.reply_text.call_args_list if "Бассейн" in c.args[0]]
+
+    async def test_press_first_while_second_sends_keeps_buttons(self) -> None:
+        second = await self._press_in_window("own")
+        self.assertEqual(len(second), 1)
+        self.assertIn("reply_markup", second[0].kwargs)
+        self.assertEqual(self._live(), ["Бассейн в 19?", "Звонить маме?"])
+
+    async def test_press_other_card_in_window_second_without_buttons(self) -> None:
+        second = await self._press_in_window("other")
+        self.assertEqual(len(second), 1)
+        self.assertNotIn("reply_markup", second[0].kwargs)
+        self.assertIn(_("без кнопок: ты уже ответил на прежний вопрос, ответ в очереди"), second[0].args[0])
+
+    async def test_both_questions_held_plural_note_and_log_per_question(self) -> None:
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "вопрос", send_voice_reply=False)
+        before = dict(self.bot_data["ask_options"])
+        with self.assertLogs("claude_tg_bot.bot", level="INFO") as logs:
+            await botmod._dispatch_to_claude(self._update(), self.ctx, "ещё", send_voice_reply=False)
+        self.assertEqual(self.bot_data["ask_options"], before)
+        self.assertIn(_("❓ Вопросы с кнопками выше ещё ждут ответа."), botmod.send_reply_text.await_args.args[2])
+        self.assertEqual(sum("ask repeat skipped chat=1" in line for line in logs.output), 2)
+
+    async def test_plan_mode_two_cards_no_plan_card(self) -> None:
+        self.answer = self.TWO
+        with patch.object(botmod, "_send_plan_card", AsyncMock()) as plan:
+            await botmod._dispatch_to_claude(self._update(), self.ctx, "план", send_voice_reply=False,
+                                             permission_mode="plan")
+        plan.assert_not_awaited()
+        opts = self.bot_data["ask_options"].values()
+        self.assertEqual(self._live(), ["Бассейн в 19?", "Звонить маме?"])
+        self.assertEqual({v["permission_mode"] for v in opts}, {"plan"})
+
+    async def test_two_questions_inside_deal_second_as_text(self) -> None:
+        deal = await self._morning()
+        self.answer = "Когда?<<ASK:Во сколько?|в 18|в 20>><<ASK:Кто звонит?|я|ты>>"
+        await self._tap(deal)
+        self.assertEqual(len(self._deals()), 1)
+        self.assertEqual(self._deal(deal["id"])["question"], "Во сколько?")
+        head, text = self.sent[-1]
+        self.assertIn(_("Вопрос: {question} ({options})").format(question="Кто звонит?", options="я; ты"), text)
+        self.assertNotIn("<<ASK", text)
+
+    async def test_untrusted_two_questions_as_text(self) -> None:
+        self.answer = self.TWO
+        await botmod._dispatch_to_claude(self._update(), self.ctx, "чужое", send_voice_reply=False, untrusted=True)
+        self.assertEqual(self.bot_data.get("ask_options", {}), {})
+        reply = botmod.send_reply_text.await_args.args[2]
+        for q, o in (("Звонить маме?", "да; нет"), ("Бассейн в 19?", "да; позже")):
+            self.assertIn(_("Вопрос: {question} ({options})").format(question=q, options=o), reply)
+
+
+class AskMarkersParseTests(unittest.TestCase):
+    def test_zero_one_two_three(self) -> None:
+        from claude_tg_bot.replies import extract_ask_markers
+        self.assertEqual(extract_ask_markers("просто текст"), ([], "просто текст"))
+        self.assertEqual(extract_ask_markers("А<<ASK:Q?|1|2>>"), ([("Q?", ["1", "2"])], "А"))
+        asks, rest = extract_ask_markers("<<ASK:A?|1|2>> между <<ASK:B?|3|4>> хвост <<ASK:C?|5|6>>")
+        self.assertEqual(asks, [("A?", ["1", "2"]), ("B?", ["3", "4"])])
+        self.assertEqual(rest, "между  хвост <<ASK:C?|5|6>>")
+        # С пределом один второй остаётся текстом (так было до 11.11.2026).
+        self.assertEqual(extract_ask_markers("<<ASK:A?|1|2>> <<ASK:B?|3|4>>", limit=1),
+                         ([("A?", ["1", "2"])], "<<ASK:B?|3|4>>"))
+
+    def test_same_question_twice_one_card_invalid_skipped(self) -> None:
+        from claude_tg_bot.replies import extract_ask_markers
+        asks, rest = extract_ask_markers("<<ASK:A?|1|2>><<ASK:A?|1|2>><<ASK:B?|x>><<ASK:C?|3|4>>")
+        self.assertEqual(asks, [("A?", ["1", "2"]), ("C?", ["3", "4"])])
+        self.assertEqual(rest, "<<ASK:B?|x>>")
+        # Тот же вопрос с другими вариантами не теряется: своя карточка.
+        asks, rest = extract_ask_markers("<<ASK:A?|1|2>><<ASK:A?|3|4>>")
+        self.assertEqual(asks, [("A?", ["1", "2"]), ("A?", ["3", "4"])])
+        # Повтор после предела тоже склеивается, а не остаётся сырым.
+        asks, rest = extract_ask_markers("<<ASK:A?|1|2>><<ASK:B?|3|4>><<ASK:A?|1|2>>")
+        self.assertEqual((len(asks), rest), (2, ""))
+        asks, rest = extract_ask_markers("`<<ASK:K?|1|2>>` <<ASK:D?|1|2>>")
+        self.assertEqual(asks, [("D?", ["1", "2"])])
+
+
 class EventDealFlagTests(unittest.TestCase):
     def test_flag_survives_record(self) -> None:
         from claude_tg_bot import events

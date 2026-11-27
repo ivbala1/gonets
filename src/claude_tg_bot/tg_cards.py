@@ -35,8 +35,8 @@ ASK_REPEAT_HOLD_SEC = 6 * 3600
 
 
 def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, list[str]], *,
-                 permission_mode: str, untrusted: bool, epoch: int) -> bool:
-    """Карточка этого вопроса с теми же вариантами в этом чате доставлена и
+                 permission_mode: str, untrusted: bool, epoch: int) -> str | None:
+    """Номер карточки (или None), если карточка этого вопроса с теми же вариантами в этом чате доставлена и
     ждёт ответа: не нажата, та же сессия и тот же режим рана, моложе
     ASK_REPEAT_HOLD_SEC. Нажатая карточка из реестра уходит, после рестарта
     реестр пуст: тогда вопрос шлётся как обычно. Ответ словами карточку не
@@ -52,8 +52,8 @@ def _ask_waiting(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ask: tuple[str, 
                 and bool(v.get("untrusted")) == untrusted):
             cards.setdefault(v.get("card"), []).append(v)
     now = time.time()
-    return any([v.get("answer") for v in vs] == list(options)
-               and float(vs[0].get("at") or 0) > now - ASK_REPEAT_HOLD_SEC for vs in cards.values())
+    return next((card for card, vs in cards.items() if [v.get("answer") for v in vs] == list(options)
+                 and float(vs[0].get("at") or 0) > now - ASK_REPEAT_HOLD_SEC), None)
 
 
 def _ask_picks_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> set[str]:
@@ -99,7 +99,9 @@ def _ask_answer_queued(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, ref: dict)
     уходит (_send_ask_card; случай 29.10.2026: Иван нажал и его, второй ход
     повторил первый). Снимается в конце хода, а не под замком: ран до него
     шлёт карточку уже после замка, и ход ответа успел бы его взять."""
-    queued = uuid.uuid4().hex[:8]
+    # Номер карточки первым: ран с двумя вопросами отличает нажатие своей
+    # первой карточки от чужого (bot._dispatch_to_claude_impl).
+    queued = f"{ref.get('card') or '-'}.{uuid.uuid4().hex[:8]}"
     ref["queued"] = queued
     _ask_picks_queued(ctx, chat_key).add(queued)
     try:
@@ -123,8 +125,8 @@ async def _retire_ask_cards(ctx: ContextTypes.DEFAULT_TYPE, cards: list[dict], n
 async def _send_ask_card(
     ctx: ContextTypes.DEFAULT_TYPE, update: _b.Update, chat_key: str,
     ask: tuple[str, list[str]], *, permission_mode: str, epoch: int,
-    untrusted: bool = False, own_queued: str | set[str] | None = None,
-) -> None:
+    untrusted: bool = False, own_queued: str | set[str] | None = None, keep: frozenset[str] = frozenset(),
+) -> str | None:
     """Уточняющий вопрос Claude кнопками. Выбор уходит следующим сообщением
     в ту же сессию — за рулём это тап вместо печати.
 
@@ -136,6 +138,9 @@ async def _send_ask_card(
     не запоминается: нажатие делает Иван (on_ask_pick). Эпоха снята под
     замком темы в конце рана: карточка уходит после сетевых ожиданий, и
     /reset за это время дал бы ей эпоху новой сессии (ревью /2mind 25.10.2026).
+    keep: номера карточек, которые не гасить (ждущая и уже ушедшая карточка
+    того же ответа: до двух вопросов на ответ, replies.ASK_MAX_CARDS).
+    Возвращает номер карточки в реестре или None (без кнопок, не ушла).
     """
     question, options = ask
     pending: dict[str, dict] = ctx.application.bot_data.setdefault("ask_options", {})
@@ -157,15 +162,16 @@ async def _send_ask_card(
         log.info("ask without buttons chat=%s", chat_key)
         with contextlib.suppress(Exception):
             await update.message.reply_text(f"❓ {question}\n\n{listing}\n\n({stale})")
-        return
-    # Один текущий вопрос на чат (проект Домового 22.10.2026, 1.5; случай
+        return None
+    # Один текущий ответ с вопросами на чат (проект Домового 22.10.2026, 1.5; случай
     # 29.10.2026: тот же вопрос другими словами дал две живые карточки, Иван
     # нажал обе): любая прежняя карточка этого чата гаснет, а не только с тем
     # же текстом, в том числе от фонового рана: варианты остаются в тексте,
     # ответить можно словами. Вопросы дел живут в своём реестре и не задеваются.
+    # Кроме keep: до двух живых карточек (два вопроса ответа или ждущая и новая).
     # Снимаются до отправки, без await: иначе старую нажимали, пока шла новая,
     # и обе давали ход. Сбой отправки возвращает их.
-    old = {t: v for t, v in pending.items() if v.get("chat_key") == chat_key}
+    old = {t: v for t, v in pending.items() if v.get("chat_key") == chat_key and v.get("card") not in keep}
     for t in old:
         pending.pop(t, None)
     gen = _ask_cards_changed(ctx, chat_key)
@@ -205,15 +211,18 @@ async def _send_ask_card(
             # такую не сверяет. Остаётся в реестре, старая гаснет ниже как при доставке.
             log.warning("ask card unconfirmed by Telegram, kept")
             await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
-            return
+            return card_id
         log.exception("ask card failed")
         for t, v in list(pending.items()):
             if v.get("card") == card_id:
                 pending.pop(t, None)
         if ctx.application.bot_data.get("ask_card_gen", {}).get(chat_key) == gen:
             pending.update(old)
-            return
+            return None
+        await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
+        return None
     await _retire_ask_cards(ctx, _ask_cards_of(old), _("↓ вопрос заменён новым ниже"))
+    return card_id
 
 
 ASK_TTL_SEC = 12 * 3600

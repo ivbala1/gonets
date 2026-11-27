@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from claude_tg_bot import approval, bot, replies  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
+from tests.texts import stop_word  # noqa: E402
 
 
 def _card_press(decision: str, *, card_html: str = "🟠 <b>Меняет:</b> файлы\n<code>ls</code>",
@@ -164,7 +165,7 @@ class HelpCommandTests(unittest.TestCase):
         # Устаревшее: карточка на каждую команду и «итоговый план» темы задачи.
         self.assertNotIn("destructive", text)
         self.assertNotIn("итоговый план", text)
-        self.assertIn("«стоп»", text)
+        self.assertIn(stop_word(), text)
         self.assertIn("📋", text)
 
 

@@ -276,7 +276,7 @@ class _Ctx:
     def __init__(self, state_dir: Path) -> None:
         self.at = SessionStore(state_dir / "at_jobs.json")
         self.jobs: list = []
-        queue = SimpleNamespace(run_once=lambda cb, when, data, name: self.jobs.append((when, data)))
+        queue = SimpleNamespace(run_once=lambda cb, when, data, name, **_kw: self.jobs.append((when, data)))
         self.application = SimpleNamespace(bot_data={"at_jobs": self.at}, job_queue=queue)
 
 
@@ -419,7 +419,7 @@ class DispatchTests(_Base):
         self.addCleanup(setattr, limits, "_path", None)
         self.jobs: list = []
         self.ctx.application.job_queue = SimpleNamespace(
-            run_once=lambda cb, when, data, name: self.jobs.append(data))
+            run_once=lambda cb, when, data, name, **_kw: self.jobs.append(data))
 
     async def test_reserve_defers_other_chats_before_claude_starts(self) -> None:
         now = time.time()

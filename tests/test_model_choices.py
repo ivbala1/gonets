@@ -26,7 +26,6 @@ from claude_tg_bot.bot import (  # noqa: E402
 from claude_tg_bot.config import DEFAULT_MODEL_CHOICES, load_config  # noqa: E402
 from claude_tg_bot import tasks  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
-from tests.texts import msg_re  # noqa: E402
 
 
 class ModelChoicesConfigTests(unittest.TestCase):

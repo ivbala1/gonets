@@ -11,6 +11,7 @@ import contextlib
 import io
 import logging
 import os
+import stat
 import re
 import secrets
 import time
@@ -549,18 +550,37 @@ _SECRET_FILES = (
     Path("~/.claude/.credentials.json"), Path("~/.codex/auth.json"),
     Path("~/.config/gh/hosts.yml"), Path("~/.docker/config.json"),
 )
+_SECRET_NAMES = frozenset({"auth.json", "hosts.yml"})
+
+
+class SendFile(Path):
+    """Путь файла маркера и его отпечаток при проверке: устройство, номер,
+    размер, время изменения. Перед отправкой отпечаток сверяется: файл,
+    подменённый ссылкой или переписанный другим раном между ответом и
+    отправкой, не уходит (ревью Codex 09.11.2026)."""
+
+    stamp: tuple[int, int, int, int] | None = None
+
+
+def _stamp(st: os.stat_result) -> tuple[int, int, int, int]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
 
 
 def _is_secret_file(p: Path) -> bool:
-    name = p.name
+    # Без учёта регистра: `.ENV` и `.SSH` на /mnt/c тот же файл (ревью Codex 09.11.2026).
+    name = p.name.lower()
     if name == ".env" or name.startswith(".env.") or name.endswith(".env"):
         return True
-    if name == ".credentials.json" or any(part in _SECRET_DIRS for part in p.parts):
+    if name == ".credentials.json" or any(part.lower() in _SECRET_DIRS for part in p.parts):
+        return True
+    # Копия файла входа Codex или gh под другим путём (`cp` в папку отправки):
+    # имя то же (ревью Codex 09.11.2026). `config.json` Docker по имени не
+    # ловим: так называется любой файл настроек.
+    if name in _SECRET_NAMES:
         return True
     # Ключи и учётные данные вне ~/.ssh: /tmp/id_rsa, backup.key, server.pem,
     # credentials (ревью 11.10.2026).
-    low = name.lower()
-    if low.startswith(("id_", "credentials")) or low.endswith((".key", ".pem")):
+    if name.startswith(("id_", "credentials")) or name.endswith((".key", ".pem")):
         return True
     return any(p == f.expanduser().resolve() for f in _SECRET_FILES)
 
@@ -581,26 +601,40 @@ def extract_send_file_markers(
         if refuse_reason:
             return None, refuse_reason
         try:
-            p = Path(raw.strip()).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError) as e:
+            given = Path(raw.strip()).expanduser()
+            p = given.resolve(strict=True)
+        # ValueError: нулевой знак в пути; иначе падал разбор всего ответа.
+        except (OSError, RuntimeError, ValueError) as e:
             return None, f"path unresolvable: {e}"
         if not p.is_file():
             return None, "not a regular file"
         if not any(_is_under(p, root) for root in whitelist):
             return None, "outside SEND_FILE whitelist"
-        if _is_secret_file(p):
-            return None, _("secret file (Read запрещён в claude-hook-settings.json)")
+        # И данное имя: `/tmp/auth.json` ссылкой на `store.json` тоже секрет.
+        if _is_secret_file(p) or _is_secret_file(given):
+            return None, _("secret file (учётные данные и ключи не отправляются)")
         try:
-            size = p.stat().st_size
+            st = p.stat()
         except OSError as e:
             return None, f"stat failed: {e}"
+        size = st.st_size
         if size == 0:
             return None, "empty file"
         if size > max_bytes:
             return None, f"too large ({size} bytes, max {max_bytes})"
-        return p, None
+        sf = SendFile(p)
+        sf.stamp = _stamp(st)
+        return sf, None
+
+    # Маркер в коде (блок ```, `одиночный`) это цитата формата, а не просьба
+    # отправить: так же у ASK, LOUD и прочих меток (ревью Codex 09.11.2026).
+    fences = _code_spans(text)
 
     def _sub(m: re.Match[str]) -> str:
+        line_head = text[text.rfind("\n", 0, m.start()) + 1:m.start()]
+        # Цитата «>» (пересказ прошлого ответа) тоже не просьба, как у LATER.
+        if any(start <= m.start() < end for start, end in fences) or line_head.lstrip().startswith(">"):
+            return m.group(0)
         raw = m.group(1).strip()
         p, err = _validate(raw)
         if p is not None:
@@ -627,16 +661,29 @@ _ASK_MAX_OPTIONS = 4
 # которую пользователь на кнопке не прочитал.
 _ASK_MAX_OPTION_LEN = 100
 _ASK_MAX_QUESTION_LEN = 300
-_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# Блок кода: закрывается такой же или более длинной цепочкой кавычек в той же
+# строке или в начале строки. ``` внутри строки кода (`print("```")`) блок не
+# закрывает, внешний блок из четырёх кавычек терпит тройные внутри (ревью
+# Codex 09.11.2026).
+# Цепочка открытия целая и без перебора (атомарная группа, не посреди
+# другой цепочки): на тысячах кавычек подряд разбор шёл секундами в цикле
+# событий бота (ревью Opus 09.11.2026).
+_FENCE_RE = re.compile(r"(?<!`)((?>`{3,}))(?:[^\n]*?(?<!`)\1(?!`)|.*?\n[ \t]*\1)", re.DOTALL)
 
 
-def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
-    """Первый валидный <<ASK:...>> → ((вопрос, варианты), текст без маркера).
+# Сколько вопросов одного ответа становятся карточками: утро Домового несёт
+# «Ждёт тебя» и предложение по ритму (измеренная боль 11.11.2026: второй
+# вопрос текстом Иван не увидел). Третий и дальше остаются в тексте как есть.
+ASK_MAX_CARDS = 2
+
+
+def extract_ask_markers(text: str, limit: int = ASK_MAX_CARDS) -> tuple[list[tuple[str, list[str]]], str]:
+    """До limit валидных <<ASK:...>> по порядку → ([(вопрос, варианты)], текст без них).
 
     Маркеры в коде (блок ```, одиночный `код`, незакрытый блок) игнорируются:
     Claude может цитировать файл, README или свой же формат, и это не должно
     превращаться в кнопки (одиночный код с 08.11.2026).
-    Невалидные маркеры (нет вариантов, слишком длинные) и второй маркер
+    Невалидные маркеры (нет вариантов, слишком длинные) и маркеры сверх limit
     остаются в тексте как есть — пользователь хотя бы прочитает вопрос.
     """
     # Диапазоны кода: маркеры внутри них не трогаем.
@@ -648,7 +695,7 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
     found: list[tuple[str, list[str]]] = []
 
     def _sub(m: re.Match[str]) -> str:
-        if found or _in_fence(m.start()):
+        if _in_fence(m.start()):
             return m.group(0)
         parts = [p.strip() for p in m.group(1).split("|")]
         question = parts[0] if parts else ""
@@ -660,12 +707,18 @@ def extract_ask_marker(text: str) -> tuple[tuple[str, list[str]] | None, str]:
             or any(len(o) > _ASK_MAX_OPTION_LEN for o in options)
         ):
             return m.group(0)
-        found.append((question, options[:_ASK_MAX_OPTIONS]))
+        ask = (question, options[:_ASK_MAX_OPTIONS])
+        if ask in found:
+            # Тот же вопрос с теми же вариантами дважды: одна карточка.
+            return ""
+        if len(found) >= limit:
+            return m.group(0)
+        found.append(ask)
         return ""
 
     cleaned = _ASK_RE.sub(_sub, text)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return (found[0] if found else None), cleaned
+    return found, cleaned
 
 
 _INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
@@ -876,6 +929,19 @@ def _send_file_timeout(size: int) -> int:
     return min(_SEND_FILE_TIMEOUT_MAX, max(_SEND_FILE_TIMEOUT, 60 + size // (256 * 1024)))
 
 
+def _same_file(fpath: Path) -> bool:
+    """Отпечаток SendFile совпал, путь не ведёт через ссылку. Простой Path
+    (без отпечатка) проверяется только на обычный файл."""
+    try:
+        st = os.stat(fpath, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or fpath.resolve(strict=True) != fpath:
+            return False
+    except (OSError, RuntimeError):
+        return False
+    stamp = getattr(fpath, "stamp", None)
+    return stamp is None or stamp == _stamp(st)
+
+
 async def send_files(update: Update, files: list[Path], *, local: bool = False,
                      max_bytes: int = _SEND_FILE_MAX_BYTES) -> None:
     """local: свой сервер Bot API: файл уходит ему путём (local_mode PTB шлёт
@@ -885,6 +951,11 @@ async def send_files(update: Update, files: list[Path], *, local: bool = False,
     msg = update.message
     for fpath in files:
         try:
+            if not _same_file(fpath):
+                log.warning("SEND_FILE skipped %s: changed after check", fpath)
+                await msg.reply_text(_("⚠️ SEND_FILE({raw}) пропущен: {error}").format(
+                    raw=fpath, error=_("файл изменился или пропал после проверки ответа, не отправлен")))
+                continue
             size = fpath.stat().st_size
             if size > max_bytes:
                 log.warning("SEND_FILE skipped %s: grew to %d bytes", fpath, size)
@@ -897,9 +968,20 @@ async def send_files(update: Update, files: list[Path], *, local: bool = False,
                 await msg.reply_document(document=fpath, filename=fpath.name,
                                          read_timeout=wait, write_timeout=wait)
             else:
+                # Байты читаются целиком (в облако до 50 МБ) и сверяются с
+                # отпечатком после чтения: файл, переписанный до или во время
+                # чтения, не уйдёт (ревью Opus и Codex 09.11.2026).
                 with fpath.open("rb") as fh:
-                    await msg.reply_document(document=fh, filename=fpath.name,
-                                             read_timeout=wait, write_timeout=wait)
+                    data = fh.read(max_bytes + 1)  # не больше предела: проверка ниже
+                    after = _stamp(os.fstat(fh.fileno()))
+                stamp = getattr(fpath, "stamp", None)
+                if (stamp is not None and after != stamp) or len(data) > max_bytes:
+                    log.warning("SEND_FILE skipped %s: changed before read", fpath)
+                    await msg.reply_text(_("⚠️ SEND_FILE({raw}) пропущен: {error}").format(
+                        raw=fpath, error=_("файл изменился или пропал после проверки ответа, не отправлен")))
+                    continue
+                await msg.reply_document(document=data, filename=fpath.name,
+                                         read_timeout=wait, write_timeout=wait)
             log.info("SEND_FILE sent: %s (%d bytes)", fpath, size)
         except Exception as e:
             log.exception("SEND_FILE failed for %s", fpath)

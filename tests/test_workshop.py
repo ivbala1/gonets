@@ -101,7 +101,7 @@ class WorkshopRestartTests(unittest.IsolatedAsyncioTestCase):
         lock = asyncio.Lock()
         await lock.acquire()
         app = SimpleNamespace(bot_data={"cfg": cfg, "chat_locks": {WS: lock}, "active_work": 0})
-        self.assertTrue(botmod._workshop_busy(app))
+        self.assertTrue(botmod._background_busy(app))
         app.bot_data["draining_keys"] = {WS}
         impl = AsyncMock(return_value=None)
         orig = botmod._dispatch_to_claude_impl
@@ -120,7 +120,7 @@ class WorkshopRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(refused)
         self.assertEqual(impl.await_count, 1)  # прошла только личка
         lock.release()
-        self.assertFalse(botmod._workshop_busy(app))
+        self.assertFalse(botmod._background_busy(app))
 
 
 class WorkshopCardTests(unittest.TestCase):

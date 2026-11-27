@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -192,7 +193,7 @@ class UntrustedSendFileTests(_Base):
         with tempfile.NamedTemporaryFile(dir="/tmp", suffix=".pdf") as f:
             f.write(b"%PDF")
             f.flush()
-            self.answer = f"Вот:\n```\n<<SEND_FILE:{f.name}>>\n```"
+            self.answer = f"Вот:\n<<SEND_FILE:{f.name}>>"
             with patch.object(botmod, "send_file_whitelist", lambda cfg: [Path("/tmp").resolve()]):
                 await self.dispatch("сводка", unattended=True, untrusted=True)
                 self.assertEqual(self.send_files.await_args.args[1], [])
@@ -1211,7 +1212,6 @@ class PhotoComposeTests(_Base):
         return _msg(photo=[ps], document=None)
 
     async def test_compose_cancel_during_get_file_drops_photo(self) -> None:
-        ck = str(GROUP)
         self.cfg.photo_max_size_bytes = 0
         await botmod.on_compose(_update(_msg("/compose")), self.ctx)
 
@@ -1240,7 +1240,7 @@ class SecretNameTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/tmp") as d:
             root = Path(d).resolve()
             names = ("id_rsa", "id_ed25519", "backup.key", "server.pem",
-                     "credentials", "credentials.json", "Server.KEY")
+                     "credentials", "credentials.json", "Server.KEY", "auth.json", "hosts.yml", "Auth.JSON")
             for name in (*names, "report.pdf"):
                 (root / name).write_text("x")
             text = "".join(f"<<SEND_FILE:{root / n}>>" for n in (*names, "report.pdf"))
@@ -1408,7 +1408,11 @@ class TurnPackTests(_Base):
         # С 01.11.2026 (queue2) пачка не теряется, а уходит после рестарта.
         for joined in (two, three):
             joined.reply_text.assert_awaited_once()
-            self.assertIn("уйдёт", str(joined.reply_text.await_args.args[0]))
+            told = str(joined.reply_text.await_args.args[0])
+            self.assertTrue(any(re.search(rx, told) for rx in (
+                msg_re("♻️ бот ждёт конца работы для перезапуска: "
+                       "сообщение уйдёт в Claude сразу после него (отмена: /cancel)"),
+                msg_re("♻️ и это уйдёт после перезапуска, всего {count} сообщ."))), told)
         import json
         [entry] = self.bot_data["at_jobs"].data.values()
         prompt = json.loads(entry["v"])["prompt"]

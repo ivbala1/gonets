@@ -23,9 +23,6 @@ from tests.texts import msg_re  # noqa: E402
 
 NOW = datetime(2026, 10, 13, 10, 0, tzinfo=timezone(timedelta(hours=4)))
 SVOD_LIB = Path.home() / "src" / "svod" / "engine" / "lib"
-PROJECTS = [{"key": "bot", "name": "Бот", "path": "~/src/claude-tg-bot", "about": "мост"},
-            {"key": "svod", "name": "Свод", "path": "~/src/svod", "about": "память"},
-            {"key": "immich", "name": "Immich", "path": "~/src/personal/Immich", "about": "фото"}]
 
 
 # msgid промптов из исходника: сверка через перевод на языке прогона
@@ -321,7 +318,6 @@ class FenceTests(unittest.TestCase):
         probe = _resolve_pin("Новость про Beta Corp", "")
         if probe is None or probe[0] == "personal":
             self.skipTest("Свода нет или алиас заказчика не распознаётся")
-        projects = json.loads(news_backlog.BACKLOGS_FILE.read_text(encoding="utf-8"))
         intro = tasks.intro_prompt(_item(title="Новость про Beta Corp"))
         self.assertEqual(_resolve_pin(intro, tasks.SCOPE_NOTE)[0], "personal")
         plan = "1. Проверить бэкап Гамма\n2. Ответить сводкой"
@@ -646,7 +642,6 @@ class CommandTaskTests(unittest.TestCase):
         if probe is None or probe[0] == "personal":
             self.skipTest("Свода нет или алиас заказчика не распознаётся")
         client = probe[0]
-        projects = json.loads(news_backlog.BACKLOGS_FILE.read_text(encoding="utf-8"))
         intro = tasks.command_intro_prompt("поправь бэкап")
         self.assertEqual(_resolve_pin(intro, tasks.scope_note("Альфа"))[0], client)
         self.assertEqual(_resolve_pin(intro, tasks.scope_note(""))[0], "personal")
@@ -684,7 +679,6 @@ class CommandTaskTests(unittest.TestCase):
         if probe is None or probe[0] == "personal":
             self.skipTest("Свода нет или алиас заказчика не распознаётся")
         client = probe[0]
-        projects = json.loads(news_backlog.BACKLOGS_FILE.read_text(encoding="utf-8"))
         plan = "1. Поправить расписание на gamma.local\n2. Ответить сводкой"
         for words, expected in (("поправь расписание бэкапа на сервере Гаммаа", client),
                                 ("поправь расписание бэкапа", "personal")):
@@ -881,7 +875,6 @@ class CommandTaskTests(unittest.TestCase):
         if probe is None or probe[0] == "personal":
             self.skipTest("Свода нет или алиас заказчика не распознаётся")
         client = probe[0]
-        projects = json.loads(news_backlog.BACKLOGS_FILE.read_text(encoding="utf-8"))
         tail = "\n```\nwbadmin: error 0x80070070"
         for words, plan, want in (
                 ("поправь бэкап на сервере Гаммаа, сейчас падает так:" + tail,
@@ -907,7 +900,6 @@ class CommandTaskTests(unittest.TestCase):
         probe = _resolve_pin("x", "Гамма")
         if probe is None or probe[0] == "personal":
             self.skipTest("Свода нет или алиас заказчика не распознаётся")
-        projects = json.loads(news_backlog.BACKLOGS_FILE.read_text(encoding="utf-8"))
         plan = "1. Поправить расписание на gamma.local"
         for words in ("поправь бэкап, в терминале так:\nuser@pc:~$ ```\nwbadmin: error",
                       "поправь бэкап, в терминале так:\n```\nuser@pc:~$ ```\nwbadmin: error\n```"):
@@ -952,21 +944,6 @@ def _put(data: dict, tid: str, **fields) -> dict:
     task.update(fields)
     data[tid] = task
     return task
-
-
-def _queue_data() -> dict:
-    """Реестр для очереди: A выполняется в «Бот», B открыта в Immich, C и D
-    ждут в «Бот» (D раньше), E открыта без репозитория."""
-    data: dict = {}
-    for tid, status, project, queued_at in (
-            ("A", "running", "bot", None), ("B", "open", "immich", None),
-            ("C", "queued", "bot", "2026-10-13T10:00:02.000000+04:00"),
-            ("D", "queued", "bot", "2026-10-13T10:00:01.000000+04:00"),
-            ("E", "open", tasks.NO_REPO, None)):
-        _, task = tasks.reserve(data, tid, _item(title=f"задача {tid}"), -100, NOW)
-        task.update(status=status, project=project, queued_at=queued_at, thread_id=70 + len(data),
-                    plan="план", plan_sha=tasks.plan_sha("план"))
-    return data
 
 
 class CallbackTests(unittest.TestCase):
@@ -1176,11 +1153,6 @@ def _repo(d: str) -> Path:
     for k, v in (("user.name", "t"), ("user.email", "t@t"), ("commit.gpgsign", "false")):
         _git(repo, "config", k, v)
     return repo
-
-
-def _commit(repo: Path, msg: str) -> str:
-    _git(repo, "commit", "-q", "--allow-empty", "-m", msg)
-    return _git(repo, "rev-parse", "HEAD")
 
 
 class SummaryTests(unittest.TestCase):

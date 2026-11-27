@@ -8,8 +8,9 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import dotenv_values, load_dotenv
@@ -111,6 +112,26 @@ def local_zone() -> ZoneInfo:
         return ZoneInfo(name or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
         return ZoneInfo("UTC")
+
+
+def zone_mismatch() -> str | None:
+    """Предупреждение, если local_zone() молча взял UTC: имя пояса негодное
+    (опечатка в CLAUDE_TG_BOT_TZ или TZ) или его нет (/etc/localtime копия
+    файла: контейнеры, часть WSL), а система живёт в другом поясе. Узнавать
+    пояс по копии не учим: на ПК и маке ссылка (BACKLOG 07.11.2026)."""
+    name = os.environ.get(TZ_ENV, "").strip() or _system_zone_name()
+    if name:
+        try:
+            ZoneInfo(name)
+            return None
+        except (ZoneInfoNotFoundError, ValueError):
+            return f"unknown time zone {name!r}: bot time is UTC; set {TZ_ENV} in .env (e.g. Europe/Berlin)"
+    offset = datetime.now(timezone.utc).astimezone().utcoffset()
+    if not offset:
+        return None
+    hours = f"{offset.total_seconds() / 3600:+g}"
+    return (f"system time zone has no name: bot time is UTC, system time is UTC{hours}; "
+            f"set {TZ_ENV} in .env (e.g. Europe/Berlin)")
 
 
 def now_local() -> datetime:
@@ -577,6 +598,9 @@ class Config:
     # Порт сервера Telegram на loopback: Bash, который туда ходит, идёт карточкой
     # (serious.py, отправка мимо проверки). 0: проверки нет.
     telegram_mcp_port: int = 8770
+    # Серверы заказчиков (CLIENT_HOSTS: имена, IP, суффиксы с точкой): Bash с
+    # таким хостом и необратимым словом идёт карточкой (serious.py). Пусто: выключено.
+    client_hosts: tuple[str, ...] = ()
     # Группа и тема «Новостей» (NEWS_TG_CHAT_ID, NEWS_TG_THREAD_ID): пометка
     # агенту в теме и группа тем задач. None: не задано или не число.
     news_tg_chat_id: int | None = None
@@ -587,10 +611,37 @@ class Config:
     workshop_model: str = "opus"
     workshop_effort: str = "high"
     workshop_scope: str = ""
+    # Тема откликов (OTKLIK_CHAT_KEY, шаг 1 решения 11.11.2026): ✅ на отклике
+    # отправляется ею, своим замком и свежей сессией, а не в личке. Модель и
+    # усилие отдельные: отправка по готовому тексту это механика. Пусто: ✅ как
+    # раньше, в чате, где отклик готовили.
+    otklik_chat_key: str = ""
+    otklik_model: str = "sonnet"
+    otklik_effort: str = "medium"
+
     @property
     def primary_chat_id(self) -> int:
         """Стабильно (min) выбранный user_id для сервисных уведомлений/approvals."""
         return min(self.allowed_user_ids)
+
+
+def _topic_key(raw: str) -> str | None:
+    """Ключ темы «<chat>:<thread>» в той форме, что даёт бот (bot._chat_key:
+    числа без нулей впереди), иначе ключ не совпал бы с ключом рана и `take`
+    отказывал бы (ревью Codex 11.11.2026). Пусто: ""; не того вида: None."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if not re.fullmatch(r"-?\d+:\d+", raw):
+        return None
+    chat, _sep, thread = raw.partition(":")
+    return f"{int(chat)}:{int(thread)}"
+
+
+def background_chat_keys(cfg: Any) -> frozenset[str]:
+    """Фоновые темы бота: мастерская и отклики. Ивана в них нет: карточки,
+    передача экрана и итог показываются в личке. getattr: в тестах cfg без полей."""
+    return frozenset(k for k in (getattr(cfg, "workshop_chat_key", ""), getattr(cfg, "otklik_chat_key", "")) if k)
 
 
 def bridge_url(cfg: Config, path: str) -> str:
@@ -972,12 +1023,18 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
                     file=sys.stderr,
                 )
     codex_prefix = os.environ.get("CODEX_PREFIX", "gpt:").strip() or "gpt:"
-    workshop_chat_key = os.environ.get("WORKSHOP_CHAT_KEY", "").strip()
+    workshop_chat_key = _topic_key(os.environ.get("WORKSHOP_CHAT_KEY", ""))
     plan_cards = _bool_env("PLAN_CARDS", False)
-    if workshop_chat_key and not re.fullmatch(r"-?\d+:\d+", workshop_chat_key):
-        print(f"[config] WARNING: WORKSHOP_CHAT_KEY={workshop_chat_key!r} не вида <chat>:<thread>, мастерская выключена",
-              file=sys.stderr)
+    if workshop_chat_key is None:
+        print(f"[config] WARNING: WORKSHOP_CHAT_KEY={os.environ.get('WORKSHOP_CHAT_KEY')!r} не вида "
+              "<chat>:<thread>, мастерская выключена", file=sys.stderr)
         workshop_chat_key = ""
+    otklik_chat_key = _topic_key(os.environ.get("OTKLIK_CHAT_KEY", "")) or ""
+    if os.environ.get("OTKLIK_CHAT_KEY", "").strip() and (not otklik_chat_key or otklik_chat_key == workshop_chat_key):
+        # Своя тема обязательна: в мастерской отклики ждали бы поисков.
+        print(f"[config] WARNING: OTKLIK_CHAT_KEY={os.environ.get('OTKLIK_CHAT_KEY')!r} не вида <chat>:<thread> или совпадает "
+              "с мастерской, тема откликов выключена", file=sys.stderr)
+        otklik_chat_key = ""
     limit_reserve_chats = frozenset(
         k.strip() for k in os.environ.get("CLAUDE_TG_LIMIT_RESERVE_CHATS", "").split(",") if k.strip()
     )
@@ -1053,6 +1110,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         telegram_mcp_unit=Path(unit).expanduser() if (unit := os.environ.get(
             "TELEGRAM_MCP_UNIT", "~/.config/systemd/user/telegram-mcp.service").strip()) else None,
         telegram_mcp_port=_int_env("TELEGRAM_MCP_PORT", 8770),
+        client_hosts=tuple(h.lower() for h in re.split(r"[\s,]+", os.environ.get("CLIENT_HOSTS", "")) if h),
         news_tg_chat_id=_int_env("NEWS_TG_CHAT_ID", None),
         news_tg_thread_id=_int_env("NEWS_TG_THREAD_ID", None),
         telegram_bot_api_url=bot_api_url,
@@ -1066,4 +1124,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         workshop_model=os.environ.get("WORKSHOP_MODEL", "opus").strip(),
         workshop_effort=os.environ.get("WORKSHOP_EFFORT", "high").strip(),
         workshop_scope=os.environ.get("WORKSHOP_SCOPE", "").strip(),
+        otklik_chat_key=otklik_chat_key,
+        otklik_model=os.environ.get("OTKLIK_MODEL", "sonnet").strip(),
+        otklik_effort=os.environ.get("OTKLIK_EFFORT", "medium").strip(),
     )

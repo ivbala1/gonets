@@ -107,15 +107,57 @@ class RecordTests(unittest.TestCase):
             with patch.dict("os.environ", env), contextlib.redirect_stderr(err):
                 with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": ""}):
                     self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
-                for _i in range(3):
+                for _i in range(handoff.RATE_LIMIT - 1):
                     _open_record(base, chat_key="5")
+                # Решение Ивана 27.10.2026: 15 в час. Четырнадцать за час: отказа
+                # по пределу ещё нет, дело доходит до следующей проверки.
+                with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": "s2"}), \
+                        patch.object(handoff, "stream_port", return_value=1), \
+                        patch.object(handoff, "session_busy", return_value=True), \
+                        patch.object(handoff, "_bot_api") as api:
+                    self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
+                    api.assert_not_called()
+                self.assertEqual(handoff.RATE_LIMIT, 15)
+                self.assertNotIn("15", err.getvalue())
+                self.assertIn(_("handoff: у этой сессии уже открыта передача, дождись её итога"), err.getvalue())
+                _open_record(base, chat_key="5")
                 with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": "s2"}), \
                         patch.object(handoff, "stream_port", return_value=1), \
                         patch.object(handoff, "_bot_api") as api:
                     self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
                     api.assert_not_called()
             self.assertIn(_("handoff: за час уже {n} передачи в этот чат, больше нельзя: остановись и скажи Ивану").format(
-                n=3), err.getvalue())
+                n=15), err.getvalue())
+
+    def test_image_read_capped_and_unknown_type_not_opened(self) -> None:
+        # Не больше IMAGE_CAP плюс байт, а файл без расширения картинки не открывается
+        # (канал без писателя повесил бы open; ревью 11.11.2026).
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / "cap.png").write_bytes(b"x" * 10)
+            (base / "cap.pipe").write_bytes(b"x")
+            sizes: list = []
+            real_open = Path.open
+
+            def spy(self, *a, **k):
+                fh = real_open(self, *a, **k)
+                sizes.append(self.name)
+                real_read = fh.read
+                fh.read = lambda n=-1: (sizes.append(n), real_read(n))[1]
+                return fh
+
+            env = {"SCREEN_PUBLIC_BASE": "http://h:8765", "CLAUDE_TG_CHAT_KEY": "5",
+                   "AGENT_BROWSER_SESSION": "s2"}
+            err = io.StringIO()
+            with patch.dict("os.environ", env), contextlib.redirect_stderr(err), \
+                    patch.object(handoff, "IMAGE_CAP", 4), patch.object(Path, "open", spy), \
+                    patch.object(handoff, "_bot_api") as api:
+                for name in ("cap.png", "cap.pipe"):
+                    args = argparse.Namespace(reason="капча", site="hh.ru", quiet=False,
+                                              image=str(base / name), region="")
+                    self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
+                api.assert_not_called()
+            self.assertEqual(sizes, ["cap.png", 5])
 
     def test_one_open_handoff_per_session(self) -> None:
         with tempfile.TemporaryDirectory() as d:

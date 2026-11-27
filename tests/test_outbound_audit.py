@@ -72,7 +72,7 @@ class LongMailCardTests(_MailEnv):
         self.assertIn(_("📤 <b>письмо от твоего имени</b> (Gmail, mailsend)"), text)
         self.assertIn("hr@bigcompany-example.com", text)
         self.assertIn("Здравствуйте!", text)
-        self.assertIn(_("прочитай целиком по 📄 до ✅"), text)
+        self.assertIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
 
     def test_recipient_at_end_of_long_command_is_on_card(self) -> None:
         subject = "Отклик hr@good-example.com " * 120
@@ -95,7 +95,7 @@ class LongOutboundCardTests(unittest.TestCase):
         self.assertLessEqual(len(text), approval.CARD_TEXT_CAP + 150)
         self.assertIn(_("📤 <b>отправка от твоего имени</b>"), text)
         self.assertIn("attacker@evil-example.com", text)
-        self.assertIn(_("прочитай целиком по 📄 до ✅"), text)
+        self.assertIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
 
 
 class _DropAfterDataSMTP(threading.Thread):

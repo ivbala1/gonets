@@ -96,7 +96,6 @@ def schedule_later(app: Application, chat_key: str, chat_id: int, thread_id: int
     if pending >= LATER_MAX_PENDING:
         return None, _("⏰ «позже» не поставлено: в теме уже ждут {n} проверки агента (/at)").format(
             n=LATER_MAX_PENDING)
-    jid = uuid.uuid4().hex[:6]
     fire_at = time.time() + delay
     prompt = _("Повторная проверка, которую ты назначил себе {when}: «{about}». Проверь и "
                "коротко доложи; ничего не меняй: нужно действие, спроси Ивана маркером "
@@ -109,12 +108,9 @@ def schedule_later(app: Application, chat_key: str, chat_id: int, thread_id: int
     if silent:
         payload["silent"] = True
     try:
-        store.set(jid, json.dumps(payload, ensure_ascii=False))
-        _b._schedule_at_job(app, jid, payload)
+        jid = at_put(app, payload)
     except Exception:
         log.exception("later: scheduling failed chat=%s", chat_key)
-        with contextlib.suppress(Exception):
-            store.remove(jid)
         return None, _("⏰ «позже» не поставлено: сбой записи задания, смотри журнал бота")
     log.info("later: scheduled chat=%s jid=%s hops=%d in=%.0fs", chat_key, jid, hops, delay)
     when = datetime.fromtimestamp(fire_at, local_zone()).strftime("%d.%m %H:%M")
@@ -138,12 +134,18 @@ async def _at_fire(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _at_fire_running(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
     store: SessionStore = ctx.application.bot_data["at_jobs"]
+    if data.get("otklik"):
+        # Отклик, одобренный заранее на срок: свой ран отправки (tg_otklik).
+        await _b.otklik_at_fire(ctx, data)
+        return
     prompt = data["prompt"]
     expires_at = data.get("expires_at")
     if expires_at is not None and float(expires_at) <= time.time():
-        # Перенесённое лимитом событие со сроком: окно прошло, не запускать.
+        # Перенесённое лимитом событие со сроком: окно прошло, не запускать,
+        # но и не молча: строка в чат события (из фоновой темы в личку).
         log.warning("at job %s expired (event %s), dropped", data["jid"], data.get("event_id"))
         store.remove(data["jid"])
+        await _at_expired_note(ctx, data)
         return
     token = _b._SILENT_RUN.set(bool(data.get("silent")))
     deal_token = _b._DEAL_ASKS.set(data.get("deal_asks") is True)
@@ -156,6 +158,21 @@ async def _at_fire_running(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
             _b._LATER_HOPS.reset(hops_token)
         _b._DEAL_ASKS.reset(deal_token)
         _b._SILENT_RUN.reset(token)
+
+
+async def _at_expired_note(ctx: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
+    """Отложенное лимитом событие выброшено по сроку: та же строка «устарело»,
+    что у события, ждавшего очереди (tg_events._event_expired_note)."""
+    from . import events
+    from .tg_events import _event_expired_note
+    cfg: Config = ctx.application.bot_data["cfg"]
+    rec = None
+    with contextlib.suppress(Exception):
+        rec = events.load(events.event_dir(cfg.state_dir), str(data.get("event_id") or ""))
+    if not rec:
+        rec = {"chat_id": data["chat_id"], "thread_id": data.get("thread_id"), "source": "/at",
+               "title": str(data.get("prompt") or "")[:80]}
+    await _event_expired_note(ctx.application, rec)
 
 
 async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: SessionStore,
@@ -215,7 +232,10 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
         bd = ctx.application.bot_data
         if not rejected and not bd.get("stopping") and not (drained and raised):
             # Ран не понадобился (идёт вход, ошибка до старта): задание отработано.
-            store.remove(data["jid"])
+            waited = store.remove(data["jid"])
+            if waited and not raised and expires_at is not None and float(expires_at) <= time.time():
+                # Срок события прошёл, пока задание ждало занятую тему: не молча.
+                await _at_expired_note(ctx, data)
         elif rejected and not bd.get("stopping") and not bd.get("draining") \
                 and data["jid"] in store.data:
             # Заявку отменили, пока шёл отказ: отмена пропустила это задание
@@ -226,9 +246,27 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
 
 def _schedule_at_job(application: Application, jid: str, payload: dict) -> None:
     delay = max(1.0, float(payload["fire_at"]) - time.time())
+    # Без срока опоздания: у APScheduler он по умолчанию 1 с, и задание,
+    # проспавшее срок (сон ПК, занятый цикл), выбрасывалось молча до
+    # перезапуска. Поздний запуск решают сами задания (expires_at, окно отклика).
     application.job_queue.run_once(
         _at_fire, when=delay, data={"jid": jid, **payload}, name=f"at:{jid}",
+        job_kwargs={"misfire_grace_time": None},
     )
+
+
+def at_put(app: Application, payload: dict) -> str:
+    """Задание /at на диск и в очередь; сбой снимает запись и поднимается дальше."""
+    store = app.bot_data["at_jobs"]
+    jid = uuid.uuid4().hex[:6]
+    try:
+        store.set(jid, json.dumps(payload, ensure_ascii=False))
+        _b._schedule_at_job(app, jid, payload)
+    except Exception:
+        with contextlib.suppress(Exception):
+            store.remove(jid)
+        raise
+    return jid
 
 
 async def on_at(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,9 +310,15 @@ async def on_at(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text(_("Формат: /at cancel <id>"))
             return
         jid = ctx.args[1].strip()
+        entry = store.data.get(jid)
         for j in ctx.application.job_queue.get_jobs_by_name(f"at:{jid}"):
             j.schedule_removal()
         removed = store.remove(jid)
+        if removed and entry:
+            # Отправка отклика в срок: отмена задания это ✋, карточка снова с
+            # кнопками. До ответа в чат: пока он идёт, освободившаяся тема
+            # успела бы отдать одобренное агенту.
+            await _b.otklik_at_cancelled(ctx, entry.get("v", ""))
         await msg.reply_text(_("🗑 отменено.") if removed else _("⚠️ id {jid} не найден.").format(jid=jid))
         return
 
@@ -284,14 +328,12 @@ async def on_at(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if delay is None or not prompt:
         await msg.reply_text(_("Формат: /at 45m <текст> | /at 2h <текст> | /at 14:30 <текст>"))
         return
-    jid = uuid.uuid4().hex[:6]
     fire_at = time.time() + delay
     payload = {
         "chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
         "fire_at": fire_at, "prompt": prompt,
     }
-    store.set(jid, json.dumps(payload, ensure_ascii=False))
-    _b._schedule_at_job(ctx.application, jid, payload)
+    jid = at_put(ctx.application, payload)
     when = datetime.fromtimestamp(fire_at, local_zone()).strftime("%d.%m %H:%M:%S")
     await msg.reply_text(_("⏰ ок, {when}: «{prompt}» (отмена: /at cancel {jid})").format(when=when, prompt=prompt[:80], jid=jid))
 

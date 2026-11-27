@@ -18,9 +18,27 @@
 Так исключены два захвата одной записи; окно неизвестного исхода самой
 внешней отправки остаётся, его закрывает проверка канала.
 
+Одно касание (решение Ивана 12.11.2026). Запись с точным адресатом (`--tg`
+или `--mail` с темой и ответом на письмо) и файлом (`--attach`: имя и sha256)
+держит их в хеше кнопки. Ран, взявший её командой `take`, отправляет ровно её
+без второй карточки: бот сверяет вызов отправки с записью (`grant`) и пускает
+один раз на попытку. Другой текст, адресат или файл идут обычной карточкой;
+то же тому же после отправки получает отказ. Карточки до 08:30 приходят без
+звука: их кладут поиск и подготовка, когда Иван может спать.
+
+Отправка в срок (решение Ивана 27.11.2026, проект Свода «поручения на время»).
+Запись одного касания с `--at` держит время отправки в хеше и на карточке; ✅
+на ней до срока не будит ран, а ставит запуск в очередь `/at` бота (переживает
+перезапуск, recover такую запись не сбрасывает). `take` и `grant` отказывают
+раньше срока и позже AT_WINDOW_SEC после него; пачка «✅ Все N» такие записи
+не берёт, правка по ✏️ без своего `--at` наследует время заменённой.
+
 Usage (агент, из корня репозитория бота):
     .venv/bin/python -m claude_tg_bot.otklik new --title "Acme, Senior IT Ops" \\
         --channel "письмо на hr@example.com, PDF резюме EN" --file текст.txt [--replaces <id>]
+    ... new ... --tg @hr_example [--attach резюме.pdf]       # одно касание, Telegram
+    ... new ... --mail hr@example.com --subject "DevOps" [--reply-to <Message-ID>] [--attach резюме.pdf]
+    ... new ... --mail hr@example.com --subject "DevOps" --at "2026-11-28 09:30"  # уйдёт в срок по ✅
     .venv/bin/python -m claude_tg_bot.otklik take --id <id>     # текст и номер попытки, один раз
     .venv/bin/python -m claude_tg_bot.otklik show --id <id> --take <попытка>  # перечитать
     .venv/bin/python -m claude_tg_bot.otklik done --id <id> --take <попытка> --status sent --note "ссылка"
@@ -38,6 +56,7 @@ import os
 import re
 import stat
 import sys
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
@@ -69,6 +88,13 @@ REPLACE_FROM = ("pending", "edit", "skipped")
 PICK_FROM = {"o": ("pending",), "e": ("pending",), "s": ("pending",),
              "c": ("approved",), "r": ("failed", "unknown", "edit")}
 NOTE_CAP = 200
+# Поля отправки одного касания: входят в хеш кнопки, если заданы (at: время отправки).
+SEND_FIELDS = ("via", "to", "subject", "reply_to", "attach", "at")
+# Отправка в срок: окно после времени, позже не уходит; дальше AT_MAX_SEC не ставится.
+AT_WINDOW_SEC = 2 * 3600
+AT_MAX_SEC = 14 * 86400
+# Карточки раньше утреннего сообщения Домового (08:30) без звука.
+QUIET_UNTIL = (8, 30)
 # Запас на строку статуса: сообщение потом правится, а лимит Telegram 4096.
 NEW_TEXT_CAP = tg_api.TEXT_LIMIT - 300
 STATUS_LINES = {
@@ -93,6 +119,10 @@ class Refused(Exception):
     """Переход не разрешён: запись не в том статусе, не та попытка или кнопка."""
 
 
+class Late(Refused):
+    """✅ на записи, чей срок отправки прошёл: текст для Ивана в самом исключении."""
+
+
 def otklik_dir(state_dir: Path) -> Path:
     return state_dir / OTKLIK_DIRNAME
 
@@ -103,7 +133,13 @@ def text_sha(text: str, channel: str = "") -> str:
 
 
 def record_sha(rec: dict[str, Any]) -> str:
-    return text_sha(rec.get("text", ""), rec.get("channel", ""))
+    """Хеш записи. Поля отправки (адресат, тема, файл) дописываются к каналу,
+    только если заданы: хеш записей до 12.11.2026 прежний."""
+    extra = {k: rec[k] for k in SEND_FIELDS if rec.get(k)}
+    channel = rec.get("channel", "")
+    if extra:
+        channel += "\0" + json.dumps(extra, ensure_ascii=False, sort_keys=True)
+    return text_sha(rec.get("text", ""), channel)
 
 
 def gen_of(rec: dict[str, Any]) -> int:
@@ -114,6 +150,13 @@ def source_of(rec: dict[str, Any]) -> str:
     """Чат, где отклик готовили: только его ран отправляет. У записей до
     22.10.2026 источника нет, их готовила личка, куда пришло сообщение."""
     return str(rec.get("source") or rec.get("chat_id"))
+
+
+def sender_of(rec: dict[str, Any]) -> str:
+    """Чат, чей ран отправляет одобренное: тема откликов, которую бот ставит
+    по ✅ и «✅ Все N» (pick с route, шаг 1 решения 11.11.2026), иначе источник.
+    Источник не меняется: правка по ✏️ и сборка пачки (`otklik all`) идут по нему."""
+    return str(rec.get("sender") or source_of(rec))
 
 
 def record_path(base: Path, oid: str) -> Path:
@@ -198,14 +241,216 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def new_record(title: str, channel: str, text: str) -> dict[str, Any]:
+def new_record(title: str, channel: str, text: str, send: dict[str, Any] | None = None) -> dict[str, Any]:
+    """send: поля одного касания (SEND_FIELDS), пустые не пишутся."""
     now = _now()
-    return {
+    rec = {
         "id": uuid.uuid4().hex[:12], "title": title.strip(), "channel": channel.strip(),
-        "text": text, "sha": text_sha(text, channel.strip()), "status": "pending", "note": "",
+        "text": text, "status": "pending", "note": "",
         "chat_id": None, "message_id": None, "created": now, "updated": now,
         "gen": 0, "source": None, "attempt": None,
     }
+    rec.update({k: v for k, v in (send or {}).items() if k in SEND_FIELDS and v})
+    rec["sha"] = record_sha(rec)
+    return rec
+
+
+def _send_lines(rec: dict[str, Any]) -> list[str]:
+    """Адресат, тема и файл одного касания строками сообщения."""
+    out = []
+    if rec.get("via") == "telegram":
+        out.append(_("Кому: Telegram {to}").format(to=rec.get("to")))
+    elif rec.get("via") == "mail":
+        out.append(_("Кому: письмо {to}").format(to=rec.get("to")))
+        out.append(_("Тема: {subject}").format(subject=rec.get("subject") or ""))
+        if rec.get("reply_to"):
+            out.append(_("Ответ на письмо: {id}").format(id=rec["reply_to"]))
+    att = rec.get("attach") or {}
+    if att:
+        out.append(_("Файл: {name}, {size} байт, sha256 {sha}").format(
+            name=att.get("name"), size=att.get("size"), sha=str(att.get("sha256"))[:16]))
+    if rec.get("at") and not at_expired(rec):  # у просроченного срок в строке ⌛
+        out.append(_("Уйдёт {when}, по ✅ без второго вопроса").format(when=at_label(rec)))
+    return out
+
+
+def at_ts(rec: dict[str, Any]) -> float | None:
+    """Время отправки записи (секунды) или None: без него или не читается."""
+    raw = rec.get("at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        t = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return t.timestamp() if t.tzinfo else None
+
+
+def at_label(rec: dict[str, Any]) -> str:
+    """Время отправки для Ивана: ДД.ММ ЧЧ:ММ в поясе бота."""
+    from .config import local_zone
+    ts = at_ts(rec)
+    return datetime.fromtimestamp(ts, local_zone()).strftime("%d.%m %H:%M") if ts is not None else "?"
+
+
+def at_refusal(rec: dict[str, Any], now: float | None = None) -> str | None:
+    """Почему запись со временем сейчас не отправляется: рано или окно прошло.
+    None: времени нет или сейчас его окно. Время не читается: отказ."""
+    if not rec.get("at"):
+        return None
+    ts = at_ts(rec)
+    now = time.time() if now is None else now
+    if ts is None:
+        return _("otklik: время отправки отклика {id} не читается, не отправлять").format(id=rec.get("id"))
+    if now < ts:
+        return _("otklik: отклик {id} уходит {when}, не раньше: его отправит запуск в срок, "
+                 "сейчас не отправлять").format(id=rec.get("id"), when=at_label(rec))
+    if now > ts + AT_WINDOW_SEC:
+        return _("otklik: срок отправки отклика {id} ({when}) прошёл больше двух часов назад, "
+                 "не отправлять").format(id=rec.get("id"), when=at_label(rec))
+    return None
+
+
+def parse_at(spec: str, now: float | None = None) -> str:
+    """`--at`: «ГГГГ-ММ-ДД ЧЧ:ММ» в поясе бота (или ISO со смещением) → ISO со
+    смещением. ValueError: не понято, уже прошло или дальше AT_MAX_SEC."""
+    from .config import local_zone
+    try:
+        t = datetime.fromisoformat(spec.strip())
+    except ValueError:
+        raise ValueError(_("--at {spec}: нужно «ГГГГ-ММ-ДД ЧЧ:ММ» (время бота)").format(spec=spec)) from None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=local_zone())
+    t = t.astimezone(local_zone()).replace(second=0, microsecond=0)
+    now = time.time() if now is None else now
+    if t.timestamp() <= now:
+        raise ValueError(_("--at {spec}: время уже прошло").format(spec=spec))
+    if t.timestamp() - now > AT_MAX_SEC:
+        raise ValueError(_("--at {spec}: дальше 14 суток не ставится").format(spec=spec))
+    return t.isoformat(timespec="minutes")
+
+
+def _norm_text(text: Any) -> str:
+    return str(text or "").replace("\r\n", "\n").strip()
+
+
+def _norm_to(via: str, to: Any) -> str:
+    """Адресат для сверки: Telegram без регистра, но с @ (строку без него
+    сервер может понять как имя контакта); у почты без регистра только домен,
+    часть до @ может различать регистр (ревью 12.11.2026)."""
+    s = str(to or "").strip()
+    if via == "telegram":
+        return s.lower()
+    local, at, domain = s.rpartition("@")
+    return f"{local}@{domain.lower()}" if at else s
+
+
+def send_matches(rec: dict[str, Any], send: dict[str, Any]) -> bool:
+    """Вызов отправки ровно тот, что показан в записи: канал, адресат, текст,
+    тема, ответ на письмо, файл (имя и sha256) или его отсутствие."""
+    via = rec.get("via")
+    att = rec.get("attach") or {}
+    return (bool(via) and via == send.get("via") and bool(rec.get("to"))
+            and _norm_to(via, rec.get("to")) == _norm_to(via, send.get("to"))
+            and _norm_text(rec.get("text")) == _norm_text(send.get("text"))
+            and (rec.get("subject") or "") == (send.get("subject") or "")
+            and (rec.get("reply_to") or "") == (send.get("reply_to") or "")
+            and (att.get("name"), att.get("sha256")) == (send.get("attach_name"), send.get("attach_sha")))
+
+
+def grant(base: Path, chat_key: str, send: dict[str, Any]) -> dict[str, Any] | None:
+    """Одно касание: вызов отправки рана chat_key совпал с откликом, который
+    этот чат взял (sending) и ещё не отправлял: разрешение и отметка в попытке.
+    Refused: то же тому же уже отправлено или разрешено и ждёт итога (повтор,
+    в том числе второй записью с тем же текстом). None: не совпало, обычная
+    карточка; так же у неудачного и неясного (failed, unknown) и у другой
+    записи с тем же, пока такая есть: прежняя отправка могла дойти, решает
+    Иван. Одобренное пачкой («✅ Все N») тоже карточкой: пачка не сверяет
+    сообщения откликов с записями, как сверяет их ✅ (tg_otklik)."""
+    if not chat_key or base.is_symlink() or not base.is_dir():
+        return None
+    with locked(base):
+        recs = [r for r in _records(base) if r.get("via") and send_matches(r, send)
+                and r.get("sha") == record_sha(r)]
+        unclear = False
+        for rec in recs:
+            granted = (rec.get("attempt") or {}).get("granted")
+            if rec.get("status") == "sent":
+                raise Refused(_("otklik: этот текст этому адресату уже отправлен (отклик {id}), "
+                                "повтор не отправляется").format(id=rec["id"]))
+            if rec.get("status") == "sending" and granted:
+                # Разрешение ставится до отправки: она могла и не уйти.
+                raise Refused(_("otklik: по отклику {id} уже была отправка или карточка отправки, второй "
+                                "вызов сам не уходит. Если первый не ушёл, отметь `done --status failed` "
+                                "(не sent), кнопки вернёт Иван ↩️").format(id=rec["id"]))
+            unclear = unclear or (rec.get("status") in ("failed", "unknown") and bool(granted))
+        if unclear:
+            return None
+        for rec in recs:
+            att = rec.get("attempt") or {}
+            if rec.get("status") == "sending" and att.get("chat") == chat_key and not rec.get("batch"):
+                if (why := at_refusal(rec)) is not None:
+                    raise Refused(why)
+                att["granted"] = _now()
+                rec.update(attempt=att, updated=_now())
+                save(base, rec)
+                return rec
+    return None
+
+
+# Взятое чатом: попытка жива или её итог есть (неясный тоже мог дойти).
+_TAKEN = ("sending", "sent", "failed", "unknown")
+
+
+def _taken_with(rec: dict[str, Any], chat_key: str, want: str) -> bool:
+    return (bool(want) and rec.get("status") in _TAKEN and (rec.get("attempt") or {}).get("chat") == chat_key
+            and _norm_text(rec.get("text")) == want)
+
+
+def hold(base: Path, chat_key: str, text: str) -> bool:
+    """Отправку текста взятого отклика показали карточкой (одно касание не
+    прошло): все живые попытки чата с этим текстом своё касание израсходовали,
+    тот же вызов потом не уйдёт сам мимо Ивана (ревью 12.11.2026). True:
+    до этого по такому тексту уже была отправка или карточка (already_sent),
+    проверено тем же проходом под замком, что и отметка: параллельный grant
+    или вторая карточка не проскочат между ними."""
+    want = _norm_text(text)
+    repeat = False
+    with locked(base):
+        for rec in _records(base):
+            if not _taken_with(rec, chat_key, want):
+                continue
+            repeat = repeat or already_sent(rec)
+            att = rec.get("attempt") or {}
+            if rec.get("status") == "sending" and not att.get("granted"):
+                att["granted"] = _now()
+                rec.update(attempt=att, updated=_now())
+                save(base, rec)
+    return repeat
+
+
+def already_sent(rec: dict[str, Any]) -> bool:
+    """Отклик уже ушёл или его отправку уже разрешили (одним касанием или карточкой)."""
+    return rec.get("status") == "sent" or bool((rec.get("attempt") or {}).get("granted"))
+
+
+def file_sha(path: Path, limit: int | None = None) -> str:
+    """sha256 файла; ValueError, если он длиннее limit (файл мог вырасти после stat)."""
+    h, n = hashlib.sha256(), 0
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            n += len(chunk)
+            if limit is not None and n > limit:
+                raise ValueError(f"{path.name}: больше {limit} байт")
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def quiet_now(now: datetime | None = None) -> bool:
+    """Раньше утреннего сообщения: карточка без звука."""
+    from .config import now_local
+    now = now or now_local()
+    return (now.hour, now.minute) < QUIET_UNTIL
 
 
 def parse_batch_callback(data: str) -> str | None:
@@ -229,7 +474,8 @@ def buttons(rec: dict[str, Any]) -> list[list[dict[str, str]]]:
                  {"text": _("⏭ Пропустить"), "data": f"{head}:s"}]]
     if status == "approved":
         return [[{"text": _("✋ Отменить"), "data": f"{head}:c"}]]
-    if status in ("failed", "unknown"):
+    if status in ("failed", "unknown") and not at_expired(rec):
+        # Просроченный срок ↩️ не вернёт: его ✅ ответила бы только «срок прошёл».
         return [[{"text": _("↩️ Не ушло, вернуть кнопки"), "data": f"{head}:r"}]]
     if status == "edit":
         # Передумал править: без кнопки запись застряла бы до новой (ревью 22.10).
@@ -243,12 +489,19 @@ def render(rec: dict[str, Any]) -> str:
     parts = [_("📨 {title} (отклик {id})").format(title=rec['title'], id=rec['id'])]
     if rec.get("channel"):
         parts.append(_("Куда: {channel}").format(channel=rec['channel']))
+    parts += _send_lines(rec)
     parts.append("")
     parts.append(rec["text"])
     note = rec.get("note") or ""
+    if at_expired(rec):
+        # Ран не запускался: «по словам агента» и «проверь канал» неверны.
+        parts += ["", "⌛ " + note]
+        return "\n".join(parts)
     if rec.get("status") == "pending" and note:
         # Кнопки вернул бот: одобренное не ушло, причина в пометке.
         line = _("⚠️ не ушло, нажми ✅ ещё раз")
+    elif rec.get("status") == "approved" and rec.get("at"):
+        line = _("✅ одобрено, уйдёт {when}; ✋ отменит до срока").format(when=at_label(rec))
     else:
         line = _(STATUS_LINES.get(rec.get("status", ""), ""))
     if line:
@@ -267,12 +520,41 @@ def approved_prompt(rec: dict[str, Any], base: Path) -> str:
           "не отправлять; take один раз на отклик, перечитать текст: `show --id {id} --take "
           "<попытка>`) и отправь его этим каналом без изменений. Затем отметь итог командой "
           "`.venv/bin/python -m claude_tg_bot.otklik done --id {id} --take <попытка> --status sent|failed "
-          "--note \"ссылка или причина\"` из ~/src/claude-tg-bot, обнови воронку и черновики. "
+          "--note \"ссылка или причина\"` из ~/src/claude-tg-bot. После done отметь Домовому "
+          "командами из ~/src/domovoy (Edit и Write эти файлы не пишут; текст на stdin через "
+          "heredoc `<<'DOMOVOY_EOF'`). Каждый sent, кроме не-вакансий (сообщение заказчику, в архив, личное: воронку "
+          "не трогай), отметь в `data/voronka.md` по её шапке одной командой `.venv/bin/python -m "
+          "domovoy.data edit data/voronka.md`; блок это строки `<<<<<<< old`, старый текст, "
+          "`=======`, новый, `>>>>>>> new` (для удаления новый пуст, без пустой строки), old дословно "
+          "из файла (строку бери `grep -F`, не из Read: он режет длинные). Строку ищи по ссылке вакансии или № из заголовка; по одному имени компании, "
+          "если у неё не одна роль, не трогай, скажи в журнале. Строка в «Кандидатах» или «Не "
+          "отправлено» переносится в «В работе»: блок «её строка → пусто» и блок «последняя строка "
+          "«В работе» → она же и новая строка в столбцах шапки «В работе»», этап «отклик отправлен "
+          "(по ✅)», в последнем событии «ДД.ММ ЧЧ:ММ по ✅», канал и id отклика; в «Контакте» "
+          "адресат (@ник, адрес), а нет его: ссылка вакансии и «контакта нет»; в ячейках без `|`. "
+          "Строка уже в «В работе»: допиши это событие в «Последнее событие», этап не понижай. "
+          "Строка в «Закрытых»: не трогай, скажи в журнале. Строки нет: допиши новую в «В работе» "
+          "тем же вторым блоком. Отказ edit: перечитай файл и повтори один раз. В конце рана одна "
+          "строка журнала на всех: "
+          "`.venv/bin/python -m domovoy.data append journal/ГГГГ-ММ.md` с текстом «Отклики ДД.ММ "
+          "ЧЧ:ММ: №, компания, канал, sent или failed с причиной; воронка отмечена или чего нет». "
+          "В `data/otkliki.md` в заголовке раздела этого № пометку «на ✅…» замени командой `domovoy.data edit data/otkliki.md` на «отправлено по ✅ ДД.ММ ЧЧ:ММ». "
           "Отправить нельзя (путь закрыт, платно, нужен ответ Ивана): текст не бери, скажи "
           "одной строкой почему, кнопки вернутся сами. Остальные одобренные "
           "(`otklik list --status approved`) отправь так же, каждый через take.").format(
               id=rec['id'], title=rec['title'], channel=rec['channel'], sha=rec['sha'])
+        + "\n" + _(SEND_HINT)
     )
+
+
+SEND_HINT = N_(
+    "Если take показал «Кому», отправь ровно туда и ровно так, тогда второй карточки не будет (кроме пачки «✅ Все N»: там она будет): "
+    "Telegram без файла `send_message` (chat_id из «Кому», message это текст, других полей нет); "
+    "Telegram с файлом `send_file` (chat_id, file_path это путь файла из take, caption это текст, "
+    "parse_mode \"plain\"); письмо `.venv/bin/python -m claude_tg_bot.mailsend --to <Кому> "
+    "--subject <Тема> --body-file <файл с текстом> [--reply-to-message-id <Ответ на>] "
+    "[--attach <путь файла>]`. Иное уйдёт Ивану обычной карточкой. Второй вызов того же бот "
+    "отклонит: если первый не ушёл, отметь `done --status failed`, не sent.")
 
 
 # ---- Переходы состояния: только под locked() ----
@@ -281,6 +563,7 @@ def pick_ok(rec: dict[str, Any] | None, sha: str, gen: int, action: str, chat_id
     """Кнопка действует: хеш, поколение, сообщение и статус записи совпадают."""
     return not (rec is None or rec.get("sha") != sha or rec.get("sha") != record_sha(rec)
                 or gen_of(rec) != gen or rec.get("status") not in PICK_FROM[action]
+                or (action == "r" and at_expired(rec))
                 or rec.get("message_id") != message_id or rec.get("chat_id") != chat_id)
 
 
@@ -294,16 +577,37 @@ def shown_text(rec: dict[str, Any]) -> str:
 
 
 def pick(base: Path, oid: str, sha: str, gen: int, action: str,
-         chat_id: int, message_id: int) -> dict[str, Any]:
-    """Нажатие кнопки: сверка хеша, поколения, сообщения и статуса, затем переход."""
+         chat_id: int, message_id: int, route: str = "", batch: bool = False) -> dict[str, Any]:
+    """Нажатие кнопки: сверка хеша, поколения, сообщения и статуса, затем переход.
+    route: тема откликов; ✅ отдаёт отправку ей (sender), без неё источнику.
+    batch: ✅ пачкой, отправка тогда карточкой (grant)."""
     with locked(base):
         rec = load(base, oid)
         if not pick_ok(rec, sha, gen, action, chat_id, message_id):
             raise Refused(_("Кнопка устарела: этот отклик уже решён или заменён"))
+        if action == "o" and rec.get("at"):
+            if batch:
+                # Пачка такие не берёт (_cmd_all): срок одобряется на своей карточке.
+                raise Refused(_("Кнопка устарела: этот отклик уже решён или заменён"))
+            ts = at_ts(rec)
+            if ts is None or time.time() > ts + AT_WINDOW_SEC:
+                raise Late(_("Срок отправки {when} прошёл: попроси поставить отклик заново").format(
+                    when=at_label(rec)))
         if action in ("c", "r"):
             rec.update(status="pending", gen=gen_of(rec) + 1, attempt=None)
         else:
             rec["status"] = {"o": "approved", "e": "edit", "s": "skipped"}[action]
+            if action == "o":
+                # Тем же переходом, что одобрение: взять текст сможет только ран
+                # этого чата, и никакой другой в промежутке (take).
+                if route:
+                    rec["sender"] = route
+                else:
+                    rec.pop("sender", None)
+                if batch:
+                    rec["batch"] = True
+                else:
+                    rec.pop("batch", None)
             # Поле attempt отличает одобренное по новому порядку от одобренного
             # до 22.10.2026 (recover): у записей старого кода его нет.
             rec.setdefault("attempt", None)
@@ -317,7 +621,7 @@ def _batch_path(base: Path, bid: str) -> Path:
     return base / "batches" / f"{bid}.json"
 
 
-def pick_all(base: Path, bid: str, chat_id: int, message_id: int) -> list[dict[str, Any]]:
+def pick_all(base: Path, bid: str, chat_id: int, message_id: int, route: str = "") -> list[dict[str, Any]]:
     """«✅ Все N»: файл пачки держит хеш и поколение каждого показанного
     отклика, запись одобряет та же `pick`. Устаревшую запись (решена отдельно,
     заменена) пачка пропускает, а не одобряет. Файл снимается сразу: второе
@@ -335,7 +639,7 @@ def pick_all(base: Path, bid: str, chat_id: int, message_id: int) -> list[dict[s
     for item in data.get("items") or []:
         try:
             picked.append(pick(base, item["id"], item["sha"], int(item["gen"]), "o",
-                               int(item["chat_id"]), int(item["message_id"])))
+                               int(item["chat_id"]), int(item["message_id"]), route, batch=True))
         except (Refused, KeyError, TypeError, ValueError, OSError):
             continue  # не записалось: отклик остаётся с кнопками, остальные идут
     return picked
@@ -349,9 +653,9 @@ def take(base: Path, oid: str, chat_key: str) -> dict[str, Any]:
             raise Refused(_("otklik: нет такой записи"))
         if not chat_key:
             raise Refused(_("otklik: текст выдаётся только рану бота (нет CLAUDE_TG_CHAT_KEY), не отправлять"))
-        if source_of(rec) != chat_key:
-            raise Refused(_("otklik: отклик готовил другой чат ({source}), отправляет только он").format(
-                source=source_of(rec)))
+        if sender_of(rec) != chat_key:
+            raise Refused(_("otklik: этот отклик отправляет другой чат ({source}), не этот; не отправлять").format(
+                source=sender_of(rec)))
         if rec.get("sha") != record_sha(rec):
             raise Refused(_("otklik: текст изменился после одобрения, не отправлять"))
         # Повторный take отказывает и тому же чату: в одном ране два помощника
@@ -360,6 +664,8 @@ def take(base: Path, oid: str, chat_key: str) -> dict[str, Any]:
         if rec.get("status") != "approved":
             raise Refused(_("otklik: отклик не одобрен или уже взят (статус {status}), не отправлять").format(
                 status=rec.get("status")))
+        if (why := at_refusal(rec)) is not None:
+            raise Refused(why)
         rec.update(status="sending", note="", updated=_now(),
                    attempt={"id": uuid.uuid4().hex[:8], "chat": chat_key, "at": _now()})
         save(base, rec)
@@ -412,6 +718,25 @@ def revert_untaken(base: Path, oid: str, gen: int, note: str) -> dict[str, Any] 
         return rec
 
 
+def at_expired(rec: dict[str, Any]) -> bool:
+    """Отклик в срок, который бот пометил failed по прошедшему окну: ран его не
+    брал (attempt пуст), значит точно не уходил; заменять его можно."""
+    return rec.get("status") == "failed" and bool(rec.get("at")) and not rec.get("attempt")
+
+
+def expire_scheduled(base: Path, oid: str, gen: int, note: str) -> dict[str, Any] | None:
+    """Одобренное в срок, чьё окно прошло без отправки (бот или ПК не работали,
+    ран ждал тему): failed с причиной. Не skipped: пропуск (⏭) утро и поиск
+    переносят в воронку как решение Ивана."""
+    with locked(base):
+        rec = load(base, oid)
+        if rec is None or rec.get("status") != "approved" or gen_of(rec) != gen:
+            return None
+        rec.update(status="failed", note=(note or "").strip()[:NOTE_CAP], updated=_now())
+        save(base, rec)
+        return rec
+
+
 def close_attempts(base: Path, chat_key: str) -> list[dict[str, Any]]:
     """Ран чата кончился: его попытки без итога получают «результат неизвестен».
     Зовётся под замком темы, второго рана этого чата в это время нет."""
@@ -436,14 +761,18 @@ def _undo_replace(base: Path, rec: dict[str, Any]) -> None:
         save(base, old)
 
 
-def recover(base: Path) -> list[dict[str, Any]]:
+def recover(base: Path, scheduled: frozenset[tuple[str, int]] = frozenset()) -> list[dict[str, Any]]:
     """Старт бота: раны прошлого процесса мертвы. Одобренное снова с кнопками,
     взятое получает «результат неизвестен». Одобренное до 22.10.2026 (без поля
     attempt) тоже неизвестно: прежний порядок отправлял прямо из approved, и
-    письмо могло уйти до сбоя итога (ревью Codex 22.10.2026)."""
+    письмо могло уйти до сбоя итога (ревью Codex 22.10.2026). scheduled: пары
+    (id, поколение) записей, чья отправка в срок лежит в очереди /at: они ждут
+    её одобренными."""
     changed = []
     with locked(base):
         for rec in _records(base):
+            if rec.get("status") == "approved" and rec.get("at") and (rec.get("id"), gen_of(rec)) in scheduled:
+                continue
             if rec.get("status") == "approved" and "attempt" in rec:
                 rec.update(status="pending", gen=gen_of(rec) + 1, note=_("бот перезапускался"))
             elif rec.get("status") in ("approved", "sending"):
@@ -515,44 +844,19 @@ def sync_targets(base: Path, now: datetime | None = None) -> list[dict[str, Any]
 
 def outbound_match(base: Path, chat_key: str, text: str) -> dict[str, Any] | None:
     """Взятый этим чатом отклик с тем же текстом: для пометки на карточке
-    отправки (решение Ивана 22.10.2026, второе подтверждение остаётся)."""
-    want = (text or "").replace("\r\n", "\n").strip()
-    if not want:
-        return None
-    for rec in _records(base):
-        if (rec.get("status") == "sending" and (rec.get("attempt") or {}).get("chat") == chat_key
-                and rec.get("text", "").replace("\r\n", "\n").strip() == want):
-            return rec
-    return None
+    отправки, когда одно касание не прошло (grant: другой адресат, файл или
+    поле вызова, отклик без адресата). Уже ушедший или разрешённый первым
+    (already_sent): пометка тогда предупреждает о повторе."""
+    want = _norm_text(text)
+    found = [rec for rec in _records(base) if _taken_with(rec, chat_key, want)]
+    found.sort(key=lambda r: not already_sent(r))
+    return found[0] if found else None
 
 
 # ---- CLI для агента ----
 
 def _bot_api(method: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    import httpx
-
-    from .config import load_config
-    cfg = load_config(skip_hook_validation=True)
-    # Как в handoff: неушедшее и 429 повторяются сами, правка при любом сбое
-    # связи (not modified успех), неподтверждённая отправка остаётся отказом.
-    edit = method.startswith("edit")
-    try:
-        r = tg_api.post(cfg.telegram_bot_token, method, json=payload, timeout=10.0,
-                        retry_not_sent=True, retry_any=edit)
-    except httpx.HTTPError as e:
-        print(f"otklik: HTTP error: {type(e).__name__}", file=sys.stderr)
-        return None
-    if edit and tg_api.not_modified(r):
-        return {"ok": True, "result": True}
-    if r.status_code != 200:
-        # Без URL: в нём токен бота.
-        print(f"otklik: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
-        return None
-    res = r.json()
-    if not edit:
-        from . import reactions
-        reactions.remember_sent(res, payload.get("text"), cfg.state_dir)
-    return res
+    return tg_api.cli_call("otklik", method, payload)
 
 
 def _result_text(res: Any) -> str | None:
@@ -580,13 +884,82 @@ def _show_in_chat(rec: dict[str, Any], base: Path | None = None) -> bool:
     return res is not None
 
 
+# Предел подписи к файлу в Telegram, в единицах UTF-16.
+CAPTION_LIMIT = 1024
+# Файл больше одно касание Telegram не сверяет (outbound.otklik_send): хеш на каждый вызов.
+TG_FILE_MAX = 50 * 1024 * 1024
+# Адресат Telegram однозначно: @имя, номер чата или телефон, не имя контакта.
+_TG_TO_RE = re.compile(r"@[A-Za-z0-9_]{4,32}|-?\d{1,20}|\+\d{7,15}")
+
+
+def _send_args(args: argparse.Namespace, text: str = "") -> dict[str, Any]:
+    """Поля одного касания из аргументов `new`; ValueError: неполные, лишние,
+    адрес или подпись, которых не примет отправка. Каталоги вложений
+    mailsend и корни сервера Telegram здесь не сверяются: их отказ придёт
+    при отправке."""
+    from .mailsend import _ADDR_RE, _MSGID_RE
+    # getattr: `new` без этих ключей (вызовы до 12.11.2026, тесты) это отклик без одного касания.
+    tg, mail, attach = (getattr(args, k, "") or "" for k in ("tg", "mail", "attach"))
+    via, to = ("telegram", tg) if tg else ("mail", mail) if mail else ("", "")
+    to = to.strip()
+    subject, reply_to = ((getattr(args, k, "") or "").strip() for k in ("subject", "reply_to"))
+    if via != "mail" and (subject or reply_to):
+        raise ValueError(_("--subject и --reply-to только с --mail"))
+    if via == "mail" and (not subject or "\n" in subject or "\r" in subject):
+        raise ValueError(_("письму нужна тема в одну строку (--subject)"))
+    if via and (not to or any(c.isspace() for c in to)):
+        raise ValueError(_("адресат пустой или с пробелом: --tg @имя или --mail адрес"))
+    if via == "telegram" and not _TG_TO_RE.fullmatch(to):
+        raise ValueError(_("--tg {to}: нужен @имя, номер чата или +телефон").format(to=to))
+    if via == "mail" and not _ADDR_RE.fullmatch(to):
+        raise ValueError(_("--mail {to}: не адрес почты").format(to=to))
+    if reply_to and not _MSGID_RE.fullmatch(reply_to):
+        raise ValueError(_("--reply-to нужен в виде <...@...>"))
+    send: dict[str, Any] = {"via": via, "to": to, "subject": subject, "reply_to": reply_to}
+    at = (getattr(args, "at", "") or "").strip()
+    if at:
+        if not via:
+            raise ValueError(_("--at только с адресатом (--tg или --mail): в срок уходит без второй карточки"))
+        send["at"] = parse_at(at)
+    if attach:
+        real = Path(attach).expanduser().resolve(strict=True)
+        if not real.is_file():
+            raise ValueError(_("--attach {path} не обычный файл").format(path=real))
+        send["attach"] = {"name": real.name, "size": real.stat().st_size, "sha256": file_sha(real),
+                          "path": str(real)}
+        if via == "telegram":
+            from .replies import utf16_len
+            if utf16_len(text) > CAPTION_LIMIT:
+                raise ValueError(_("Telegram с файлом: текст идёт подписью, а она до {n} знаков; "
+                                   "сократи или шли файл без --attach").format(n=CAPTION_LIMIT))
+            if send["attach"]["size"] > TG_FILE_MAX:
+                raise ValueError(_("Telegram с файлом: файл больше {mb} МБ одно касание не сверяет").format(
+                    mb=TG_FILE_MAX // (1024 * 1024)))
+    return send
+
+
 def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
              chat_key: str, sources: frozenset[str]) -> int:
     text = Path(args.file).read_text(encoding="utf-8").strip()
     if not text:
         print(_("otklik: пустой текст"), file=sys.stderr)
         return 1
-    rec = new_record(args.title, args.channel, text)
+    try:
+        send = _send_args(args, text)
+        prev = load(base, args.replaces) if args.replaces and not send.get("at") else None
+        if prev is not None and prev.get("at"):
+            # Правка по ✏️ без своего времени: срок заменённой, а не немедленная отправка.
+            if not send.get("via"):
+                raise ValueError(_("заменяемый отклик уходит в срок ({when}): нужен адресат --tg или --mail "
+                                   "(и --at, если время другое)").format(when=at_label(prev)))
+            if at_refusal(prev) is not None and (at_ts(prev) or 0) <= time.time():
+                raise ValueError(_("срок заменяемого отклика ({when}) прошёл: задай новое время --at").format(
+                    when=at_label(prev)))
+            send["at"] = prev["at"]
+    except (OSError, ValueError) as e:
+        print(f"otklik: {e}", file=sys.stderr)
+        return 1
+    rec = new_record(args.title, args.channel, text, send)
     rec["source"] = chat_key or str(primary_chat_id)
     if rec["source"] not in sources:
         print(_("otklik: отклики готовят только чаты Домового, а не {key}").format(key=rec["source"]),
@@ -604,7 +977,15 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
     with locked(base):
         if args.replaces:
             old = load(base, args.replaces)
-            if old is None or old.get("status") not in REPLACE_FROM:
+            if old is None or (old.get("status") not in REPLACE_FROM and not at_expired(old)):
+                if old is not None and old.get("status") == "approved" and old.get("at"):
+                    # Одобренный в срок стоит в очереди /at: новая карточка без ✋ его не снимет
+                    # (ревью Codex 27.11.2026, перенос времени).
+                    print(_("otklik: отклик {id} одобрен и уйдёт {when}; без ✋ Ивана на его карточке он остаётся в очереди "
+                            "на этот срок, и новая карточка его не снимет. Перенести или поправить: ✋ "
+                            "(кнопки вернутся), потом new --replaces {id}").format(
+                                id=old["id"], when=at_label(old)), file=sys.stderr)
+                    return 1
                 print(_("otklik: заменить можно только неодобренный и неотправленный отклик"),
                       file=sys.stderr)
                 return 1
@@ -623,6 +1004,7 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
         print(_("otklik: старый отклик закрыт, но его сообщение не обновилось"), file=sys.stderr)
     res = _bot_api("sendMessage", {
         "chat_id": primary_chat_id, "text": body, "link_preview_options": {"is_disabled": True},
+        "disable_notification": quiet_now(),
     })
     if res is None:
         # Иван новой записи не видел: её нет, заменённая снова как была.
@@ -671,7 +1053,7 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
     fresh_from = datetime.now(timezone.utc) - timedelta(hours=BATCH_FRESH_HOURS)
     with locked(base):
         recs = [r for r in _records(base) if r.get("status") == "pending" and r.get("message_id")
-                and r.get("chat_id") is not None and source_of(r) == source
+                and not r.get("at") and r.get("chat_id") is not None and source_of(r) == source
                 and (t := _created_at(r)) is not None and t > fresh_from][-BATCH_MAX:]
     if len(recs) < 2:
         print(_("otklik: ждущих меньше двух, кнопка не нужна"))
@@ -679,7 +1061,8 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
     lines = [_("📨 Ждут «ок»: {count}").format(count=len(recs))]
     lines += [f"{i}. {r['title'][:150]}" for i, r in enumerate(recs, 1)]
     bid = uuid.uuid4().hex[:12]
-    res = _bot_api("sendMessage", {"chat_id": primary_chat_id, "text": "\n".join(lines)})
+    res = _bot_api("sendMessage", {"chat_id": primary_chat_id, "text": "\n".join(lines),
+                                   "disable_notification": quiet_now()})
     if res is None:
         return 1
     path = _batch_path(base, bid)
@@ -702,8 +1085,12 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
 
 
 def _print_text(rec: dict[str, Any]) -> None:
-    print(_("Куда: {channel}\nПопытка: {attempt}\n---\n{text}").format(
-        channel=rec['channel'], attempt=(rec.get("attempt") or {}).get("id"), text=rec['text']))
+    lines = _send_lines(rec)
+    if rec.get("attach"):
+        lines.append(_("Путь файла: {path}").format(path=rec["attach"].get("path")))
+    print(_("Куда: {channel}\n{send}Попытка: {attempt}\n---\n{text}").format(
+        channel=rec['channel'], send="".join(f"{line}\n" for line in lines),
+        attempt=(rec.get("attempt") or {}).get("id"), text=rec['text']))
 
 
 def _cmd_take(args: argparse.Namespace, base: Path, chat_key: str) -> int:
@@ -734,6 +1121,8 @@ def _cmd_list(args: argparse.Namespace, base: Path) -> int:
     for rec in _records(base):
         if not args.status or rec.get("status") == args.status:
             note = f" | {' '.join(rec['note'].split())}" if rec.get("note") else ""
+            if rec.get("at"):
+                note += " | " + _("уйдёт {when}").format(when=at_label(rec))
             print(f"{rec['id']} {rec.get('status')} {rec.get('updated')} {rec.get('title')}{note}")
     return 0
 
@@ -758,7 +1147,15 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--title", required=True)
     p_new.add_argument("--channel", required=True, help="куда уйдёт и что приложено")
     p_new.add_argument("--file", required=True, help="файл с точным текстом отклика")
-    p_new.add_argument("--replaces", default="", help="отклик, который этот заменяет (правка по ✏️)")
+    p_new.add_argument("--replaces", default="", help="отклик, который этот заменяет (правка по ✏️; одобренный в срок сначала снимает ✋ Ивана)")
+    to = p_new.add_mutually_exclusive_group()
+    to.add_argument("--tg", default="", help="одно касание: адресат Telegram (@имя или номер чата)")
+    to.add_argument("--mail", default="", help="одно касание: адрес письма (mailsend)")
+    p_new.add_argument("--subject", default="", help="тема письма (с --mail)")
+    p_new.add_argument("--reply-to", default="", help="Message-ID письма, на которое ответ (с --mail)")
+    p_new.add_argument("--attach", default="", help="файл к отправке: имя и sha256 на карточке")
+    p_new.add_argument("--at", default="",
+                       help="отправить в срок: \"ГГГГ-ММ-ДД ЧЧ:ММ\" по времени бота, только с --tg или --mail")
     sub.add_parser("all", help="прислать кнопку «✅ Все N» под пачкой ждущих откликов")
     p_take = sub.add_parser("take", help="взять одобренный текст для отправки")
     p_take.add_argument("--id", required=True)

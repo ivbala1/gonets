@@ -5,12 +5,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from claude_tg_bot import bot as botmod  # noqa: E402
+from claude_tg_bot.claude_runner import ClaudeResult  # noqa: E402
 from test_review_bot_main import GROUP, _Base, _msg  # noqa: E402
 
 WS = f"{GROUP}:77"
@@ -41,6 +42,50 @@ class WorkshopForwardSoundTests(_Base):
         sent = self._forwards()
         self.assertEqual(len(sent), 1)
         self.assertTrue(sent[0].kwargs["disable_notification"])
+
+    async def test_quiet_marker_with_text_stays_in_topic(self) -> None:
+        # Подготовка утра Домового 26.11.2026: отчёт и метка в конце.
+        self.answer = "готово: подготовка утра 26.11\nВопроса Ивану нет.\n\n<<QUIET>>"
+        await self.dispatch("наряд", msg=_msg(thread=77), unattended=True)
+        self.assertEqual(self._forwards(), [])
+        self.send_reply_text.assert_awaited()   # в теме итог остаётся
+        self.assertIn("подготовка утра", self.send_reply_text.await_args.args[2])
+
+    async def test_quiet_marker_with_failure_still_forwards(self) -> None:
+        async def failed_run(*_a, **_kw):
+            return ClaudeResult(text="не вышло: поиск оборвался\n<<QUIET>>", session_id="s1", is_error=True)
+        with patch.object(botmod, "run_claude", failed_run):
+            await self.dispatch("наряд", msg=_msg(thread=77), unattended=True)
+        sent = self._forwards()
+        self.assertEqual(len(sent), 1)
+        self.assertFalse(sent[0].kwargs["disable_notification"])
+
+    async def test_quiet_marker_with_loud_still_forwards(self) -> None:
+        self.answer = "готово: цена ниже порога\n<<QUIET>>\n<<LOUD>>"
+        await self.dispatch("наряд", msg=_msg(thread=77), unattended=True)
+        self.assertEqual(len(self._forwards()), 1)
+
+    async def test_quiet_marker_with_ask_still_forwards(self) -> None:
+        self.answer = "готово: подготовка\n<<QUIET>>\n<<ASK: Ставить бассейн? | да | нет>>"
+        await self.dispatch("наряд", msg=_msg(thread=77), unattended=True)
+        self.assertEqual(len(self._forwards()), 1)
+
+    async def test_quiet_marker_after_button_still_forwards(self) -> None:
+        # ✅ отклика идёт рана по кнопке: итог для Ивана единственное подтверждение.
+        self.answer = "готово: отправлено\n<<QUIET>>"
+        await self.dispatch("[✅]", msg=_msg(thread=77), from_callback=True)
+        self.assertEqual(len(self._forwards()), 1)
+
+    async def test_quiet_marker_with_codex_fallback_still_forwards(self) -> None:
+        self.cfg.codex_bin = "codex"
+        self.cfg.codex_fallback = True
+        self.result_error = True
+        with patch.object(botmod, "_is_claude_unavailable", lambda r: True), \
+                patch.object(botmod, "_codex_as_claude_result",
+                             AsyncMock(return_value=ClaudeResult(text="готово: подготовка\n<<QUIET>>"))) as codex:
+            await self.dispatch("наряд", msg=_msg(thread=77), unattended=True)
+        codex.assert_awaited()
+        self.assertEqual(len(self._forwards()), 1)
 
     async def test_direct_call_flags(self) -> None:
         # Внутри тихого рана (поиск, наряд): обёртка бота _SilentAwareBot глушит

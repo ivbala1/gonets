@@ -33,7 +33,7 @@ from claude_tg_bot.i18n import _  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult, SessionStore  # noqa: E402
 from claude_tg_bot.skills.news_digest.core import Item  # noqa: E402
 from telegram import Chat, Message, MessageEntity, MessageOriginUser, Update, User  # noqa: E402
-from telegram.error import BadRequest, NetworkError, RetryAfter  # noqa: E402
+from telegram.error import NetworkError, RetryAfter  # noqa: E402
 from telegram.ext import CommandHandler  # noqa: E402
 
 # Настоящий роутер Свода и разметка ограждений: помощники из test_tasks.

@@ -110,7 +110,7 @@ class _LaterBase(_Base):
         await super().asyncSetUp()
         self.scheduled: list[dict] = []
         self.ctx.application.job_queue = SimpleNamespace(
-            run_once=lambda cb, when, data, name: self.scheduled.append(data),
+            run_once=lambda cb, when, data, name, **_kw: self.scheduled.append(data),
             get_jobs_by_name=lambda name: [],
         )
         self.notes: list[list[str]] = []
@@ -243,7 +243,7 @@ class DispatchLaterTests(_LaterBase):
         with patch.object(botmod, "_workshop_forward", AsyncMock()):
             await self.dispatch("x")
         self.assertEqual(self.later_jobs(), {})
-        self.assertIn(_("в мастерской не работает"), self.footer_text())
+        self.assertIn(_("в фоновой теме (мастерская, отклики) не работает"), self.footer_text())
 
     def test_refusal_reasons(self) -> None:
         base = dict(untrusted=False, task=None, deal=None, workshop=False, plan=False, gpt=False, error=False)
@@ -251,7 +251,7 @@ class DispatchLaterTests(_LaterBase):
         for key, value, reason in (
             ("task", {"id": "t1"}, _("в теме задачи не работает")),
             ("deal", {"id": "d1"}, _("в ходе дела не работает")),
-            ("workshop", True, _("в мастерской не работает")),
+            ("workshop", True, _("в фоновой теме (мастерская, отклики) не работает")),
             ("gpt", True, _("ответ GPT, а не claude")),
             ("error", True, _("ответ с ошибкой")),
         ):

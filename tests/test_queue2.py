@@ -224,7 +224,8 @@ class DrainDeferTests(_Base):
         self.bot_data["draining"] = True
         msg = await self.dispatch("вариант", from_callback=True)
         self.assertEqual(_drained(self.bot_data["at_jobs"]), [])
-        self.assertIn("не ушло", str(msg.reply_text.await_args.args[0]))
+        self.assertEqual(botmod._("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
+                                  "повтори через пару минут"), str(msg.reply_text.await_args.args[0]))
 
 
 class InflightTests(_Base):
@@ -505,28 +506,28 @@ class VoiceMtprotoFallbackTests(_VoiceBase):
         self.assertFalse(kw["hold"])
         self.assertIsNotNone(kw["retry"])  # сбой MTProto ещё раз пробует Bot API
         self.assertTrue(self.dl.await_args.kwargs["timeout_to_mtproto"]())
-        self.assertNotIn("⚠️ не удалось скачать голосовое", self.said(msg))
+        self.assertNotIn(botmod._("⚠️ не удалось скачать голосовое"), self.said(msg))
         self.assertEqual(len(self.runs), 1)
 
     async def test_mtproto_failure_stops_quietly(self) -> None:
         self.big.return_value = None  # _fetch_big уже объяснил сбой сам
         msg = await self._send()
         self.assertEqual(self.runs, [])
-        self.assertNotIn("⚠️ не удалось скачать голосовое", self.said(msg))
+        self.assertNotIn(botmod._("⚠️ не удалось скачать голосовое"), self.said(msg))
 
     async def test_timeout_without_mtproto_reports_failure(self) -> None:
         self.cfg.telegram_api_id = 0
         msg = await self._send()
         self.assertFalse(self.dl.await_args.kwargs["timeout_to_mtproto"]())
         self.big.assert_not_awaited()
-        self.assertIn("⚠️ не удалось скачать голосовое", self.said(msg))
+        self.assertIn(botmod._("⚠️ не удалось скачать голосовое"), self.said(msg))
         self.assertEqual(self.runs, [])
 
     async def test_other_error_not_sent_to_mtproto(self) -> None:
         self.dl.side_effect = RuntimeError("x")
         msg = await self._send()
         self.big.assert_not_awaited()
-        self.assertIn("⚠️ не удалось скачать голосовое", self.said(msg))
+        self.assertIn(botmod._("⚠️ не удалось скачать голосовое"), self.said(msg))
 
     async def test_cancel_during_bot_api_drops_voice(self) -> None:
         # Код-ревью 07.11.2026: /cancel во время попытки Bot API не видел
@@ -546,7 +547,7 @@ class VoiceMtprotoFallbackTests(_VoiceBase):
         await _settle()
         self.big.assert_not_awaited()
         self.assertEqual(self.runs, [])
-        self.assertNotIn("⚠️ не удалось скачать голосовое", self.said(msg))
+        self.assertNotIn(botmod._("⚠️ не удалось скачать голосовое"), self.said(msg))
 
     async def test_retry_waits_for_transcription(self) -> None:
         # Повтор свайпом во время распознавания не запускает второй ход.

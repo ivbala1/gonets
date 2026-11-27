@@ -1,10 +1,11 @@
-"""Реакции Ивана на сообщения бота (решение Ивана 01.11.2026): 👍 сделано или
-согласен, 👎 такое не присылать.
+"""Реакции Ивана на сообщения бота: 👍 это его «ок» на сообщение (решение
+Ивана 12.11.2026; с 01.11.2026 было «сделано или согласен» заметкой), 👎 такое
+не присылать.
 
 Telegram сообщает только номер сообщения, текста в событии нет, поэтому бот и
-notify пишут свои отправки в личку в короткий журнал. Реакция ложится заметкой
-и уходит в следующий ход лички: отдельный ран на каждую реакцию занимал бы
-личку и стоил бы хода."""
+notify пишут свои отправки в личку в короткий журнал. 👍 сразу начинает ход
+лички (tg_quick.on_reaction): «ок» ждёт действия. 👎 ложится заметкой и уходит
+в следующий ход лички: отдельный ран на неё занимал бы личку и стоил бы хода."""
 from __future__ import annotations
 
 import logging
@@ -17,6 +18,7 @@ log = logging.getLogger(__name__)
 SENT_FILE = "sent_texts.jsonl"
 MEANINGS = ("👍", "👎")
 TEXT_LIMIT = 500
+_HEAD = 150
 _TAIL_BYTES = 256 * 1024
 # Подрезка до окна lookup: старше хвоста _TAIL_BYTES строки никто не читает
 # (этап 2 уборки, 09.11.2026; до того 2 МБ -> 1 МБ при старте бота).
@@ -55,6 +57,14 @@ def _trim(path: Path) -> None:
         log.warning("sent log trim failed: %s", e)
 
 
+def clip(text: str) -> str:
+    """Начало и конец длинного сообщения: предложение и вопрос, на которые
+    Иван ставит 👍, обычно стоят в конце, а начало называет тему."""
+    if len(text) <= TEXT_LIMIT:
+        return text
+    return f"{text[:_HEAD]}\n[…]\n{text[-(TEXT_LIMIT - _HEAD):]}"
+
+
 def remember(chat_id: object, message_id: object, text: object, state_dir: Path | None = None) -> None:
     """Строка в журнал отправок. Только личка: у групп положительного номера нет.
     Сбой записи не мешает отправке."""
@@ -64,7 +74,7 @@ def remember(chat_id: object, message_id: object, text: object, state_dir: Path 
     if not isinstance(message_id, int) or not isinstance(text, str) or not text.strip():
         return
     try:
-        jsonstore.jsonl_append(base / SENT_FILE, {"c": chat_id, "m": message_id, "t": text[:TEXT_LIMIT]})
+        jsonstore.jsonl_append(base / SENT_FILE, {"c": chat_id, "m": message_id, "t": clip(text)})
     except OSError as e:
         log.warning("sent log write failed: %s", e)
 

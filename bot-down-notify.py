@@ -201,6 +201,10 @@ def alert_target(env: dict[str, str]) -> tuple[str, int | str, int | None] | Non
 # повтор при любом сбое, кроме отказа Telegram (4xx, кроме 429). Юнит oneshot,
 # срока запуска у него нет.
 RETRY_DELAYS = (5.0, 15.0)
+# Потолок паузы, которую назвал Telegram при 429. Повтор раньше названного срока
+# снова получает 429, и два повтора сгорали впустую (при прежнем потолке 600 с);
+# час: тревога с опозданием лучше потерянной, а бесконечный срок повесил бы юнит.
+FLOOD_CAP = 3600.0
 
 
 def _no_proxy_open(req: urllib.request.Request, timeout: float):
@@ -210,18 +214,20 @@ def _no_proxy_open(req: urllib.request.Request, timeout: float):
 
 
 def send(base: str, token: str, chat: int | str, thread: int | None, text: str, sleep=None) -> bool:
-    """sendMessage со звуком (тревога), до трёх попыток."""
-    payload: dict[str, object] = {"chat_id": chat, "text": text}
-    if thread is not None:
-        payload["message_thread_id"] = thread
-    req = urllib.request.Request(
-        f"{base}/bot{token}/sendMessage", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+    """sendMessage со звуком (тревога), до трёх попыток. Отказ 400 при заданной
+    теме (тема удалена или закрыта): сразу ещё одна попытка без темы, в сам чат;
+    в счёт трёх она не идёт, так что запросов на путь бывает четыре."""
     local = _loopback(urllib.parse.urlsplit(base).hostname or "")
     delays = iter(RETRY_DELAYS)
     while True:
         flood = 0.0
+        payload: dict[str, object] = {"chat_id": chat, "text": text}
+        if thread is not None:
+            payload["message_thread_id"] = thread
+        req = urllib.request.Request(
+            f"{base}/bot{token}/sendMessage", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
         try:
             with (_no_proxy_open if local else urllib.request.urlopen)(req, timeout=15) as r:
                 if json.load(r).get("ok") is True:
@@ -230,15 +236,19 @@ def send(base: str, token: str, chat: int | str, thread: int | None, text: str, 
         except urllib.error.HTTPError as e:
             what = f"HTTP {e.code}"
             with e:
+                if e.code == 400 and thread is not None:
+                    print("bot-down-notify: Telegram отказал: HTTP 400, шлю без темы", file=sys.stderr)
+                    thread = None
+                    continue
                 if 400 <= e.code < 500 and e.code != 429:
                     print(f"bot-down-notify: Telegram отказал: {what}", file=sys.stderr)
                     return False
                 if e.code == 429:
-                    # Пауза, которую назвал Telegram, если длиннее своей. Потолок
-                    # 10 минут: раньше срока повтор снова 429, и тревога терялась
-                    # (ревью Codex 08.11.2026); юнит oneshot без предела запуска.
+                    # Пауза, которую назвал Telegram, если длиннее своей: раньше
+                    # срока повтор снова 429, и тревога терялась (ревью Codex
+                    # 08.11.2026); юнит oneshot без предела запуска.
                     try:
-                        flood = min(float(json.load(e)["parameters"]["retry_after"]) + 1, 600.0)
+                        flood = min(float(json.load(e)["parameters"]["retry_after"]) + 1, FLOOD_CAP)
                     except Exception:
                         pass
         except Exception as e:

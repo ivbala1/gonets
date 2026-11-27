@@ -91,14 +91,15 @@ def _make_event_wake(app: Application) -> Callable[..., Awaitable[None]]:
                 noted = await _event_expired_note(app, events.load(store, event_id))
             _event_mark(store, event_id, status="done", outcome=outcome, done_at=time.time())
         key = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
-        if outcome in ("not started", "expired", "error") and not noted and _b._is_workshop(cfg, key):
-            # Тема мастерской заглушена: что наряд не запустился (лимит, срок,
-            # сбой), Иван узнаёт в личке (проект Домового 22.10.2026). Строка
-            # «устарело» уже ушла в личку: второй о том же не нужно. Звук по
-            # тишине события.
+        if outcome in ("not started", "expired", "error") and not noted and _b._is_background(cfg, key):
+            # Фоновая тема (мастерская, отклики) заглушена: что наряд не
+            # запустился (лимит, срок, сбой), Иван узнаёт в личке (проект
+            # Домового 22.10.2026; отклики с 27.11.2026). Строка «устарело» уже
+            # ушла в личку: второй о том же не нужно. Звук по тишине события.
             with contextlib.suppress(Exception):
                 await app.bot.send_message(cfg.primary_chat_id, _(
-                    "🛠 Мастерская: «{what}» не запустилось ({why}), подробности в теме мастерской").format(
+                    "{head}: «{what}» не запустилось ({why}), подробности в теме").format(
+                        head=_b._background_head(cfg, key),
                         what=(events.load(store, event_id) or {}).get("title") or "?",
                         why={"not started": _("лимит или отказ, перенос назван в теме"),
                              "expired": _("срок вышел"), "error": _("сбой")}[outcome]),
@@ -130,11 +131,12 @@ def _event_ref(store: Path, event_id: str | None, silent: bool, deal_asks: bool 
 
 
 def _event_show_target(app: Application, rec: dict) -> tuple[int, int | None, str]:
-    """Куда сказать о событии: в его чат, а для мастерской в личку с 🛠."""
+    """Куда сказать о событии: в его чат, а для фоновой темы (мастерская,
+    отклики) в личку с её подписью."""
     cfg: Config = app.bot_data["cfg"]
     key = f"{rec['chat_id']}:{rec['thread_id']}" if rec.get("thread_id") is not None else str(rec["chat_id"])
-    if _b._is_workshop(cfg, key):
-        return cfg.primary_chat_id, None, _("🛠 Мастерская: ")
+    if _b._is_background(cfg, key):
+        return cfg.primary_chat_id, None, _b._background_head(cfg, key) + ": "
     return rec["chat_id"], rec.get("thread_id"), ""
 
 

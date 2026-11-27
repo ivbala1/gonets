@@ -27,7 +27,8 @@ PKG = ROOT / "src" / "claude_tg_bot"
 
 def test_root_is_repo() -> None:
     assert paths.BOT_ROOT == ROOT
-    assert paths.ENV_FILE == ROOT / ".env"
+    # conftest прячет настоящий .env от тестов: сверка по исходнику.
+    assert 'ENV_FILE = BOT_ROOT / ".env"' in Path(paths.__file__).read_text(encoding="utf-8")
     assert paths.VENV_PYTHON == ROOT / ".venv" / "bin" / "python"
 
 

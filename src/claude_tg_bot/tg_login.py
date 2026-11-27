@@ -27,12 +27,14 @@ def _login_keyboard(ctx, engines=("claude", "codex"), *, private: bool = True):
 
 async def _offer_login(update, ctx, engine):
     cfg = ctx.application.bot_data.get("cfg")
-    if cfg is not None and _b._is_workshop(cfg, _b._chat_key(update)[0]):
-        # Мастерская заглушена: кнопка входа в личку, туда же ведёт и вход.
+    key = _b._chat_key(update)[0]
+    if cfg is not None and _b._is_background(cfg, key):
+        # Фоновая тема заглушена: кнопка входа в личку, туда же ведёт и вход.
         with contextlib.suppress(Exception):
             await ctx.bot.send_message(
                 cfg.primary_chat_id,
-                _("🛠 Мастерская: нужно восстановить вход {engine}.").format(
+                (_("📨 Отклики: нужно восстановить вход {engine}.") if _b._is_otklik_topic(cfg, key)
+                 else _("🛠 Мастерская: нужно восстановить вход {engine}.")).format(
                     engine='Claude' if engine == 'claude' else 'Codex'),
                 reply_markup=_login_keyboard(ctx, (engine,), private=True))
         return

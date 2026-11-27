@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json as _json
 import logging
 import os
+import sys
 import time
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -49,6 +51,10 @@ RETRY_DELAYS = (2.0, 5.0)
 # replies, не больше двух раз и не дольше минуты.
 FLOOD_RETRIES = 2
 FLOOD_WAIT_MAX = 60.0
+
+# httpx на INFO пишет полный адрес запроса, а в нём токен: любой процесс с
+# tg_api (команды агента, screen_server с basicConfig INFO) его не печатает.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _loopback(host: str) -> bool:
@@ -169,10 +175,10 @@ class TokenLogFilter(logging.Filter):
 
 
 def scrub(text: str, *tokens: str) -> str:
-    """Токены в тексте на <token> (пустые пропускаются)."""
+    """Токены в тексте на <token> (пустые пропускаются), и в виде из адреса (%3A)."""
     for token in tokens:
         if token:
-            text = text.replace(token, "<token>")
+            text = text.replace(token, "<token>").replace(quote(token, safe=""), "<token>")
     return text
 
 
@@ -241,3 +247,65 @@ async def apost(token: str, method: str, *, json: Any = None, timeout: float = 1
     except (httpx.HTTPError, httpx.InvalidURL) as e:
         err: Exception = e
     raise _clean(err, token)
+
+
+def _may_have_arrived(prog: str, method: str, payload: dict[str, Any]) -> None:
+    from .i18n import _
+    print(_("{prog}: Telegram не подтвердил {method}: сообщение могло дойти без кнопок, "
+            "запись закрыта").format(prog=prog, method=method), file=sys.stderr)
+    if int(payload.get("chat_id") or 0) < 0:
+        # Группа: второе сообщение туда было бы дублем людям.
+        print(_("{prog}: это группа, заново не вызывай, скажи Ивану").format(prog=prog), file=sys.stderr)
+
+
+def cli_call(prog: str, method: str, payload: dict[str, Any],
+             photo: tuple[str, bytes, str] | None = None) -> dict[str, Any] | None:
+    """Вызов Bot API из команды агента (handoff, otklik): ответ Telegram или
+    None, причина отказа в stderr с именем команды. Неушедшее и 429 повторяются
+    сами; правка (edit*) повторяется при любом сбое связи, уже применённая
+    («not modified») успех. Неподтверждённая отправка остаётся отказом: без
+    номера сообщения кнопки не прикрепить. Ушедшее сообщение попадает в журнал
+    реакций. photo: (имя, байты, тип), отправка формой (sendPhoto).
+    Поведение при сбоях: docs/tg-send-failures-2026-11-07.md."""
+    # Не на уровне модуля: config и reactions сами зовут tg_api.
+    from . import reactions
+    from .config import load_config
+    cfg = load_config(skip_hook_validation=True)
+    edit = method.startswith("edit")
+    try:
+        if photo is None:
+            r = post(cfg.telegram_bot_token, method, json=payload, timeout=10.0,
+                     retry_not_sent=True, retry_any=edit)
+        else:
+            form = {k: v if isinstance(v, str) else _json.dumps(v) for k, v in payload.items()}
+            r = post(cfg.telegram_bot_token, method, data=form, files={"photo": photo}, timeout=30.0,
+                     retry_not_sent=True)
+    except httpx.HTTPError as e:
+        if is_unconfirmed(e) and not edit:
+            _may_have_arrived(prog, method, payload)
+        else:
+            print(f"{prog}: HTTP error: {type(e).__name__}", file=sys.stderr)
+        return None
+    if edit and not_modified(r):
+        return {"ok": True, "result": True}
+    if r.status_code != 200:
+        # Без URL: в нём токен бота; тело тоже чистится (прокси повторяет путь), до обрезки.
+        print(f"{prog}: {method} failed: {r.status_code} {scrub(r.text, cfg.telegram_bot_token)[:200]}",
+              file=sys.stderr)
+        return None
+    try:
+        res = r.json()
+    except ValueError:
+        res = None
+    sent = isinstance(res, dict) and res.get("ok") is True and (
+        edit or isinstance(res.get("result"), dict) and isinstance(res["result"].get("message_id"), int))
+    if not sent:
+        # 200 без годного ответа (прокси, обрыв): отказ, вызывающий закроет запись;
+        # отправка при этом могла дойти.
+        print(f"{prog}: {method}: unexpected response", file=sys.stderr)
+        if not edit:
+            _may_have_arrived(prog, method, payload)
+        return None
+    if not edit:
+        reactions.remember_sent(res, payload.get("text") or payload.get("caption"), cfg.state_dir)
+    return res

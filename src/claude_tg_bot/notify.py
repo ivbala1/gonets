@@ -239,7 +239,8 @@ def _deliver(cfg, args: argparse.Namespace, text: str, chat_id: int, thread_id: 
             _print_id_on_failure(args.pin, first_message_id)
             return 1, first_message_id
         if r.status_code != 200:
-            print(f"notify: sendMessage failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+            print(f"notify: sendMessage failed: {r.status_code} {tg_api.scrub(r.text, cfg.telegram_bot_token)[:200]}",
+                  file=sys.stderr)
             _print_id_on_failure(args.pin, first_message_id)
             return 1, first_message_id
         with contextlib.suppress(AttributeError, ValueError):
@@ -350,7 +351,7 @@ def _pin_call(token: str, method: str, chat_id: int, message_id: int, *, silent:
     if tg_api.not_modified(r):  # повтор уже прошедшего закрепа
         return True
     if r.status_code != 200:
-        print(f"notify: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+        print(f"notify: {method} failed: {r.status_code} {tg_api.scrub(r.text, token)[:200]}", file=sys.stderr)
         return False
     return True
 
@@ -368,7 +369,7 @@ def _unpin(token: str, chat_id: int, message_id: int) -> int:
         print(f"unpinned message_id={message_id} (already not pinned)")
         return 0
     if r.status_code != 200:
-        print(f"notify: unpinChatMessage failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+        print(f"notify: unpinChatMessage failed: {r.status_code} {tg_api.scrub(r.text, token)[:200]}", file=sys.stderr)
         return 1
     print(f"unpinned message_id={message_id}")
     return 0

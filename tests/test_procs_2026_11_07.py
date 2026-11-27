@@ -9,6 +9,7 @@ import ast
 import asyncio
 import os
 import signal
+import subprocess
 import time
 import unittest
 import unittest.mock
@@ -19,16 +20,26 @@ from claude_tg_bot import claude_runner, lifecycle, procs
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _state(pid: int) -> str:
+    """Состояние процесса одной буквой, пусто если его нет. На маке нет
+    /proc, там `ps` (на Linux тоже работает, но /proc дешевле)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError):  # исчез посреди чтения
+        pass
+    if Path("/proc/self").exists():  # /proc есть, а файла нет: процесса нет
+        return ""
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                         capture_output=True, text=True).stdout.strip()
+    return out[:1]
+
+
 def _gone(pid: int, wait: float = 3.0) -> bool:
     """Процесса нет или он зомби (снимет приёмный родитель)."""
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                state = f.read().rsplit(")", 1)[1].split()[0]
-        except (FileNotFoundError, ProcessLookupError):  # исчез посреди чтения
-            return True
-        if state == "Z":
+        if _state(pid) in ("", "Z"):  # нет процесса или зомби
             return True
         time.sleep(0.05)
     return False

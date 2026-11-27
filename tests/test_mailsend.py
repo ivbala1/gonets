@@ -65,9 +65,63 @@ class CommandClassifyTests(_Env):
                 self.assertEqual(kind, "card")
                 self.assertIn("Резюме", info["body"])
 
+    def test_cd_with_semicolon_is_simple_form(self) -> None:
+        # Карточка 10.11.2026 на справку: `cd DIR; PY --help 2>&1 | head -40`
+        # шла «mention», потому что после `cd DIR` принимался только `&&`.
+        self.assertEqual(outbound.mailsend_check(
+            f"cd ~/src/claude-tg-bot; {PY} --help 2>&1 | head -40", "/x")[0], "dry")
+        self.assertEqual(outbound.mailsend_check(
+            f"cd /home/user/src/claude-tg-bot; {self.cmd(' --dry-run')}", "/x")[0], "dry")
+        plain = outbound.mailsend_check(self.cmd(), None)
+        kind, info = outbound.mailsend_check(f"cd /home/user/src/claude-tg-bot; {self.cmd()}", "/x")
+        self.assertEqual((kind, info["digest"]), ("card", plain[1]["digest"]))
+        # Относительный путь читается из каталога `cd`, а не из каталога рана:
+        # на карточке письмо, которое прочтёт mailsend после удачного `cd`. При
+        # неудачном `cd` за `;` mailsend прочтёт другой файл, хеш не сойдётся
+        # с билетом, письмо не уйдёт (take_ticket).
+        (self.outside / "body.txt").write_text("чужой текст\n", encoding="utf-8")
+        rel = f"cd {self.body.parent}; python3 -m claude_tg_bot.mailsend --to a@b.c --subject S --body-file body.txt"
+        kind, info = outbound.mailsend_check(rel, str(self.outside))
+        self.assertEqual(kind, "card")
+        self.assertIn("Резюме", info["body"])
+        # Каталога `cd` нет: письма по относительному пути не собрать, отказ.
+        gone = rel.replace(str(self.body.parent), str(self.body.parent / "нет-такого"))
+        self.assertEqual(outbound.mailsend_check(gone, str(self.outside))[0], "deny")
+        # `cd ~нет_такого`: expanduser бросает RuntimeError, обработчик не падает.
+        self.assertEqual(outbound.mailsend_check(f"cd ~нет-такого-xyz; {PY} --help", "/x")[0], "mention")
+        # Другие разделители после `cd DIR` простой формой не стали.
+        for sep in ("||", "|", "&", ";;"):
+            with self.subTest(sep=sep):
+                self.assertEqual(outbound.mailsend_check(
+                    f"cd /home/user/src/claude-tg-bot {sep} {self.cmd()}", "/x")[0], "mention")
+
+    def test_dollar_in_single_quotes_is_text(self) -> None:
+        # Ревью Codex 11.11.2026: тема `'Оклад $5000'` давала карточку команды
+        # без билета, письмо не уходило.
+        base = f"{PY} --to a@b.c --body-file {self.body}"
+        kind, info = outbound.mailsend_check(base + " --subject 'Оклад $5000, `код` и \\n'", None)
+        self.assertEqual((kind, info["subject"]), ("card", "Оклад $5000, `код` и \\n"))
+        # Вне одинарных кавычек знаки оболочки по-прежнему не простая форма.
+        for subject in ('"Оклад $5000"', "Оклад\\ 5000", '"`id`"', "$'a\\'b'", "'a'$HOME"):
+            with self.subTest(subject=subject):
+                self.assertEqual(outbound.mailsend_check(f"{base} --subject {subject}", None)[0], "mention")
+
+    def test_unreadable_file_is_denied(self) -> None:
+        # OSError при чтении (файл пропал между проверкой и чтением) это отказ,
+        # а не исключение из обработчика.
+        with patch.object(mailsend, "load_letter", side_effect=PermissionError("нет доступа")):
+            kind, why = outbound.mailsend_check(self.cmd(), None)
+        self.assertEqual(kind, "deny")
+        self.assertIn("нет доступа", why)
+
     def test_dry_run_and_help_skip_card(self) -> None:
         self.assertEqual(outbound.mailsend_check(self.cmd(" --dry-run"), None)[0], "dry")
         self.assertEqual(outbound.mailsend_check(f"{PY} --help", None)[0], "dry")
+        # Сокращённая справка: argparse выходит сам, бот от этого не падает.
+        for flag in ("--hel", "--he", "-hh"):
+            with self.subTest(flag=flag), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(outbound.mailsend_check(f"{PY} {flag}", None)[0], "dry")
+                self.assertEqual(outbound.mailsend_check(self.cmd(f" {flag}"), None)[0], "dry")
 
     def test_tricky_forms_give_command_card(self) -> None:
         for cmd in (f'bash -c "{self.cmd()}"', f"x=$({self.cmd()})", f"`{self.cmd()}`",
@@ -159,12 +213,47 @@ class CommandClassifyTests(_Env):
                 self.assertEqual(kind, "deny")
                 self.assertTrue(reason.startswith("mailsend:"))
 
+    def test_bad_paths_denied_not_raised(self) -> None:
+        # Исключение наружу роняло обработку запроса бота (Codex 11.11.2026, круг 2).
+        nouser = "~no_such_review_user_xyz"
+        for cmd in (f"{PY} --to a@b.c --subject S --body-file '{nouser}/body'",
+                    f"{PY} --to a@b.c --subject S --body-file {self.body} --attach '{nouser}/cv.pdf'",
+                    f"{PY} --to a@b.c --subject S --body-file '/x\0'",
+                    f"cd '/x\0'; {PY} --to a@b.c --subject S --body-file body.txt"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "deny")
+
     def test_symlink_out_of_allowed_dir_denied(self) -> None:
         link = self.allowed / "link.pdf"
         link.symlink_to(self.outside / "secret.pdf")
         kind, _ = outbound.mailsend_check(
             f"{PY} --to a@b.c --subject S --body-file {self.body} --attach {link}", None)
         self.assertEqual(kind, "deny")
+
+
+    def test_files_read_only_up_to_limit(self) -> None:
+        # Чтение целиком до проверки размера убивало проверку (`--body-file /dev/zero`,
+        # 11.11.2026). Здесь только малый предел и файл в 40 байт: большие файлы
+        # и /dev/zero в тестах запрещены (тест на старом коде съел память мака).
+        big = self.allowed / "big.txt"
+        big.write_bytes(b"x" * 40)
+        short = self.allowed / "short.txt"
+        short.write_text("ok", encoding="utf-8")  # тело в пределе: отказ даёт вложение
+
+        def no_full_read(path, *a, **k):
+            raise AssertionError(f"файл прочитан целиком: {path}")
+
+        with patch.object(mailsend, "BODY_MAX_BYTES", 16), \
+                patch.dict(os.environ, {mailsend.MAX_BYTES_VAR: "16"}), \
+                patch.object(Path, "read_bytes", no_full_read):
+            for cmd in (f"{PY} --to a@b.c --subject S --body-file {big}",
+                        f"{PY} --to a@b.c --subject S --body-file {short} --attach {big}"):
+                with self.subTest(cmd=cmd):
+                    kind, reason = outbound.mailsend_check(cmd, None)
+                    self.assertEqual(kind, "deny")
+                    self.assertIn("16", reason)  # отказ по размеру, а не другой
+        self.assertEqual(len(mailsend._read_capped(big, 10)), 11)
+        self.assertEqual(len(mailsend._read_capped(big, -5)), 1)
 
 
 class HandleApproveTests(_Env):
@@ -213,7 +302,8 @@ class HandleApproveTests(_Env):
             with self.subTest(cmd=cmd[:40]):
                 out, card = self._decide(cmd, unattended=True)
                 self.assertEqual(out["decision"], "deny")
-                self.assertIn("черновик в отчёт", out["reason"])
+                self.assertEqual(out["reason"], _(outbound.UNATTENDED_HINT))
+                self.assertIn("черновик в отчёт с адресатом", outbound.UNATTENDED_HINT)  # смысл подсказки
                 card.assert_not_called()
 
     def test_dry_run_passes_without_card(self) -> None:

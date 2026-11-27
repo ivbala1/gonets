@@ -408,6 +408,125 @@ class BotWarmTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.pings, [])
         self.assertEqual(self.bot_data["active_work"], 0)
 
+    # Перезапуск бота (25.11.2026): цепочка поднимается из state/warm_marks.json.
+    def _restart(self) -> int:
+        """Новый процесс бота: пустые bot_data и очередь заданий, тот же state."""
+        self.jq = _JobQueue()
+        self.bot_data = {"cfg": self.cfg, "sessions": self.store, "procs": {},
+                         "session_targets": {}, "chat_locks": {}, "active_work": 0}
+        self.ctx = SimpleNamespace(
+            application=SimpleNamespace(bot_data=self.bot_data, job_queue=self.jq),
+            job=SimpleNamespace(data=("183", 0)),
+        )
+        n = botmod.warm_restore(self.ctx.application)
+        if self.jq.jobs:
+            self.ctx.job.data = self.jq.jobs[-1][2]
+        return n
+
+    def _saved(self) -> dict:
+        return json.loads((self.cfg.state_dir / "warm_marks.json").read_text())
+
+    async def test_restart_continues_chain(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run()
+        self.assertEqual(self._saved()["183"]["sid"], MAIN)
+        self.assertEqual(self._restart(), 1)
+        self.assertLess(self.jq.jobs[-1][0], 5)  # срок прошёл: пинг сразу
+        await botmod._warm_tick(self.ctx)
+        self.assertEqual(len(self.pings), 1)
+        # Удачный пинг двигает отметку и на диске.
+        self.assertAlmostEqual(self._saved()["183"]["at"], self.ping_result.last_request_at)
+
+    async def test_failed_ping_not_repeated_after_restart(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run()
+        self.ping_result = ClaudeResult(text="ок", session_id=MAIN, requests=1,
+                                        last_request_at=time.time(),
+                                        first_cache_read=0, first_cache_write=150_000)
+        await botmod._warm_tick(self.ctx)
+        self.assertEqual(len(self.pings), 1)
+        self.assertEqual(self._saved(), {})
+        self.assertEqual(self._restart(), 0)
+
+    async def test_ping_stopped_by_restart_keeps_saved_mark(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run(last_request_at=time.time() - 56 * 60)
+        at = self.bot_data["warm"]["183"]["at"]
+        self.ping_result = ClaudeResult(text="", session_id=MAIN, is_error=True, requests=0)
+        orig = botmod.run_claude
+
+        async def draining_run(*a, **kw):
+            self.bot_data["draining"] = True
+            return await orig(*a, **kw)
+
+        with patch.object(botmod, "run_claude", draining_run):
+            await botmod._warm_tick(self.ctx)
+        self.assertEqual(self._saved()["183"]["at"], at)
+        self.assertEqual(self._restart(), 1)
+
+    async def test_no_ping_when_marks_not_saved(self) -> None:
+        blocker = Path(self.tmp.name) / "not-a-dir"
+        blocker.write_text("x")
+        self.cfg.state_dir = blocker  # запись в него падает OSError
+        self._after_run()
+        await botmod._warm_tick(self.ctx)
+        self.assertEqual(self.pings, [])
+
+    async def test_ping_reached_model_not_repeated_after_restart(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run(last_request_at=time.time() - 56 * 60)
+        self.ping_result = ClaudeResult(text="ок", session_id=MAIN, requests=1,
+                                        last_request_at=time.time(),
+                                        first_cache_read=0, first_cache_write=150_000)
+        orig = botmod.run_claude
+
+        async def draining_run(*a, **kw):
+            self.bot_data["draining"] = True
+            return await orig(*a, **kw)
+
+        with patch.object(botmod, "run_claude", draining_run):
+            await botmod._warm_tick(self.ctx)
+        self.assertEqual(self._saved(), {})
+        self.assertEqual(self._restart(), 0)
+
+    async def test_untrusted_run_does_not_revive_failed_chain(self) -> None:
+        self._after_run()
+        self.ping_result = ClaudeResult(text="ок", session_id=MAIN, requests=1,
+                                        last_request_at=time.time(),
+                                        first_cache_read=0, first_cache_write=150_000)
+        await botmod._warm_tick(self.ctx)
+        jobs = len(self.jq.jobs)
+        botmod._warm_resume_after(self.ctx.application, "183")
+        self.assertEqual(len(self.jq.jobs), jobs)
+        self._after_run()  # живая цепочка продолжается
+        jobs = len(self.jq.jobs)
+        botmod._warm_resume_after(self.ctx.application, "183")
+        self.assertEqual(len(self.jq.jobs), jobs + 1)
+
+    def test_junk_saved_marks_skipped(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        (self.cfg.state_dir / "warm_marks.json").write_text(json.dumps({
+            "183": {"sid": MAIN, "at": 1e309, "expected": 1e309, "sig": []},
+            "1": [], "2": {"sid": None, "at": time.time(), "expected": 1, "sig": []}}))
+        self.assertEqual(self._restart(), 0)
+        self.assertEqual(self._saved(), {})
+
+    def test_stale_or_other_session_not_restored(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run(last_request_at=time.time() - 59 * 60)
+        self.assertEqual(self._restart(), 0)
+        self.assertEqual(self._saved(), {})
+        self._after_run()
+        self.store.set("183", "other-session")
+        self.assertEqual(self._restart(), 0)
+        self.assertEqual(self.jq.jobs, [])
+
+    def test_forget_removes_saved_mark(self) -> None:
+        self.cfg.state_dir = Path(self.tmp.name)
+        self._after_run()
+        botmod._warm_forget(self.ctx.application, "183")
+        self.assertEqual(self._saved(), {})
+
 
 
 class _Status:

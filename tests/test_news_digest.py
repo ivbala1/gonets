@@ -111,7 +111,7 @@ class PageTests(unittest.TestCase):
         state = State()
         html1 = "<p>October 1, 2026 first feature that is long enough</p><p>short</p>"
         cand, snap = page_candidate(html1, self.SRC, state, is_html=True)
-        self.assertIn(_("первое чтение страницы, новыми считать только записи после границы"), cand.title)
+        self.assertIn(_("первое чтение страницы, новыми считать только записи начиная с границы"), cand.title)
         self.assertIn("first feature", cand.body)
         self.assertNotIn("short", cand.body)
         state.snapshots["p"] = snap
@@ -230,6 +230,19 @@ class AnswerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_answer("не знаю", [_cand(1)])
 
+    def test_tail_after_json_and_broken_outer(self):
+        # Разбор недели Домового W47: за верным JSON модель дописала его копию
+        # внутри выдуманного вызова инструмента; срез до последней «}» падал.
+        body = '{"items": []}'
+        raw = f'```json\n{body}\n```\n<invoke name="Write"><parameter name="content">{body}</parameter></invoke>'
+        self.assertEqual(parse_answer(raw, [_cand(1)]), [])
+        # Битый внешний объект не подменяется вложенным: отказ остаётся отказом.
+        with self.assertRaises(ValueError):
+            parse_answer('{"items": [{"refs": ["c1"], "title": "x"}, ', [_cand(1)])
+        for raw in ('Формат: {}\n{"items": []}', '{"items": [\n{"refs": ["c1"], "title": "x"}\n'):
+            with self.assertRaises(ValueError):
+                parse_answer(raw, [_cand(1)])
+
 
 class MessageTests(unittest.TestCase):
     ITEM = Item(1, "tools", "Claude Code <2.1.292>", "Подагенты & уровень.", "Разведчики дешевле.",
@@ -337,6 +350,9 @@ class MessageTests(unittest.TestCase):
         keys = {"bot", "svod"}
         self.assertEqual(parse_backlog_choice('{"project": "svod", "why": "роутер"}', keys), ("svod", "роутер"))
         self.assertEqual(parse_backlog_choice('ok {"project": "../etc", "why": "x"}', keys), (None, "x"))
+        # Копия JSON в хвосте (W47 Домового) не теряет выбор.
+        self.assertEqual(parse_backlog_choice(
+            '{"project": "svod", "why": "р"}\n<invoke>{"project": "svod", "why": "р"}</invoke>', keys), ("svod", "р"))
         self.assertEqual(parse_backlog_choice('{"project": "none", "why": "не моё"}', keys), (None, "не моё"))
         self.assertEqual(parse_backlog_choice("мусор", keys), (None, ""))
 

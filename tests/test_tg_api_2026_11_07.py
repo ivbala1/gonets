@@ -429,8 +429,11 @@ MAIN_ENV = f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_ALLOWED_USER_IDS=5\n"
 def test_bot_down_fallback_on_any_failure_without_token_in_stderr(tmp_path, monkeypatch, capsys, kind) -> None:
     rc, sent = _run_bot_down(tmp_path, monkeypatch, MAIN_ENV + ALERT_ENV,
                              fail_tokens=((ALERT_TOKEN, kind), (TOKEN, kind)))
-    # Отказ Telegram (4xx) не повторяется, остальное по три попытки на путь.
-    assert rc == 1 and len(sent) == (2 if kind == "http" else 6)
+    # Отказ Telegram (4xx) не повторяется, кроме 400 при теме: бот тревог шлёт ещё раз
+    # без темы (удалённая тема, 26.11.2026); остальное по три попытки на путь.
+    assert rc == 1 and len(sent) == (3 if kind == "http" else 6)
+    if kind == "http":
+        assert [b.get("message_thread_id") for _u, b in sent] == [77, None, None]
     err = capsys.readouterr().err
     assert TOKEN not in err and ALERT_TOKEN not in err and "SECRET" not in err
 

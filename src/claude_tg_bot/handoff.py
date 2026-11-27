@@ -60,7 +60,7 @@ SHOW_CHAT_KEY_ENV = "CLAUDE_TG_SHOW_CHAT_KEY"
 SESSION_ENV = "AGENT_BROWSER_SESSION"
 TTL_SECONDS = 600
 DEFAULT_WAIT = 580
-RATE_LIMIT = 3          # передач на чат
+RATE_LIMIT = 15         # передач на чат
 RATE_WINDOW = 3600      # за столько секунд
 KEEP_DAYS = 7
 OPEN = "open"
@@ -426,44 +426,8 @@ def stream_disable(session: str) -> None:
 
 def _bot_api(method: str, payload: dict[str, Any],
              photo: tuple[str, bytes, str] | None = None) -> dict[str, Any] | None:
-    import httpx
-
     from . import tg_api
-    from .config import load_config
-    cfg = load_config(skip_hook_validation=True)
-    # Неушедшее и 429 повторяются сами; правка повторяется при любом сбое
-    # связи, уже применённая (not modified) успех. Неподтверждённая отправка
-    # остаётся отказом: без номера сообщения кнопки не прикрепить.
-    edit = method.startswith("edit")
-    try:
-        if photo is None:
-            r = tg_api.post(cfg.telegram_bot_token, method, json=payload, timeout=10.0,
-                            retry_not_sent=True, retry_any=edit)
-        else:
-            form = {k: v if isinstance(v, str) else json.dumps(v) for k, v in payload.items()}
-            r = tg_api.post(cfg.telegram_bot_token, method, data=form, files={"photo": photo}, timeout=30.0,
-                            retry_not_sent=True)
-    except httpx.HTTPError as e:
-        if tg_api.is_unconfirmed(e) and not edit:
-            print(_("handoff: Telegram не подтвердил {method}: сообщение могло дойти без кнопок, "
-                    "передача закрыта").format(method=method), file=sys.stderr)
-            if int(payload.get("chat_id") or 0) < 0:
-                # Группа: второе сообщение туда было бы дублем людям.
-                print(_("handoff: это группа, заново не вызывай, скажи Ивану"), file=sys.stderr)
-        else:
-            print(f"handoff: HTTP error: {type(e).__name__}", file=sys.stderr)
-        return None
-    if edit and tg_api.not_modified(r):
-        return {"ok": True, "result": True}
-    if r.status_code != 200:
-        # Без URL: в нём токен бота.
-        print(f"handoff: {method} failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
-        return None
-    res = r.json()
-    if not edit:
-        from . import reactions
-        reactions.remember_sent(res, payload.get("text") or payload.get("caption"), cfg.state_dir)
-    return res
+    return tg_api.cli_call("handoff", method, payload, photo)
 
 
 def markup(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
@@ -500,7 +464,10 @@ def _cmd_ask(args: argparse.Namespace, base: Path, primary_chat_id: int) -> int:
         img = Path(args.image)
         kind = IMAGE_TYPES.get(img.suffix.lower())
         try:
-            data = img.read_bytes() if kind else b""
+            data = b""
+            if kind:  # расширение до открытия: канал без писателя повесил бы open
+                with img.open("rb") as fh:
+                    data = fh.read(IMAGE_CAP + 1)  # не больше предела плюс байт
         except OSError:
             data = b""
         if not data or len(data) > IMAGE_CAP:

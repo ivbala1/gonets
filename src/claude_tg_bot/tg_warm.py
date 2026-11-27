@@ -8,7 +8,7 @@ from datetime import datetime
 
 from telegram.ext import Application, ContextTypes
 
-from . import limits, warm
+from . import jsonstore, limits, warm
 from .claude_runner import ClaudeResult, SessionStore
 from .config import Config, local_zone
 from .i18n import _
@@ -21,6 +21,9 @@ log = logging.getLogger("claude_tg_bot.bot")
 WARM_RUNTIME_SEC = 180
 # Насколько раньше срока задание job_queue может сработать без отказа.
 WARM_EARLY_SEC = 30
+# Отметки живых цепочек на диске (25.11.2026): перезапуск бота обрывал
+# цепочку, за 11-25.11 это 7 холодных возвратов личного чата, 1,33 млн записи.
+WARM_FILE = "warm_marks.json"
 
 
 def _warm_prompt() -> str:
@@ -54,7 +57,8 @@ def _warm_after_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
     marks: dict = ctx.application.bot_data.setdefault("warm", {})
     if not result.context_tokens:
         # Разговор сжат в последнем запросе, ожидаемый размер неизвестен.
-        marks.pop(chat_key, None)
+        if marks.pop(chat_key, None) is not None:
+            _warm_save(ctx.application)
         return
     marks[chat_key] = {"sid": sid, "at": result.last_request_at,
                        "expected": result.context_tokens, "sig": sig}
@@ -64,6 +68,66 @@ def _warm_after_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
 def _warm_forget(app: Application, chat_key: str) -> None:
     if app.bot_data.get("warm", {}).pop(chat_key, None) is not None:
         _warm_cancel(app, chat_key)
+        _warm_save(app)
+
+
+def _warm_save(app: Application) -> bool:
+    """Отметки живых цепочек в state/: после перезапуска бота цепочка
+    продолжается (warm_restore). Отметка пинга, который ушёл и ещё не
+    подтвердил чтение кэша, на диск не попадает («off»): неудачный пинг
+    не повторится после перезапуска (ревью Codex 25.11.2026)."""
+    state_dir = getattr(app.bot_data.get("cfg"), "state_dir", None)
+    if state_dir is None:
+        return True
+    data = {k: {"sid": m["sid"], "at": m["at"], "expected": m["expected"], "sig": list(m["sig"])}
+            for k, m in app.bot_data.get("warm", {}).items() if not m.get("off")}
+    try:
+        jsonstore.write_json(state_dir / WARM_FILE, data)
+    except OSError as e:
+        log.warning("warm marks not saved: %s", e)
+        return False
+    return True
+
+
+def warm_restore(app: Application) -> int:
+    """После запуска бота: цепочки, чья отметка моложе LATE_SEC и сессия
+    темы та же. Остальные проверки (окно, параметры рана, резерв, близость
+    сжатия) делает пинг, как обычно. Отдаёт число поднятых цепочек."""
+    bd = app.bot_data
+    cfg = bd["cfg"]
+    state_dir = getattr(cfg, "state_dir", None)
+    if state_dir is None or not getattr(cfg, "warm_chats", None):
+        return 0
+    store: SessionStore = bd["sessions"]
+    marks: dict = bd.setdefault("warm", {})
+    now = time.time()
+    restored: list[str] = []
+    for chat_key, m in jsonstore.read_dict(state_dir / WARM_FILE).items():
+        try:
+            sid, at, expected, sig = m["sid"], float(m["at"]), int(m["expected"]), tuple(m["sig"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if (not sid or chat_key not in getattr(cfg, "warm_chats", frozenset()) or chat_key in marks
+                or not 0 <= now - at <= warm.LATE_SEC or store.get(chat_key) != sid):
+            continue
+        marks[chat_key] = {"sid": sid, "at": at, "expected": expected, "sig": sig}
+        restored.append(chat_key)
+    # Задания после того, как в памяти все отметки: каждая запись файла
+    # полная, обрыв посреди не теряет ещё не поднятые (ревью Codex 25.11.2026).
+    for chat_key in restored:
+        _b._warm_schedule(app, chat_key)
+    _warm_save(app)
+    if restored:
+        log.info("warm restored %d chain(s) after start", len(restored))
+    return len(restored)
+
+
+def _warm_resume_after(app: Application, chat_key: str) -> None:
+    """После рана по чужому тексту (bot.py, warm_after): продолжить цепочку,
+    если она жива. Отметку неудачного пинга («off») не продолжать (ревью 25.11.2026)."""
+    mark = app.bot_data.get("warm", {}).get(chat_key)
+    if mark is not None and not mark.get("off"):
+        _b._warm_schedule(app, chat_key)
 
 
 def _warm_cancel(app: Application, chat_key: str) -> None:
@@ -85,6 +149,8 @@ def _warm_schedule(app: Application, chat_key: str) -> None:
     mark = bd["warm"][chat_key]
     bd["warm_gen"] = gen = bd.get("warm_gen", 0) + 1
     mark["gen"] = gen
+    mark.pop("off", None)
+    _warm_save(app)
     cfg: Config = bd["cfg"]
     delay = max(1.0, mark["at"] + cfg.warm_idle_min * 60 - time.time())
     jq.run_once(_warm_tick, when=delay, name=f"warm:{chat_key}", data=(chat_key, gen))
@@ -151,6 +217,13 @@ async def _warm_tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if reason:
                 log.info("warm skip chat=%s: %s", chat_key, reason)
                 return
+            # С диска до пинга: упавший или неудачный пинг перезапуск не повторит.
+            mark["off"] = True
+            if not _warm_save(app):
+                # На диске осталась прежняя отметка: неудачный пинг повторился
+                # бы после перезапуска. Цепочку кончает следующий ран.
+                log.info("warm skip chat=%s: marks not saved", chat_key)
+                return
             result = await _b.run_claude(
                 cfg.claude_bin, chat_key, int(chat_id_s), int(thread_s) if thread_s else None,
                 _warm_prompt(), bd["sessions"],
@@ -181,6 +254,12 @@ async def _warm_tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                             chat_key, result.is_error, result.requests, result.compacted,
                             result.first_cache_read, result.first_cache_write, mark["expected"],
                             result.text[:200])
+                if (bd.get("stopping") or bd.get("draining")) and not result.requests:
+                    # Пинг погашен перезапуском до запроса к модели: отметка
+                    # прежняя, новый процесс решит по ней сам (проверка «late»).
+                    # Дошедший до модели пинг не повторяется (ревью Codex 25.11).
+                    mark.pop("off", None)
+                    _warm_save(app)
                 return
             mark["at"] = result.last_request_at
             _b._warm_schedule(app, chat_key)

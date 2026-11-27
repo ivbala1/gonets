@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -42,7 +43,7 @@ def _esc_truncate(s: str, limit: int) -> str:
     if len(escaped) <= limit:
         return escaped
     cut = escaped[:limit]
-    # Если обрезали посреди HTML-entity (`&lt;`, `&amp;` и т.п.) — откатываемся
+    # Если обрезали посреди HTML-entity (`&lt;`, `&amp;` и т.п.), откатываемся
     # до последнего `&`, у которого нет закрывающего `;` в хвосте.
     last_amp = cut.rfind("&")
     if last_amp >= 0 and ";" not in cut[last_amp:]:
@@ -132,8 +133,6 @@ _TEXT_TOOLS = frozenset({"git", "grep", "egrep", "fgrep", "rg", "echo", "printf"
 # Обёртки перед настоящей командой: `timeout 60 git ...` это git.
 _CMD_WRAPPERS = frozenset({"env", "timeout", "nice", "nohup", "sudo", "exec", "command",
                            "time", "stdbuf", "setsid", "strace", "ltrace"})
-_HEREDOC_RE = re.compile(
-    r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)(?:\n[ \t]*\2[ \t]*(?=\n|\Z)|\Z)", re.S)
 _MAILSEND_MODULE = "claude_tg_bot.mailsend"
 _PYTHON_RE = re.compile(r"(?:\S*/)?python3?(?:\.\d+)?")
 _SHELL_OPS = frozenset("();<>|&")
@@ -141,14 +140,17 @@ _MAILSEND_FORM = "[cd DIR &&] .venv/bin/python -m claude_tg_bot.mailsend --to ..
 
 
 def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] | None:
-    """Аргументы mailsend из простой команды `[cd DIR &&] PY -m
+    """Аргументы mailsend из простой команды `[cd DIR && или ;] PY -m
     claude_tg_bot.mailsend ...` и каталог для относительных путей. Подстановки,
     bash -c, heredoc, переменные и хвост не из читателей (_reader_tail) не
     разбираются: None."""
     # Перенос строки через `\` bash убирает до разбора; в одинарных кавычках
     # он остался бы, но такой путь или тема дадут другой хеш, то есть отказ.
-    cmd = cmd.replace("\\\n", "")
-    if any(c in cmd for c in "$`\\\n\r"):
+    cmd = _join_lines(cmd)
+    # В одинарных кавычках `$`, обратная кавычка и `\` обычные знаки: тема
+    # `'Оклад $5000'` это простая форма (ревью Codex 11.11.2026).
+    quoted = _single_quoted(cmd)
+    if any(c in "\n\r" or (c in "$`\\" and not quoted[i]) for i, c in enumerate(cmd)):
         return None
     try:
         # Комментарий как в bash: `#` в начале слова вне кавычек, до конца
@@ -156,7 +158,7 @@ def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] |
         # считает комментарием, bash нет: хвост за ним пропал бы из разбора
         # (ревью Opus 09.11.2026), а без комментариев вовсе `# don't` ломал
         # разбор и `# --help` делал отправку справкой (ревью Codex).
-        lex = shlex.shlex(cmd[:_shell_scan(cmd)[1]], posix=True, punctuation_chars=True)
+        lex = shlex.shlex(_strip_comments(cmd), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.commenters = ""
         tokens = list(lex)
@@ -164,9 +166,15 @@ def _mailsend_argv(cmd: str, cwd: str | None) -> tuple[list[str], Path | None] |
         return None
     base = Path(cwd) if cwd and Path(cwd).is_absolute() else None
     if tokens[:1] == ["cd"]:
-        if len(tokens) < 3 or tokens[2] != "&&":
+        # `;` наравне с `&&` (карточка на справку 10.11.2026): при неудачном
+        # `cd` mailsend прочтёт относительные пути из другого каталога, хеш не
+        # сойдётся с билетом, и письмо не уйдёт.
+        if len(tokens) < 3 or tokens[2] not in ("&&", ";"):
             return None
-        target = Path(tokens[1]).expanduser()
+        try:
+            target = Path(tokens[1]).expanduser()
+        except (RuntimeError, ValueError):  # `~нет_такого_пользователя`, нулевой байт
+            return None
         if not target.is_absolute():
             if base is None:
                 return None
@@ -211,13 +219,73 @@ def _reader_tail(rest: list[str]) -> bool:
     return True
 
 
+# Обёртки, которые запускают следующую команду: короткие буквы ключей со
+# значением (в том числе последней буквой склейки: `sudo -iu root`, `xargs
+# -0n 1`) и длинные ключи со значением следующим словом. Ключ вида `-n5`,
+# `--signal=TERM` значение несёт сам.
+WRAPPER_VALUE: dict[str, tuple[str, frozenset[str]]] = {
+    "sudo": ("ugCDhprtUT", frozenset({"--user", "--group", "--chdir", "--host", "--prompt", "--role", "--type",
+                                      "--other-user", "--close-from", "--command-timeout"})),
+    "env": ("uCS", frozenset({"--unset", "--chdir", "--split-string"})),
+    "timeout": ("sk", frozenset({"--signal", "--kill-after"})),
+    "nice": ("n", frozenset({"--adjustment"})),
+    "ionice": ("cnpPu", frozenset({"--class", "--classdata", "--pid", "--pgid", "--uid"})),
+    "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"})),
+    "xargs": ("InPdLsEa", frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file",
+                                       "--replace", "--eof", "--max-chars", "--process-slot-var"})),
+    "nohup": ("", frozenset()), "setsid": ("", frozenset()), "time": ("", frozenset()),
+    "command": ("", frozenset()), "exec": ("a", frozenset()), "builtin": ("", frozenset()),
+    "rtk": ("", frozenset()), "caffeinate": ("tw", frozenset()),
+    "watch": ("nq", frozenset({"--interval", "--equexit"})),
+    "doas": ("uC", frozenset()), "chronic": ("", frozenset()), "busybox": ("", frozenset()),
+    "unshare": ("", frozenset({"--setgroups", "--map-user", "--map-group", "--wd", "--root"})),
+    "nsenter": ("tSGwr", frozenset({"--target", "--setuid", "--setgid", "--wd", "--root"})),
+    "strace": ("eopsEuIabXP", frozenset({"--output", "--signal", "--user", "--env"})),
+    "ltrace": ("eopsEuabn", frozenset({"--output", "--user"})),
+    "taskset": ("", frozenset()), "chrt": ("", frozenset()), "flock": ("wE", frozenset({"--timeout",
+                                                                                           "--conflict-exit-code"})),
+}
+
+
+def skip_options(name: str, words: list[str],
+                 spec: tuple[str, frozenset[str]] | None = None, start: int = 0) -> int:
+    """Номер первого слова после ключей обёртки `name`, стоящей в words[start]
+    (spec: свои буквы и длинные ключи со значением, для программы не из WRAPPER_VALUE: ssh)."""
+    letters, long_values = spec or WRAPPER_VALUE[name]
+    i = start + 1
+    while i < len(words):
+        w = words[i]
+        if name == "env" and "=" in w and not w.startswith("-"):
+            i += 1
+        elif w.startswith("--"):
+            i += 2 if w in long_values else 1
+        elif w.startswith("-") and len(w) > 1:
+            # Короткие склеенные: значение несёт хвост (`-n5`) или следующее
+            # слово, если буква со значением последняя (`-iu root`).
+            body = w[1:]
+            k = next((n for n, ch in enumerate(body) if ch in letters), None)
+            i += 2 if k is not None and k == len(body) - 1 else 1
+        else:
+            break
+    return i
+
+
 def _command_head(tokens: list[str]) -> str:
-    """Имя команды простого куска: без присваиваний VAR=..., обёрток и их ключей."""
-    for t in tokens:
-        if (re.fullmatch(r"\w+=.*", t, re.S) or t.startswith("-")
-                or re.fullmatch(r"[\d.]+[smhd]?", t) or Path(t).name in _CMD_WRAPPERS):
-            continue
-        return Path(t).name
+    """Имя команды простого куска: без присваиваний VAR=..., обёрток и их ключей
+    (ключи со значением по WRAPPER_VALUE: `sudo -Hu git rm` это rm, а не git)."""
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        name = Path(t).name
+        if re.fullmatch(r"\w+=.*", t, re.S) or t.startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", t):
+            i += 1
+        elif name in _CMD_WRAPPERS:
+            end = skip_options(name, tokens, start=i) if name in WRAPPER_VALUE else i + 1
+            if name == "env" and any(w.startswith(("-S", "--split-string")) for w in tokens[i + 1:end]):
+                return name  # `env -S 'команда' …`: строка исполняется, кусок не текстовый
+            i = end
+        else:
+            return name
     return ""
 
 
@@ -227,35 +295,459 @@ def _command_head(tokens: list[str]) -> str:
 _COMMENT_AFTER = frozenset(" \t\n;&|()<>")
 
 
-def _shell_scan(cmd: str) -> tuple[list[bool], int]:
+def _escaped(t: str, pos: int) -> bool:
+    """Перед позицией нечётное число `\\`: знак на ней экранирован
+    (`\\$(`, склейка `\\` с переводом строки); `\\\\` это одна `\\`."""
+    n = 0
+    while pos - n - 1 >= 0 and t[pos - n - 1] == "\\":
+        n += 1
+    return n % 2 == 1
+
+
+# Знаков на поиск пар скобок в одном разборе: длинный ввод с незакрытыми
+# `((` не делает разбор квадратичным (ревью Opus и Codex 10.11.2026).
+ARITH_BUDGET = 2_000_000
+
+
+def _close(t: str, j: int, opener: str, closer: str, budget: list[int] | None = None,
+           slot: int = 0) -> int | None:
+    """Пара скобки `t[j]` с учётом кавычек, как в bash: `'…'`, `"…"` (внутри
+    `"…"` `$(` открывает свой уровень), `\\`. None: пары нет или кончился
+    budget[slot] (общий счёт знаков на разбор)."""
+    stack: list[str] = []
+    k, n = j, len(t)
+    while k < n:
+        if budget is not None:
+            budget[slot] -= 1
+            if budget[slot] <= 0:
+                return None
+        c = t[k]
+        top = stack[-1] if stack else ""
+        if c == "\\":
+            k += 2
+            continue
+        if top == '"':
+            if c == '"':
+                stack.pop()
+            elif t.startswith("$(", k):
+                stack.append("(")
+                k += 2
+                continue
+        elif c == "'":
+            e = t.find("'", k + 1)
+            if e < 0:
+                return None
+            k = e + 1
+            continue
+        elif c == '"':
+            stack.append('"')
+        elif c in (opener, "("):
+            stack.append(c)
+        elif (c == closer and top == opener) or (c == ")" and top == "("):
+            stack.pop()
+            if not stack:
+                return k
+        k += 1
+    return None
+
+
+def heredoc_word(t: str, i: int) -> tuple[str, bool, int] | None:
+    """Ограничитель heredoc с позиции после `<<` или `<<-`: (слово, в кавычках
+    ли оно, конец). Пробелы перед словом пропускаются, слово идёт до пробела
+    или знака оболочки; кавычки и `\\` в слове делают тело буквальным,
+    `\\` с переводом строки склеивает слово, как в bash. None: слова нет
+    (`<< ;`, ошибка bash) или кавычка не закрыта: тогда это не heredoc."""
+    n = len(t)
+    while i < n and t[i] in " \t":
+        i += 1
+    word: list[str] = []
+    quoted = has = False
+    while i < n and t[i] not in " \t\n;|&<>()`":
+        c = t[i]
+        if c == "$" and t.startswith(("$'", '$"'), i):
+            # `<<$'EOF'` и `<<$"EOF"`: ограничитель EOF (ревью Codex 10.11.2026).
+            i += 1
+            continue
+        if c == "'" and t[i - 1:i] == "$" and not _escaped(t, i - 1):
+            e = i + 1
+            while e < n and t[e] != "'":
+                e += 2 if t[e] == "\\" else 1
+            if e >= n:
+                return None
+            word.append(re.sub(r"\\(.)", r"\1", t[i + 1:e]))
+            quoted = has = True
+            i = e + 1
+        elif c == "'":
+            e = t.find(c, i + 1)
+            if e < 0:
+                return None
+            word.append(t[i + 1:e])
+            quoted = has = True
+            i = e + 1
+        elif c == '"':
+            # В `"…"` `\\` снимается только перед `"`, `\\`, `$`, обратной кавычкой.
+            e = i + 1
+            while e < n and t[e] != '"':
+                e += 2 if t[e] == "\\" else 1
+            if e >= n:
+                return None
+            word.append(re.sub(r'\\([\\"$`])', r"\1", t[i + 1:e].replace("\\\n", "")))
+            quoted = has = True
+            i = e + 1
+        elif c == "\\" and t.startswith("\\\n", i):
+            i += 2
+        elif c == "\\" and i + 1 < n:
+            word.append(t[i + 1])
+            quoted = has = True
+            i += 2
+        else:
+            word.append(c)
+            has = True
+            i += 1
+    return ("".join(word), quoted, i) if has else None
+
+
+def heredoc_body(t: str, i: int, delim: str, strip: bool, quoted: bool,
+                 nested: bool = False, stop: int | None = None) -> tuple[str, int]:
+    """Тело heredoc с начала строки `i`: (тело, позиция за строкой
+    ограничителя). Конец тела, как в bash 5: строка ровно из ограничителя (у
+    `<<-` без табуляций в начале); без кавычек у ограничителя `\\` с переводом
+    строки склеивает строки (нечётное число `\\`), сверяется и отдаётся
+    склеенная. Нет такой строки: тело до конца текста. nested (внутри `$(...)`
+    или `<(...)`): тело кончается и на строке, которая начинается с
+    ограничителя и где дальше есть `)` (`E)`, `E x)`, `EE)` закрывают тело,
+    `Ex foo` нет; у `<<''` любая строка с `)`; bash 5.3), позиция тогда сразу за ограничителем, хвост
+    строки исполняется. stop: конец текста обратных кавычек, тело до него."""
+    n = len(t) if stop is None else stop
+    lines: list[str] = []
+    while i < n:
+        start, logical = i, []
+        while True:
+            e = t.find("\n", i, n)
+            line, i = (t[i:n], n) if e < 0 else (t[i:e], e + 1)
+            if nested and not logical:
+                head = line.lstrip("\t") if strip else line
+                if head.startswith(delim) and ")" in head[len(delim):]:
+                    return "\n".join(lines), start + len(line) - len(head) + len(delim)
+            if quoted or not _escaped(line, len(line)) or e < 0:
+                logical.append(line)
+                break
+            logical.append(line[:-1])
+        line = "".join(logical)
+        if (line.lstrip("\t") if strip else line) == delim:
+            return "\n".join(lines), i
+        lines.append(line)
+    return "\n".join(lines), n
+
+
+def arith_end(t: str, i: int, budget: list[int] | None = None, slot: int = 0) -> int | None:
+    """Конец арифметики `((...))` с первой скобки `i`: позиция за `))`. Как в
+    bash, арифметика только если пара второй скобки (с учётом кавычек) стоит
+    прямо перед `)`: `((cmd) )`, `((cmd); (cmd))`, `((echo "x))") )` это
+    подоболочки, `$((1 << "2"))` арифметика (ревью Opus и Codex 10.11.2026).
+    None: не арифметика."""
+    if not t.startswith("((", i):
+        return None
+    m = _close(t, i + 1, "(", ")", budget, slot)
+    return m + 2 if m is not None and t.startswith(")", m + 1) else None
+
+
+def bracket_end(t: str, i: int, budget: list[int] | None = None, slot: int = 0) -> int | None:
+    """Конец старой арифметики `$[...]` со скобки `i`: позиция за `]`."""
+    m = _close(t, i, "[", "]", budget, slot)
+    return None if m is None else m + 1
+
+
+_CASE_WORD = re.compile(r"(case|esac|in)(?=[ \t\n;&|()]|$)")
+_COMMAND_AFTER_WORDS = frozenset({"then", "do", "else", "{", "!", "time"})
+
+
+def _command_position(t: str, pos: int) -> bool:
+    """Слово на `pos` стоит на месте команды: после начала, перевода строки,
+    `;&|()` или слова оболочки (`then`, `do`)."""
+    j = pos - 1
+    while j >= 0 and t[j] in " \t":
+        j -= 1
+    if j < 0 or t[j] in "\n;&|()":
+        return True
+    k = j
+    while k >= 0 and t[k] not in " \t\n;&|()":
+        k -= 1
+    return t[k + 1:j + 1] in _COMMAND_AFTER_WORDS
+
+
+@dataclass(frozen=True)
+class _Heredoc:
+    start: int       # `<<`
+    word_end: int    # за ограничителем
+    line_end: int    # перевод строки, за которым тело (или где тело оборвалось)
+    body_start: int
+    end: int         # за строкой ограничителя
+    body: str
+    quoted: bool
+
+
+def unescape_backtick(text: str) -> str:
+    """Текст обратных кавычек, как его исполняет bash: `\\``, `\\\\`, `\\$` без
+    `\\`: вложенная `` `echo \\`cmd\\`` `` исполняет cmd (ревью Opus 10.11.2026)."""
+    return re.sub(r"\\([`\\$])", r"\1", text)
+
+
+def _backtick_end(t: str, i: int) -> int:
+    """Закрывающая обратная кавычка с позиции `i` (`\\`` её не закрывает)."""
+    while i < len(t):
+        if t[i] == "\\":
+            i += 2
+        elif t[i] == "`":
+            return i
+        else:
+            i += 1
+    return len(t)
+
+
+def _shell_scan(cmd: str) -> tuple[list[bool], list[tuple[int, int]], list[_Heredoc],
+                                   list[tuple[int, int]]]:
     """Для каждого знака: внутри одинарных кавычек оболочки, где `$(...)` и
-    обратные кавычки не исполняются (в двойных `'` обычный знак); и начало
-    первого комментария (`#` в начале слова вне кавычек) или длина строки.
-    Комментарий кавычек не открывает: апостроф в `# don't` не прячет
-    подстановки ниже."""
+    обратные кавычки не исполняются (в двойных `'` обычный знак); участки
+    комментариев bash (`#` в начале слова вне кавычек, до перевода строки);
+    heredoc. Комментарий кавычек не открывает: апостроф в `# don't` не прячет
+    подстановки ниже. Как в bash (ревью Opus и Codex 09.11.2026):
+    экранированный знак (`a\\ #x`) и закрытая подстановка (`$(x)#tag`,
+    `` `x`#tag ``) это часть слова; в `$'...'` кавычку закрывает только
+    неэкранированная `'`; комментарий внутри обратных кавычек кончается на
+    закрывающей, хвост за ней исполняется. `$(...)` и обратные кавычки
+    внутри `"..."` открывают уровень без кавычек, как в bash: кавычки и
+    heredoc внутри разбираются заново (ревью Opus 10.11.2026; раньше это был
+    принятый риск guard3-decisions.md).
+
+    Heredoc как в bash 5 (ревью Свода 09.11.2026): метка `<<` только вне
+    кавычек, комментария, `${...}` и арифметики (`$((`, `((`, `$[`), не
+    `<<<`; тело читается за переводом строки команды (heredoc_body), его знаки
+    не кавычки и не комментарий; тело метки внутри обратных кавычек не
+    выходит за закрывающую. Тело внутри `"$(cat <<'E' ...)"` вырезается тоже:
+    непарные `"` и `'` в нём иначе сбивали кавычки, и хвост команды
+    пропадал (ревью Opus 10.11.2026)."""
+    n = len(cmd)
     out, single, double, esc, comment, prev = [], False, False, False, False, "\n"
-    first = len(cmd)
-    for i, c in enumerate(cmd):
-        out.append(single and c != "'")
+    ansi = bq = comment_bq = False
+    esc_prev = "\n"
+    bq_double = False
+    # Открытые скобки: (вид, глубина `${` снаружи); вид "" подоболочка, "w"
+    # после закрывающей слово идёт дальше (`$(`, `<(`, `>(`, `arr=(`), "d" то
+    # же и снова двойные кавычки. `${` считается на каждом уровне свой:
+    # `${x:-$(cat <<E …)}` настоящий heredoc (ревью Codex 10.11.2026).
+    parens: list[tuple[str, int, int]] = []
+    # Тексты `$(...)` (начало, конец): границы по тем же кавычкам, `case` и
+    # вложенности, что и heredoc (ревью Codex 10.11.2026: шаблон `x)` закрывал
+    # подстановку в простом счёте скобок).
+    subs: list[tuple[int, int]] = []
+    budget = [ARITH_BUDGET]
+    # `case`: глубина скобок у каждого открытого, ждём `in`, ждём `)` шаблона.
+    cases: list[int] = []
+    case_in = pattern = False
+    # Метки из закрытой `$(...)`: bash читает их тела первыми, в порядке закрытия.
+    closed: list[tuple[int, int, str, bool, bool, bool, bool, int]] = []
+    brace = 0
+    comments: list[tuple[int, int]] = []
+    docs: list[_Heredoc] = []
+    # Метка ждёт тела: (начало, конец слова, ограничитель, `<<-`, в кавычках,
+    # в `...`, внутри `$(...)`: правило `E)` действует и за закрытой скобкой,
+    # глубина скобок).
+    pending: list[tuple[int, int, str, bool, bool, bool, bool, int]] = []
+
+    def arith_subs(a: int, b: int) -> None:
+        # `$(( $(cmd) ))`: подстановку внутри арифметики bash исполняет.
+        if "$(" in cmd[a:b]:
+            subs.extend((s + a, e + a) for s, e in _shell_scan(cmd[a:b])[3])
+
+    def flush(at: int, keep_bq: bool = False) -> None:
+        # Метки без тела (обрыв текста или закрытие обратных кавычек): тело пустое.
+        nonlocal pending, closed
+        rest = []
+        for mark in closed + pending:
+            if keep_bq and not mark[5]:
+                rest.append(mark)
+            else:
+                docs.append(_Heredoc(mark[0], mark[1], at, at, at, "", mark[4]))
+        pending, closed = rest, []
+
+    def bodies(i: int) -> int:
+        nonlocal pending, closed
+        stop = _backtick_end(cmd, i) if bq else None
+        pending, closed = closed + pending, []
+        for k, (start, word_end, delim, strip, quoted, _in_bq, in_sub, _lvl) in enumerate(pending):
+            body, end = heredoc_body(cmd, i, delim, strip, quoted,
+                                     nested=in_sub or any(k for k, _b, _s in parens), stop=stop)
+            docs.append(_Heredoc(start, word_end, i - 1, i, end, body, quoted))
+            out.extend([False] * (end - i))
+            i = end
+            if end == n or end == stop or (end and cmd[end - 1] != "\n"):
+                # Тело оборвалось посреди строки или на конце текста: у
+                # остальных меток тела нет, хвост исполняется.
+                pending = pending[k + 1:]
+                flush(end)
+                break
+        pending = []
+        return i
+
+    i = 0
+    while i < n:
+        c = cmd[i]
+        out.append((single and c != "'") or ansi)
+        i += 1
         if esc:
             esc = False
+            # `\\` с переводом строки bash убирает целиком: `cat \\⏎# c` это
+            # `cat # c`, комментарий (сверка с bash 09.11.2026).
+            prev = esc_prev if c == "\n" else "a"
+            continue
+        if ansi:
+            if c == "\\":
+                esc = True
+            ansi = c != "'"
         elif single:
             single = c != "'"
         elif comment:
-            comment = c != "\n"
+            if c == "\n" or (c == "`" and comment_bq):
+                comment = False
+                comments[-1] = (comments[-1][0], i - 1)
+                if c == "`":
+                    bq, double = False, bq_double
+                    flush(i - 1, keep_bq=True)
+                    prev = "a"
+                    continue
         elif c == "\\":
-            esc = True
+            esc, esc_prev = True, prev
+            continue
         elif c == '"':
             double = not double
+        elif c == "`":
+            bq = not bq
+            if bq:
+                bq_double, double = double, False
+            else:
+                double = bq_double
+                flush(i - 1, keep_bq=True)
+            # Внутри обратных кавычек новая команда; после закрывающей слово идёт дальше.
+            prev = "\n" if bq else "a"
+            continue
         elif double:
-            pass
+            if c == "(" and prev == "$":
+                if (end := arith_end(cmd, i - 1, budget)) is not None:
+                    arith_subs(i + 1, end - 2)
+                    out.extend([False] * (end - i))
+                    i, prev = end, "a"
+                    continue
+                parens.append(("d", brace, i))
+                double, brace = False, 0
         elif c == "'":
-            single = True
+            if prev == "$":
+                ansi = True
+            else:
+                single = True
+        elif c == "(" and cmd.startswith("(", i) and prev not in "<>" \
+                and (end := arith_end(cmd, i - 1, budget)) is not None:
+            # `$((1<<2))`, `((x<<=1))`, `for((`: сдвиг, а не heredoc. После
+            # команды `((…))` `#` начинает комментарий, после `$((…))` нет.
+            arith_subs(i + 1, end - 2)
+            out.extend([False] * (end - i))
+            i, prev = end, ("a" if prev == "$" else ")")
+            continue
+        elif c == "[" and prev == "$" and (end := bracket_end(cmd, i - 1, budget)) is not None:
+            arith_subs(i, end - 1)
+            out.extend([False] * (end - i))
+            i, prev = end, "a"
+            continue
+        elif c == "{" and prev == "$":
+            brace += 1
+        elif c == "}" and brace:
+            brace -= 1
+        elif c == "<" and cmd.startswith("<<", i - 1) and not brace:
+            if cmd.startswith("<", i + 1):
+                # `<<<` here-string: слово, а не тело.
+                out.extend([False, False])
+                i, prev = i + 2, "<"
+                continue
+            strip = cmd.startswith("-", i + 1)
+            word = heredoc_word(cmd, i + 1 + strip)
+            if word is not None:
+                delim, quoted, end = word
+                pending.append((i - 1, end, delim, strip, quoted, bq, any(k for k, _b, _s in parens),
+                                len(parens)))
+                out.extend([False] * (end - i))
+                i, prev = end, "a"
+                continue
+        elif c == ";" and cmd.startswith((";", "&"), i) and cases and cases[-1] == len(parens):
+            pattern = True  # `;;`, `;&`, `;;&`: дальше шаблон case
+        elif c in "cie" and prev in _COMMENT_AFTER and (kw := _CASE_WORD.match(cmd, i - 1)):
+            word = kw.group(1)
+            if word == "case" and _command_position(cmd, i - 1):
+                cases.append(len(parens))
+                case_in = True
+            elif word == "in" and case_in:
+                case_in, pattern = False, True
+            elif word == "esac" and cases and cases[-1] == len(parens) and _command_position(cmd, i - 1):
+                cases.pop()
+                pattern = False
+        elif c == "(" and pattern and cases[-1] == len(parens) and prev in _COMMENT_AFTER:
+            pass  # `(x)` шаблона case: скобка шаблона, не подоболочка
+        elif c == "(":
+            # `$(`, `<(`, `>(`, `arr=(`: после закрывающей слово идёт дальше.
+            parens.append(("w" if prev in "$<>=" else "", brace, i if prev == "$" else -1))
+            brace = 0
+        elif c == ")" and pattern and cases and cases[-1] == len(parens):
+            pattern = False  # `x)` шаблона case не закрывает `$(...)` (ревью Codex 10.11.2026)
+        elif c == ")" and parens:
+            kind, brace, sub_start = parens.pop()
+            if sub_start >= 0:
+                subs.append((sub_start, i - 1))
+            if kind:
+                # Метки изнутри `$(...)` bash читает раньше внешних (ревью Opus 10.11.2026).
+                closed += [p for p in pending if p[7] > len(parens)]
+                pending = [p for p in pending if p[7] <= len(parens)]
+                double = kind == "d"
+                prev = "a"
+                continue
         elif c == "#" and prev in _COMMENT_AFTER:
-            comment = True
-            first = min(first, i)
+            comment, comment_bq = True, bq
+            comments.append((i - 1, n))
         prev = c
-    return out, first
+        if c == "\n" and (pending or closed) and not (single or double or ansi or brace):
+            i = bodies(i)
+    flush(n)
+    subs += [(start, n) for _k, _b, start in parens if start >= 0]
+    return out, comments, docs, sorted(subs)
+
+
+def _join_lines(cmd: str) -> str:
+    """`\\` в конце строки склеивает строки, кроме как в комментарии: там
+    это текст комментария, следующая строка исполняется (ревью Codex 09.11.2026)."""
+    if "\\\n" not in cmd:
+        return cmd
+    comments = _shell_scan(cmd)[1]
+    out, i = [], 0
+    while i < len(cmd):
+        # Нечётное число `\\` перед переводом строки: склейка; `\\\\` это
+        # экранированная `\\`, строка не склеивается (ревью Opus 09.11.2026).
+        if (cmd.startswith("\\\n", i) and not _escaped(cmd, i)
+                and not any(s <= i < e for s, e in comments)):
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    return "".join(out)
+
+
+def _strip_comments(cmd: str) -> str:
+    """Команда без комментариев bash (_shell_scan), переводы строк на месте.
+    Разбирать дальше shlex с `commenters = ""`: у shlex `#` внутри слова
+    (`issue#12`) тоже комментарий, и хвост строки пропадал из разбора."""
+    out, pos = [], 0
+    for start, end in _shell_scan(cmd)[1]:
+        out.append(cmd[pos:start])
+        pos = end
+    out.append(cmd[pos:])
+    return "".join(out)
 
 
 def _single_quoted(cmd: str) -> list[bool]:
@@ -264,14 +756,30 @@ def _single_quoted(cmd: str) -> list[bool]:
     return _shell_scan(cmd)[0]
 
 
-def _substitutions(cmd: str) -> list[str]:
+def _substitutions(cmd: str, heredoc: bool = False) -> list[str]:
     """Тексты подстановок $(...) и `...` вне одинарных кавычек (там они
     текст, финальное ревью 03.11.2026). Скобки внутри считаются без учёта
     кавычек, незакрытая подстановка идёт до конца строки."""
-    quoted = _single_quoted(cmd)
-    out = [m.group(1) for m in re.finditer(r"`([^`]*)`?", cmd) if not quoted[m.start()]]
+    # В теле heredoc апостроф обычный знак: `don't $(...)` исполняется
+    # (ревью Opus 09.11.2026).
+    scan = None if heredoc else _shell_scan(cmd)
+    quoted = [False] * len(cmd) if scan is None else scan[0]
+
+    out, i = [], cmd.find("`")
+    while i >= 0:
+        # `\\`` текст, `\\\\`` подстановка (ревью Opus 10.11.2026).
+        if quoted[i] or _escaped(cmd, i):
+            i = cmd.find("`", i + 1)
+            continue
+        end = _backtick_end(cmd, i + 1)
+        out.append(unescape_backtick(cmd[i + 1:end]))
+        i = cmd.find("`", end + 1)
+    if scan is not None:
+        # Границы `$(...)` от _shell_scan: кавычки, `case`, `\$(` текстом.
+        return out + [cmd[start:end] for start, end in scan[3]]
     for m in re.finditer(r"\$\(", cmd):
-        if quoted[m.start()]:
+        # `\$(...)` bash печатает как текст (ревью Codex 09.11.2026).
+        if _escaped(cmd, m.start()):
             continue
         depth, j = 1, m.end()
         while j < len(cmd) and depth:
@@ -296,25 +804,64 @@ def executed_text(cmd: str, depth: int = 0) -> str:
     grep, сообщение коммита, текст echo), с телами heredoc для интерпретатора
     и подстановками. Куски склеены переводом строки, слова в кавычках shlex.
     Что не разобралось, остаётся целиком: лишняя карточка дешевле."""
-    cmd = cmd.replace("\\\n", "")
-    bodies: list[tuple[str, str]] = []
-
-    def cut(m: re.Match[str]) -> str:
-        line = cmd[:m.start()].rsplit("\n", 1)[-1]
-        bodies.append((re.split(r"\$\(|[;|&(`]", line)[-1], m.group(4)))
-        return m.group(3)
-
-    shell = _HEREDOC_RE.sub(cut, cmd)
-    out = [body for opener, body in bodies if _text_head(opener.split()) not in _TEXT_TOOLS]
+    # Heredoc ищется по исходному тексту: склейка `\\` с переводом строки
+    # в теле с кавычками у ограничителя не делается (_shell_scan сам знает
+    # переносы), команда склеивается уже без тел.
+    bodies: list[tuple[bool, bool, str]] = []
+    spans: list[tuple[int, int]] = []
+    _flags, comments, docs, _subs = _shell_scan(cmd)
+    # Начало команды перед меткой (после перевода строки без `\\`, `;|&(` или
+    # обратной кавычки) и ближайший `|` за ней: один проход на весь текст, а
+    # не на каждую метку (ревью Opus 10.11.2026, много меток в строке).
+    bound, pipe = [-1] * (len(cmd) + 1), [len(cmd)] * (len(cmd) + 1)
+    if docs:
+        # `\\` в комментарии текст: перевод строки за ним граница команды (ревью Opus 10.11.2026).
+        comment_ends = {end for _start, end in comments}
+        for j, ch in enumerate(cmd):
+            bound[j + 1] = j if ch in ";|&(`" or (ch == "\n" and (
+                not _escaped(cmd, j) or j in comment_ends)) else bound[j]
+        for j in range(len(cmd) - 1, -1, -1):
+            pipe[j] = j if cmd[j] == "|" else pipe[j + 1]
+    for doc in docs:
+        opener = _join_lines(cmd[bound[doc.start] + 1:doc.start])
+        # Тело исполняется и тогда, когда команда текстовая, но вывод идёт
+        # дальше по конвейеру (`cat <<'EOF' | bash`, ревью Codex 09.11.2026).
+        runs = (_text_head(opener.split(None, 64)[:64]) not in _TEXT_TOOLS
+                or pipe[doc.word_end] < doc.line_end)
+        bodies.append((runs, not doc.quoted, doc.body))
+        spans += [(doc.start, doc.word_end), (doc.body_start, doc.end)]
+    # Метки и тела вырезаются; у двух меток в строке участки перемежаются.
+    pieces, pos = [], 0
+    for start, end in sorted(spans):
+        pieces.append(cmd[pos:start])
+        pos = max(pos, end)
+    pieces.append(cmd[pos:])
+    shell = _join_lines("".join(pieces))
+    # Исполняемое тело (bash, python) склеивает `\\` с переводом строки и
+    # при кавычках у ограничителя: `-m \\` и `claude_tg_bot.mailsend` на
+    # следующей строке это один вызов (ревью Opus 10.11.2026).
+    out = [_join_lines(body) for runs, _open, body in bodies if runs]
+    # Тело без кавычек у разделителя оболочка раскрывает: `$(...)` в нём
+    # исполняется и у `cat <<EOF` (ревью Codex 09.11.2026).
+    out += [inner if depth >= 3 else executed_text(inner, depth + 1)
+            for runs, unquoted, body in bodies if unquoted and not runs
+            for inner in _substitutions(body, heredoc=True)]
     out += [inner if depth >= 3 else executed_text(inner, depth + 1) for inner in _substitutions(shell)]
     try:
-        # `;` после перевода строки, а не вместо: комментарий shlex читает до
-        # конца строки, и `# x` не съедает команды на следующих строках.
-        lex = shlex.shlex(shell.replace("\n", "\n;"), posix=True, punctuation_chars=True)
+        # Комментарии bash вырезаются заранее (_strip_comments): у shlex `#`
+        # внутри слова (`cat issue#12; curl ...`) съедал хвост строки, и
+        # отправка за ним шла без карточки (решение Ивана 09.11.2026).
+        # Подстановки выше ищутся по тексту с комментариями: лишняя карточка
+        # дешевле. `;` после перевода строки: куски строк не склеиваются.
+        lex = shlex.shlex(_strip_comments(shell).replace("\n", "\n;"), posix=True,
+                          punctuation_chars=True)
         lex.whitespace_split = True
+        lex.commenters = ""
         tokens = list(lex)
     except ValueError:
-        return cmd
+        # Склеенный текст: `-m \\` и `claude_tg_bot.mailsend` на следующей
+        # строке это один вызов (ревью Opus 10.11.2026).
+        return _join_lines(cmd)
     part: list[str] = []
     for t in tokens + [";"]:
         if t and set(t) <= _SHELL_OPS:
@@ -322,7 +869,9 @@ def executed_text(cmd: str, depth: int = 0) -> str:
                 out.append(shlex.join(part))
             part = []
         else:
-            part.append(t)
+            # `;` после перевода строки вставлен для разбора и попал бы в слово в кавычках
+            # (тело heredoc в строке для ssh, SQL): из слова её убрать (перепроверка 13.11.2026).
+            part.append(t.replace("\n;", "\n"))
     return "\n".join(out)
 
 
@@ -352,12 +901,22 @@ def mailsend_check(cmd: str, cwd: str | None) -> tuple[str, Any]:
             return "dry", None
         letter = mailsend.load_letter(args, dirs=mailsend.attach_dirs(),
                                       limit=mailsend.max_bytes(), base=base)
-    except (mailsend.MailError, argparse.ArgumentError) as e:
+    except (mailsend.MailError, argparse.ArgumentError, OSError, RuntimeError, ValueError) as e:
+        # OSError: файл пропал или не читается; RuntimeError: `~нет_пользователя`
+        # в пути; ValueError: нулевой байт в пути (ревью Codex 11.11.2026, круг 2).
+        if not isinstance(e, mailsend.MailError):
+            log.warning("mailsend_check: %s", type(e).__name__, exc_info=True)
         return "deny", f"mailsend: {e}"
+    except SystemExit:
+        # Справка сокращением (`--he`, `-hh`): argparse печатает её и выходит,
+        # мимо проверки выше. Команда сделает то же, письма не будет; выход
+        # наружу уронил бы бота (ревью Opus 11.11.2026).
+        return "dry", None
     return "card", {
         "to": list(letter.to), "cc": list(letter.cc), "subject": letter.subject,
         "reply_to": letter.reply_to_id, "body": letter.body,
-        "attachments": [{"name": a.name, "size": len(a.data), "path": a.path}
+        "attachments": [{"name": a.name, "size": len(a.data), "path": a.path,
+                         "sha256": hashlib.sha256(a.data).hexdigest()}
                         for a in letter.attachments],
         "digest": letter.digest(),
     }
@@ -572,9 +1131,9 @@ def format_card(tool_input: dict[str, Any], text_cap: int, tool_name: str = "") 
 def otklik_match(cfg: Any, pending: Any, chat_id: int,
                  thread_id: int | None) -> dict[str, Any] | None:
     """Отклик, который этот чат взял на отправку, с тем же текстом, что в
-    карточке: для пометки (решение Ивана 22.10.2026: два нажатия остаются,
-    сверять проще). Адресата бот не сверяет: в отклике он записан свободным
-    текстом, поэтому Иван сверяет его сам с «Куда»."""
+    карточке: для пометки, когда одно касание (otklik.grant) не прошло:
+    адресат, файл или поле вызова другие, либо в отклике адресат только
+    свободным текстом, тогда Иван сверяет его сам с «Куда»."""
     mail = pending.tool_input.get(MAILSEND_CARD_KEY)
     if isinstance(mail, dict):
         texts = [str(mail.get("body") or "")]
@@ -760,10 +1319,24 @@ def path_refusal(file_path: Any, unit: Path | None) -> str | None:
     dest = next((r for r in roots if Path(r).name == _SEND_DIR_NAME), roots[0]).rstrip("/") + "/"
     # Имя с символами шаблона сервер не примет и в новом каталоге: копия
     # получает имя без них, каждая своей командой cp.
-    plain = [p for p in bad if not _bad_name(p)]
-    cps = ["cp -f " + " ".join(shlex.quote(p) for p in plain) + " " + shlex.quote(dest)] if plain else []
-    cps += ["cp -f " + shlex.quote(p) + " " + shlex.quote(dest + _safe_name(p)) for p in bad if _bad_name(p)]
-    cp = " && ".join(cps)
+    # Два файла с одним именем: второй своей командой под именем с номером,
+    # иначе cp -f затёр бы первый. `--`: имя вроде `-report.pdf` не ключ
+    # (ревью Codex 09.11.2026).
+    plain, single, seen = [], [], set()
+    for p in bad:
+        name = _safe_name(p) if _bad_name(p) else Path(p).name
+        if _bad_name(p) or name in seen:
+            n, base = 2, name
+            while name in seen:
+                name, n = f"{n}-{base}", n + 1
+            single.append((p, name))
+        else:
+            plain.append(p)
+        seen.add(name)
+    cps = ["cp -f -- " + " ".join(shlex.quote(p) for p in plain) + " " + shlex.quote(dest)] if plain else []
+    cps += ["cp -f -- " + shlex.quote(p) + " " + shlex.quote(dest + name) for p, name in single]
+    # Папки отправки может не быть (новая машина): cp в неё упал бы (ревью Codex 09.11.2026).
+    cp = " && ".join(["mkdir -p " + shlex.quote(dest), *cps])
     return _("сервер Telegram берёт файлы только по абсолютному пути из {roots}, без символов "
              "~ * ? [ ] {{ }} и без ..: скопируй {cp} и пошли новым абсолютным путём").format(
         roots=", ".join(roots), cp=cp)
@@ -777,6 +1350,59 @@ async def _path_check(file_path: Any, unit: Path | None) -> str | None:
     except Exception:
         log.warning("send_file path check failed, no check", exc_info=True)
     return None
+
+
+# Одно касание (otklik.grant): какие поля вызова Telegram допустимы и где
+# текст. Любое другое заполненное поле (ответ, тема, аккаунт, разметка,
+# отложенная отправка) меняет показанное: обычная карточка.
+# send_message без parse_mode сервер шлёт как есть (parse_mode=None в Telethon,
+# проверено 13.11.2026); у send_file без "plain" подпись читается как Markdown.
+_TG_ONE_TOUCH = {"send_message": ("message", frozenset({"chat_id", "message"})),
+                 "send_file": ("caption", frozenset({"chat_id", "file_path", "caption", "parse_mode",
+                                                     "force_document"}))}
+
+
+def otklik_send(tool_name: str, tool_input: dict[str, Any], mail: Any = None) -> dict[str, Any] | None:
+    """Вызов отправки полями отклика (otklik.send_matches): канал, адресат,
+    текст, тема, ответ на письмо, файл (имя и sha256). mail: снимок письма
+    mailsend_check. None: форма, которую одно касание не сверяет.
+    Файл Telegram читается здесь, а сервер читает его позже: подмена между
+    чтениями не ловится (у mailsend хеш сверяет сама отправка)."""
+    if isinstance(mail, dict):
+        to, atts = mail.get("to") or [], mail.get("attachments") or []
+        if len(to) != 1 or mail.get("cc") or len(atts) > 1:
+            return None
+        att = atts[0] if atts else {}
+        return {"via": "mail", "to": to[0], "text": mail.get("body"), "subject": mail.get("subject"),
+                "reply_to": mail.get("reply_to"), "attach_name": att.get("name"),
+                "attach_sha": att.get("sha256")}
+    parts = tool_name.split("__", 2)
+    if len(parts) != 3 or parts[:2] != ["mcp", "telegram"] or parts[2] not in _TG_ONE_TOUCH:
+        return None
+    text_key, allowed = _TG_ONE_TOUCH[parts[2]]
+    # Пустое строго: `0 in (False,)` в Python истинно, а `reply_to: 0` это значение.
+    if any(not (v is None or v is False or v == "" or v == []) for k, v in tool_input.items()
+           if k not in allowed):
+        return None
+    send = {"via": "telegram", "to": tool_input.get("chat_id"), "text": tool_input.get(text_key)}
+    if parts[2] == "send_file":
+        # Подпись без parse_mode сервер читает как Markdown: текст изменился бы.
+        # Путь только абсолютный (относительный сервер считает от своих корней),
+        # имя ссылки то же, что у файла: получатель видит имя, что на карточке.
+        path = tool_input.get("file_path")
+        if (tool_input.get("parse_mode") != "plain" or not isinstance(path, str)
+                or not os.path.isabs(path) or path != path.strip()):
+            return None
+        try:
+            real = Path(path).resolve(strict=True)
+            if (real.name != Path(path).name or not real.is_file()
+                    or real.stat().st_size > otklik.TG_FILE_MAX):
+                return None
+            sha = otklik.file_sha(real, otklik.TG_FILE_MAX)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        send.update(attach_name=real.name, attach_sha=sha)
+    return send
 
 
 UNATTENDED_HINT = N_(
@@ -794,25 +1420,43 @@ class Verdict:
 
 
 async def decide(tool_name: str, tool_input: dict[str, Any], *, cfg: Any,
-                 unattended: bool, mail_kind: str = "", mail_info: Any = None) -> Verdict:
+                 unattended: bool, mail_kind: str = "", mail_info: Any = None,
+                 chat_key: str = "") -> Verdict:
     """Одна точка решения по отправке от имени Ивана (MCP или mailsend с
     mail_kind из mailsend_check). Себе без карточки, в том числе из фона.
-    Человеку из фонового рана сразу отказ без карточки: Ивана рядом нет, а
-    карточка протухла бы за срок (решение Ивана 03.11.2026, п. 6). Путь
-    send_file, который сервер Telegram не примет, отказ до карточки."""
+    Ровно показанное в отклике, который взял ран чата chat_key, без карточки
+    один раз: ✅ на отклике и есть «ок» (решение Ивана 12.11.2026), повтор
+    отказ. Человеку из фонового рана иначе сразу отказ без карточки: Ивана
+    рядом нет, а карточка протухла бы за срок (решение Ивана 03.11.2026, п. 6).
+    Путь send_file, который сервер Telegram не примет, отказ до карточки."""
     if mail_kind:
         why = mail_info if mail_kind == "deny" else None
     else:
         why = _refusal(tool_name, tool_input)
     if why:
         return Verdict("deny", "deny:outbound", why)
-    to_self = not mail_kind and _to_self(tool_name, tool_input, cfg)
-    if unattended and not to_self:
-        return Verdict("deny", "deny:outbound-unattended", _(UNATTENDED_HINT))
     if tool_name == SEND_FILE:
         why = await _path_check(tool_input.get("file_path"), getattr(cfg, "telegram_mcp_unit", None))
         if why:
             return Verdict("deny", "deny:outbound-path", why)
+    to_self = not mail_kind and _to_self(tool_name, tool_input, cfg)
+    if chat_key and not to_self:
+        send = await asyncio.to_thread(otklik_send, tool_name, tool_input,
+                                       mail_info if mail_kind == "card" else None)
+        if send is not None:
+            try:
+                rec = await asyncio.to_thread(otklik.grant, otklik.otklik_dir(cfg.state_dir), chat_key, send)
+            except otklik.Refused as e:
+                return Verdict("deny", "deny:otklik-repeat", str(e))
+            except Exception:
+                # Испорченная запись (правка руками) не должна отказывать всем
+                # отправкам всех чатов: хук при сбое отказывает (hook_approve).
+                log.warning("otklik grant failed, card instead", exc_info=True)
+                rec = None
+            if rec is not None:
+                return Verdict("allow", "allow:otklik", f"otklik:{rec['id']}")
+    if unattended and not to_self:
+        return Verdict("deny", "deny:outbound-unattended", _(UNATTENDED_HINT))
     if to_self:
         return Verdict("allow", "allow:self", "outbound:self")
     return Verdict("card")
