@@ -270,38 +270,3 @@ class ScopeFingerprintTests(unittest.TestCase):
         sessions = _Store({"chat:1": "sid-old"})
         prints = _Store({"chat:1": "alpha"})
         self.assertIsNone(resume_target(sessions, prints, "chat:1", ""))
-
-
-class ScheduledJobScopeTests(unittest.TestCase):
-    """Плановая задача обязана называть канонический scope.
-
-    У неё нет человека рядом: без scope роутер закрепит личный режим, и
-    задача отработает без проектной памяти вообще, ничем это не показав.
-    Падать надо ДО запуска claude.
-    """
-
-    def test_known_scope_passes(self):
-        from claude_tg_bot.skills._oneshot import MEMORY_SCOPES_ENV, require_memory_scope
-
-        with patch.dict(os.environ, {MEMORY_SCOPES_ENV: "alpha, Gamma"}):
-            self.assertEqual(require_memory_scope("Alpha"), "alpha")
-            self.assertEqual(require_memory_scope("gamma"), "gamma")
-            # Нет в списке (например, заказчик в архиве): не канонический.
-            with self.assertRaises(SystemExit):
-                require_memory_scope("beta")
-
-    def test_unknown_scope_fails_before_launch(self):
-        from claude_tg_bot.skills._oneshot import MEMORY_SCOPES_ENV, require_memory_scope
-
-        with patch.dict(os.environ, {MEMORY_SCOPES_ENV: "alpha"}):
-            for bad in ("", "   ", "какой-то текст", "поддержка"):
-                with self.assertRaises(SystemExit):
-                    require_memory_scope(bad)
-
-    def test_no_scopes_configured_fails(self):
-        from claude_tg_bot.skills._oneshot import MEMORY_SCOPES_ENV, require_memory_scope
-
-        with patch.dict(os.environ, {MEMORY_SCOPES_ENV: ""}):
-            with self.assertRaises(SystemExit):
-                require_memory_scope("alpha")
-

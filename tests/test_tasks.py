@@ -111,20 +111,26 @@ def _fenced(text: str) -> list[bool]:
     return mask
 
 
+# Условные заказчики тестов: Свод их не знает, а настоящих имён в тестах нет
+# (тесты с ними пропускались до 27.11.2026). Добавляются в темы Свода только в
+# процессе проверки, копией первой темы с другими алиасами.
+FAKE_CLIENTS = {"test-alfa": ("Альфа",), "test-beta": ("Beta Corp",), "test-gamma": ("Гамм*", "gamma")}
+
+
 def _resolve_pin(prompt: str, hint: str) -> tuple[str, str] | None:
     """resolve_pin Свода отдельным процессом, чтобы модули Свода не смешались
-    с ботом. None, если Свода или его конфигурации на этой машине нет."""
+    с ботом. None, если Свода на этой машине нет."""
     if not (SVOD_LIB / "memorycontext.py").is_file():
         return None
-    code = ("import json, sys; sys.path.insert(0, sys.argv[1]); import memorycontext as m; "
-            "a = json.load(sys.stdin); print(json.dumps(m.resolve_pin(a[0], a[1])))")
-    try:
-        proc = subprocess.run([sys.executable, "-I", "-c", code, str(SVOD_LIB)],
-                              input=json.dumps([prompt, hint]), capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
+    code = ("import dataclasses, json, sys; sys.path.insert(0, sys.argv[1]); import memorycontext as m; "
+            "a = json.load(sys.stdin); base = next(iter(m.TOPICS.values()))\n"
+            "for k, v in a[2].items(): m.TOPICS[k] = dataclasses.replace(base, scope=k, aliases=tuple(v))\n"
+            "m.TOPIC_ORDER = (*m.TOPIC_ORDER, *a[2]); print(json.dumps(m.resolve_pin(a[0], a[1])))")
+    # Свод есть, а проба упала (сменились его внутренности, срок): падение, а
+    # не тихий пропуск, ради которого тесты и оживлены (ревью 27.11.2026).
+    proc = subprocess.run([sys.executable, "-I", "-c", code, str(SVOD_LIB)],
+                          input=json.dumps([prompt, hint, FAKE_CLIENTS]), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr[-2000:]
     return tuple(json.loads(proc.stdout))
 
 
@@ -316,8 +322,9 @@ class FenceTests(unittest.TestCase):
         # Свод закрепляет память по первому сообщению рана: имя заказчика в
         # новости или в плане не должно тянуть его память (проект шага 3, 1.8)
         probe = _resolve_pin("Новость про Beta Corp", "")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         intro = tasks.intro_prompt(_item(title="Новость про Beta Corp"))
         self.assertEqual(_resolve_pin(intro, tasks.SCOPE_NOTE)[0], "personal")
         plan = "1. Проверить бэкап Гамма\n2. Ответить сводкой"
@@ -639,8 +646,9 @@ class CommandTaskTests(unittest.TestCase):
         # Решение Ивана 13.10.2026, вопрос 3а: задача из /task в теме заказчика
         # получает его память, из личной темы решают слова Ивана.
         probe = _resolve_pin("x", "Альфа")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         client = probe[0]
         intro = tasks.command_intro_prompt("поправь бэкап")
         self.assertEqual(_resolve_pin(intro, tasks.scope_note("Альфа"))[0], client)
@@ -676,8 +684,9 @@ class CommandTaskTests(unittest.TestCase):
         # Обсуждение и выполнение одной /task закрепляют одну память: и по
         # исходной теме, и по словам Ивана без неё (ревью 14.10)
         probe = _resolve_pin("x", "Гамма")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         client = probe[0]
         plan = "1. Поправить расписание на gamma.local\n2. Ответить сводкой"
         for words, expected in (("поправь расписание бэкапа на сервере Гаммаа", client),
@@ -694,8 +703,9 @@ class CommandTaskTests(unittest.TestCase):
         # Случаи ревью 14.10: заказчик после 500-го знака подсказки. Тема задачи
         # получает ту же подсказку памяти, что исходная тема (origin_hint).
         probe = _resolve_pin("x", "Гамма")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         both = "Тема по Гамме. " + "з" * 510 + " Не путать с Beta Corp"
         late = "Тема без заказчика. " + "з" * 553 + " Гамма"
         for hint in (both, late):
@@ -838,8 +848,9 @@ class CommandTaskTests(unittest.TestCase):
         # настоящий роутер Свода: имя заказчика в пункте новостей и в списке
         # не закрепляет его память, в словах Ивана закрепляет, как во вступлении
         probe = _resolve_pin("Бэкап Гамма", "")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         self.assertEqual(_resolve_pin(core.backlog_prompt(news, projects), "")[0], "personal")
         self.assertEqual(_resolve_pin(core.backlog_prompt(task, projects), "")[0], "personal")
         own = tasks.command_item("Гамма: проверь бэкап")
@@ -872,8 +883,9 @@ class CommandTaskTests(unittest.TestCase):
         # Случаи ревью 14.10: слова с незакрытым ``` и план, где назван другой
         # заказчик. Обсуждение и выполнение закрепляют одну память.
         probe = _resolve_pin("x", "Гамма")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         client = probe[0]
         tail = "\n```\nwbadmin: error 0x80070070"
         for words, plan, want in (
@@ -898,8 +910,9 @@ class CommandTaskTests(unittest.TestCase):
         # отступ после замены как у Свода: пробел и четыре пробела не ограждение
         self.assertEqual(tasks.close_fence("user@pc:~$    ```\nb"), "user@pc:~$    ```\nb")
         probe = _resolve_pin("x", "Гамма")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         plan = "1. Поправить расписание на gamma.local"
         for words in ("поправь бэкап, в терминале так:\nuser@pc:~$ ```\nwbadmin: error",
                       "поправь бэкап, в терминале так:\n```\nuser@pc:~$ ```\nwbadmin: error\n```"):
@@ -1277,19 +1290,54 @@ class FlowTests(unittest.TestCase):
         data: dict = {}
         _put(data, "A", status="proposed", plan="п", plan_sha=sha)
         _put(data, "B", status="proposed", plan="п", plan_sha=sha)
+        _put(data, "C", status="proposed", plan="п", plan_sha=sha)
         self.assertEqual(tasks.approve(data, "A", "старый")[0], "stale")
         kind, a = tasks.approve(data, "A", sha, press="q1")
         self.assertEqual((kind, a["status"], a["exec_gen"]), ("running", "running", 1))
         self.assertEqual(tasks.approve(data, "A", sha, press="q1")[0], "dup")
         self.assertEqual(tasks.approve(data, "A", sha, press="q2")[0], "stale")
-        # выполнение одно на весь бот: другая задача занято, проект ждёт и
-        # то же нажатие потом сработает (очередь убрана, разбор 19.10.2026)
-        self.assertEqual(tasks.approve(data, "B", sha, press="q3")[0], "busy")
-        self.assertEqual((data["B"]["status"], data["B"].get("accepted_press")), ("proposed", None))
+        # выполнение одно на весь бот: другая задача встаёт в очередь
+        # (решение Ивана 27.11.2026), проект тот же, статус прежний
+        self.assertEqual(tasks.approve(data, "C", sha, press="q3")[0], "queued")
+        self.assertEqual(tasks.approve(data, "B", sha, press="q4")[0], "queued")
+        self.assertEqual(tasks.approve(data, "C", sha, press="q3")[0], "dup")
+        first = data["C"]["queued_at"]
+        self.assertEqual(tasks.approve(data, "C", sha, press="q5")[0], "queued")
+        self.assertEqual(data["C"]["queued_at"], first)  # повтор места не теряет
+        self.assertEqual((data["B"]["status"], data["C"]["status"]), ("proposed", "proposed"))
+        self.assertIsNone(tasks.pump(data))  # A ещё выполняется
         data["A"]["status"] = "done"
         # процесс выполнения ещё не вышел: всё ещё занято
-        self.assertEqual(tasks.approve(data, "B", sha, live={"A"}, press="q3")[0], "busy")
-        self.assertEqual(tasks.approve(data, "B", sha, press="q3")[0], "running")
+        self.assertIsNone(tasks.pump(data, live={"A"}))
+        self.assertEqual(tasks.approve(data, "A", sha, live={"A"})[0], "stale")
+        nxt = tasks.pump(data)
+        self.assertEqual((nxt["id"], nxt["status"], nxt["queued_at"]), ("C", "running", None))
+        self.assertIsNone(tasks.pump(data))
+        data["C"]["status"] = "done"
+        self.assertEqual(tasks.pump(data)["id"], "B")
+        data["B"]["status"] = "done"
+        self.assertIsNone(tasks.pump(data))
+
+    def test_correction_takes_out_of_queue(self):
+        sha = tasks.plan_sha("п")
+        data: dict = {}
+        _put(data, "A", status="running", plan="п", plan_sha=sha, exec_started=NOW.isoformat())
+        b = _put(data, "B", status="proposed", plan="п", plan_sha=sha)
+        self.assertEqual(tasks.approve(data, "B", sha)[0], "queued")
+        self.assertEqual(tasks.stage_line(b), i18n._(tasks.QUEUED_LINE))
+        # насос взял, ран ещё не начался: «делай» одобрение не снимает
+        b2 = _put({}, "B2", status="running", plan="п", plan_sha=sha, exec_gen=1)
+        self.assertEqual(tasks.touch(b2, "делай"), "go")
+        self.assertEqual(b2["status"], "running")
+        self.assertEqual(tasks.touch(b2, "стой"), "cancelled")
+        self.assertEqual(tasks.touch(b, "нет, сначала покажи план"), "dropped")
+        self.assertIsNone(b["queued_at"])
+        # отметка, оставшаяся от старого кода, новый проект в очередь не ставит
+        b["queued_at"] = NOW.isoformat()
+        self.assertTrue(tasks.propose(b, b["rev"], "другой проект", ""))
+        self.assertIsNone(b["queued_at"])
+        data["A"]["status"] = "done"
+        self.assertIsNone(tasks.pump(data))
 
     def test_exec_generation_ref(self):
         sha = tasks.plan_sha("п")

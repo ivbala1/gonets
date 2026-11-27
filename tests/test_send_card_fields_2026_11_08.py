@@ -209,11 +209,11 @@ class NotASendTests(unittest.TestCase):
         for tool in self.NOT_SENDS:
             with self.subTest(tool=tool):
                 self.assertFalse(outbound.is_send(tool))
-                self.assertEqual(serious.send_reasons(tool, {}, None), set())
+                self.assertEqual(serious.send_reasons(tool, {}), set())
 
     def test_send_as_change_still_card(self) -> None:
         # Меняет, от чьего имени уйдут следующие сообщения: карточка остаётся.
-        self.assertTrue(serious.sends(serious.send_reasons("mcp__telegram__set_default_send_as", {}, None)))
+        self.assertTrue(serious.sends(serious.send_reasons("mcp__telegram__set_default_send_as", {})))
 
     def test_real_sends_still_cards(self) -> None:
         for tool in ("mcp__telegram__send_message", "mcp__telegram__edit_message",
@@ -224,7 +224,7 @@ class NotASendTests(unittest.TestCase):
             with self.subTest(tool=tool):
                 self.assertTrue(outbound.is_send(tool))
                 if not tool.endswith("create_poll"):  # опрос ловит только is_send
-                    self.assertTrue(serious.sends(serious.send_reasons(tool, {}, None)))
+                    self.assertTrue(serious.sends(serious.send_reasons(tool, {})))
 
 
 if __name__ == "__main__":

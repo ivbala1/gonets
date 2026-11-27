@@ -22,6 +22,8 @@ from .core import Item, add_backlog_line, backlog_prompt, new_backlog_text, pars
 BACKLOGS_FILE = Path(__file__).resolve().parent / "backlogs.json"
 CHOICE_TIMEOUT = 120
 GIT_TIMEOUT = 60
+# Сколько ждать git после SIGTERM по сроку до SIGKILL группе.
+GIT_TERM_GRACE = 5.0
 # Ветка, куда идёт строка бэклога: у всех проектов из backlogs.json это main
 # (проект шага 3, 1.8, п. 7).
 MAIN = "main"
@@ -41,10 +43,13 @@ def load_projects(path: Path = BACKLOGS_FILE) -> list[dict]:
 
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     # Без вопросов в терминал: запрос пароля держал бы вызов до таймаута; на
-    # таймауте SIGKILL получает вся группа, ssh тоже (procs.run_bounded_sync).
+    # таймауте вся группа (ssh тоже) получает SIGTERM, через GIT_TERM_GRACE
+    # оставшиеся SIGKILL: на SIGTERM git снимает .git/index.lock, SIGKILL
+    # сразу его оставлял (procs.run_bounded_sync, term_grace).
     # Без секретов бота: кнопка работает в его процессе, а push зовёт хуки.
     env = {**(agent_env() if env is None else env), "GIT_TERMINAL_PROMPT": "0"}
-    return procs.run_bounded_sync(["git", "-C", str(repo), *args], text=True, timeout=GIT_TIMEOUT, env=env)
+    return procs.run_bounded_sync(["git", "-C", str(repo), *args], text=True, timeout=GIT_TIMEOUT,
+                                  env=env, term_grace=GIT_TERM_GRACE)
 
 
 def _push_env(repo: Path) -> dict[str, str]:

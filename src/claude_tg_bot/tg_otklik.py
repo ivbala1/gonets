@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ from .i18n import _
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
+# Сколько текста отклика повторять в строке ✏️ в личке (как цитата карточки, bot.py).
+EDIT_QUOTE_CAP = 1000
 
 
 def _otklik_markup(rec: dict) -> InlineKeyboardMarkup | None:
@@ -126,10 +129,39 @@ async def _otklik_close_attempts(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, ch
     ctx.application.create_task(_otklik_sync(ctx.bot, base))
 
 
+async def _otklik_report_to_primary(cfg: Any, chat_key: str, since: datetime) -> bool:
+    """Итог рана темы откликов нужен в личке: сбой или ответ человеку (otklik.report_to_primary)."""
+    try:
+        return await asyncio.to_thread(otklik.report_to_primary, otklik.otklik_dir(cfg.state_dir), chat_key, since)
+    except Exception:
+        log.exception("otklik: failed check chat=%s", chat_key)
+        return True   # не знаем: итог в личку, как до 27.11.2026
+
+
+async def _otklik_edit_ask(bot: Any, cfg: Config, rec: dict) -> None:
+    """✏️ на карточке в теме откликов: строка в личке, ответом на которую Иван
+    пишет правку. Начало как у карточки (номер отклика): ответ цитирует его, и
+    личка правит так же, как по ответу на саму карточку (решение Ивана 27.11.2026)."""
+    body = str(rec.get("text") or "")
+    if len(body) > EDIT_QUOTE_CAP:
+        body = body[:EDIT_QUOTE_CAP].rstrip() + "…"
+    # Текст отклика в самой строке: раньше его давала цитата карточки в ответе.
+    text = (_("📨 {title} (отклик {id})").format(title=rec.get("title"), id=rec["id"]) + "\n\n" + body
+            + "\n\n" + _(otklik.EDIT_ASK))
+    try:
+        await bot.send_message(cfg.primary_chat_id, text, disable_notification=True,
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception:
+        log.exception("otklik %s: edit ask in primary failed", rec.get("id"))
+        # Карточка обещает строку в личке: сказать там, где Иван нажал ✏️.
+        await _otklik_loud(bot, {k: v for k, v in rec.items() if k != "alarm_chat_id"}, _(
+            "✏️ Строка в личку не ушла: напиши в личке «правка отклика {id}: …»").format(id=rec["id"]), quiet=True)
+
+
 def _otklik_target(ctx: ContextTypes.DEFAULT_TYPE, rec: dict, update: Update) -> Update:
     """Кого будит ✅: тема откликов, без неё чат, где отклик готовили
-    (otklik.sender_of). Сообщение с кнопкой лежит в личке; если отправляет
-    она же, ран отвечает на само сообщение."""
+    (otklik.sender_of). Сообщение с кнопкой лежит в личке или в теме откликов;
+    если отправляет тот же чат, ран отвечает на само сообщение."""
     sender = otklik.sender_of(rec)
     msg = update.callback_query.message
     if sender == str(msg.chat_id):
@@ -207,6 +239,8 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             # ✋ снял одобрение в срок: его задание из очереди /at тоже.
             _drop_otklik_jobs(ctx.application, rec["id"])
         await _otklik_show(ctx.bot, rec, base)
+        if action == "e" and rec.get("thread_id"):
+            await _otklik_edit_ask(ctx.bot, cfg, rec)
         return
     ts = otklik.at_ts(rec)
     if ts is not None and ts > time.time():
@@ -224,8 +258,8 @@ async def _otklik_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, base: Path, r
                       target: Callable[[], Update], prologue: Any = None, *, keep_if_rejected: bool = False,
                       **extra: Any) -> bool | None:
     """Ран отправки одобренного отклика (по ✅ или в его срок). Одобренное, которое
-    ран не взял, снова с кнопками, а прошедшее окно срока пропущенным со строкой
-    Ивану; keep_if_rejected: отказ из-за перезапуска оставляет его одобренным
+    ран не взял, снова с кнопками, а прошедшее окно срока со статусом failed и
+    строкой Ивану; keep_if_rejected: отказ из-за перезапуска оставляет его одобренным
     (запуск в срок лежит в очереди /at и уйдёт после рестарта). target зовётся
     внутри try: сбой разбора чата тоже возвращает кнопки. Возвращает ответ
     _dispatch_to_claude: True отказ до старта."""
@@ -294,6 +328,8 @@ async def _otklik_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, base: Path, r
             await _otklik_loud(ctx.bot, back, _("⚠️ Отклик «{title}» в срок {when} не ушёл: {reason}, подробности "
                                                 "в теме откликов. Кнопки вернулись.").format(
                 title=back.get("title"), when=otklik.at_label(back), reason=reason))
+        else:
+            await _otklik_back_loud(ctx.bot, [back])
     elif keep_if_rejected and not expired and rejected is not True and not stopping:
         cur = await asyncio.to_thread(otklik.load, base, oid)
         if cur is not None and otklik.gen_of(cur) == gen and cur.get("status") == "failed":
@@ -305,14 +341,56 @@ async def _otklik_run(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, base: Path, r
 
 
 async def _otklik_loud(bot: Any, rec: dict, text: str, quiet: bool = False) -> None:
-    """Строка ответом на карточку отклика, со звуком (quiet: без), правка карточки звука не даёт."""
+    """Строка ответом на карточку отклика, со звуком (quiet: без), правка карточки звука не даёт.
+    Карточка в теме откликов: строка в личку (alarm_chat_id), тема заглушена
+    (решение Ивана 27.11.2026: в личку только сбой)."""
     if not rec.get("message_id") or rec.get("chat_id") is None:
         return
     try:
+        if rec.get("thread_id") and rec.get("alarm_chat_id"):
+            await bot.send_message(rec["alarm_chat_id"], text, disable_notification=quiet,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
         await bot.send_message(rec["chat_id"], text, disable_notification=quiet, reply_parameters=ReplyParameters(
             message_id=rec["message_id"], allow_sending_without_reply=True))
     except Exception:
         log.exception("otklik %s: loud line failed", rec.get("id"))
+
+
+async def _otklik_back_loud(bot: Any, recs: list[dict], reply_to: tuple[int, int] | None = None) -> None:
+    """Одобренное вернулось с кнопками, не уйдя: правка карточки звука не даёт,
+    а карточка могла уехать вверх (слова Ивана 27.11.2026: «о таком сбое надо
+    узнавать в телеграме»). Одно новое сообщение: на один отклик ответом на его
+    карточку, на несколько разом (пачка, перезапуск) списком ответом на reply_to
+    или первую карточку. До утра без звука: ран мог ждать тему за полночь."""
+    recs = [r for r in recs if r]
+    if not recs:
+        return
+    quiet = otklik.quiet_now()
+
+    def title(rec: dict) -> str:
+        return (str(rec.get("title") or "").splitlines() or [""])[0][:60]
+    reason = recs[0].get("note") or _("причина в журнале бота")
+    if len(recs) == 1:
+        await _otklik_loud(bot, recs[0], _("⚠️ Отклик «{title}» не ушёл: {reason}. Кнопки вернулись на карточке, "
+                                           "нажми ✅ ещё раз.").format(title=title(recs[0]), reason=reason),
+                           quiet=quiet)
+        return
+    chat_id, message_id = reply_to or (recs[0].get("chat_id"), recs[0].get("message_id"))
+    items = "\n".join(f"• {title(rec)}" for rec in recs)
+    # Карточки в теме откликов (хоть одна): строка в личку, как у одного (_otklik_loud).
+    topic = next((r for r in recs if r.get("thread_id") and r.get("alarm_chat_id")), {})
+    await _otklik_loud(bot, {"id": recs[0].get("id"), "chat_id": chat_id, "message_id": message_id,
+                             "thread_id": topic.get("thread_id"), "alarm_chat_id": topic.get("alarm_chat_id")},
+                       _("⚠️ Не ушли отклики ({count}): {reason}. Кнопки вернулись, нажми ✅ ещё раз:\n{items}").format(
+                           count=len(recs), reason=reason, items=items), quiet=quiet)
+
+
+async def _otklik_restart_loud(bot: Any, recovered: list[dict]) -> None:
+    """Старт бота: одобренное по ✅, которое перезапуск оборвал до отправки
+    (recover вернул в pending), одной строкой на всех. Отправка в срок и
+    «неизвестно» говорят своими строками."""
+    await _otklik_back_loud(bot, [rec for rec in recovered if rec.get("status") == "pending" and not rec.get("at")])
 
 
 def _at_late(rec: dict) -> bool:
@@ -506,7 +584,7 @@ async def on_otklik_all_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await _otklik_show(ctx.bot, rec, base)
         _otklik_queued(ctx, f"batch={bid} n={len(picked)}", sender)
         if await _b._dispatch_to_claude(
-            _otklik_target(ctx, first, update), ctx, otklik.approved_prompt(first, base),
+            _otklik_target(ctx, first, update), ctx, otklik.batch_prompt(picked, base),
             send_voice_reply=False, from_callback=True, still_wanted=still_approved, fresh=fresh,
         ):
             reason = _("бот перезапускается")
@@ -520,9 +598,11 @@ async def on_otklik_all_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                 back.append(otklik.revert_untaken(base, oid, gen, reason))
             except Exception:
                 log.exception("otklik revert failed aid=%s", oid)
-    for rec in filter(None, back):
+    back = [rec for rec in back if rec]
+    for rec in back:
         log.info("otklik %s: approved but not taken, buttons back (%s)", rec["id"], reason)
         await _otklik_show(ctx.bot, rec, base)
+    await _otklik_back_loud(ctx.bot, back, reply_to=(msg.chat_id, msg.message_id) if msg is not None else None)
 
 
 # В конце: bot импортирует этот модуль при своей загрузке. Имена bot и

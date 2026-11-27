@@ -934,7 +934,6 @@ class UnattendedPolicyTests(unittest.TestCase):
     def _cfg(self, **over):
         base = dict(
             approve_whitelist_paths=frozenset({Path("/home/user/src")}),
-            bash_auto_allow_re=re.compile(r"ls( .*)?"),
             mcp_auto_allow_re=re.compile(r"get[A-Za-z]*"),
         )
         base.update(over)
@@ -945,12 +944,6 @@ class UnattendedPolicyTests(unittest.TestCase):
         cfg = self._cfg()
         self.assertTrue(cfg.mcp_auto_allow_re.fullmatch("getMessage"))
         self.assertIsNone(cfg.mcp_auto_allow_re.fullmatch("createIssue"))
-
-    def test_burst_skipped_for_unattended_session(self) -> None:
-        unattended = {"sid-bg"}
-        for sid, eligible in (("sid-human", True), ("sid-bg", False)):
-            with self.subTest(sid=sid):
-                self.assertEqual(sid not in unattended, eligible)
 
 
 class SessionEpochTests(unittest.TestCase):

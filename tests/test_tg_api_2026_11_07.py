@@ -17,7 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from claude_tg_bot import lifecycle, notify, serious, tg_api  # noqa: E402
+from claude_tg_bot import lifecycle, notify, tg_api  # noqa: E402
 
 TOKEN = "123456:SECRET-token_value"
 LOCAL = "http://127.0.0.1:8081"
@@ -538,59 +538,6 @@ def test_bot_down_alert_only_and_bad_alert(tmp_path, monkeypatch) -> None:
     rc, sent = _run_bot_down(tmp_path, monkeypatch, f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_ALLOWED_USER_IDS=5\n"
                              f"ALERT_BOT_TOKEN={ALERT_TOKEN}\nALERT_CHAT_ID=x\n")
     assert rc == 0 and [u for u, _b in sent] == [f"https://api.telegram.org/bot{TOKEN}/sendMessage"]
-
-
-# ---- сторож команд агента узнаёт Bot API на своём сервере ----
-
-def _why(cmd: str) -> set[str]:
-    return serious.send_reasons("Bash", {"command": cmd}, None)
-
-
-@pytest.mark.parametrize("cmd", [
-    'curl -s "http://127.0.0.1:8081/bot$TOKEN/sendMessage" -d chat_id=5 -d text=hi',
-    'API="http://localhost:8081/bot${TELEGRAM_BOT_TOKEN}"; curl -s "$API/sendVoice" -F voice=@a.ogg',
-    "curl http://127.0.0.1:8081/bot123456:AAAbbb/forwardMessage -d chat_id=1",
-    """python3 -c 'import os,httpx; httpx.post(f"http://127.0.0.1:8081/bot{os.environ["T"]}/sendMessage")'""",
-    """python3 -c 'u="http://127.0.0.1:8081/bot"+tok+"/sendMessage"'""",
-    """python3 -c 'u="http://127.0.0.1:8081/bot%s/sendMessage" % t'""",
-    'python3 - <<EOF\nimport httpx\nhttpx.post(f"{base}/bot{tok}/sendPhoto")\nEOF',
-    'curl "http://127.0.0.1:8081/bot$(cat ~/.tok)/sendMessage" -d text=hi',
-    'curl http://127.0.0.1:8081/bot"$TOKEN"/sendMessage -d text=hi',
-    'curl "http://127.0.0.1:8081/bot$1/sendMessage" -d text=hi',
-    'curl "http://127.0.0.1:8081/bot$(< ~/.tok)/sendMessage" -d text=hi',
-    """python3 -c 'from claude_tg_bot import tg_api; tg_api.post(t, "sendMessage", json={"chat_id": 1})'""",
-    """python3 -c 'from claude_tg_bot import tg_api; from claude_tg_bot.config import load_config; """
-    """tg_api.post(load_config(skip_hook_validation=True).telegram_bot_token, "sendMessage", json={})'""",
-    """python3 -c 'from claude_tg_bot.tg_api import post; m="sendDocument"; post(t, m, data={})'""",
-    'curl "http://127.0.0.1:8081/bot$( cat ~/.tok )/sendMessage" -d a=1',
-])
-def test_local_bot_api_send_is_card(cmd: str) -> None:
-    found = _why(cmd)
-    assert found and not serious.sends(found)
-
-
-@pytest.mark.parametrize("cmd", [
-    'curl -s "http://127.0.0.1:8081/bot$TOKEN/getUpdates"',
-    "git commit -m 'tg_api: /bot$TOKEN/sendMessage на свой сервер'",
-    "ls /srv/bot/send",
-    "grep -rn '/bot{token}/sendMessage' src", "docker run bot12345:latest",
-    'curl -s "http://127.0.0.1:8081/bot$TOKEN/getMe"',
-    """python3 -c 'from claude_tg_bot import tg_api; print(tg_api.post(t, "getMe").json())'""",
-    """grep -rn 'tg_api.post(.*"sendMessage"' src""", "git commit -m 'tg_api: \"sendMessage\" через модуль'",
-    "pytest -q tests/test_tg_api_2026_11_07.py -k sendMessage",
-])
-def test_local_bot_api_reads_free(cmd: str) -> None:
-    assert _why(cmd) == set()
-
-
-def test_webfetch_docs_page_free() -> None:
-    assert serious.send_reasons("WebFetch", {"url": "https://docs.example.org/bot%2Dapi/sendMessage.html"},
-                                None) == set()
-
-
-def test_webfetch_local_bot_api_send_is_card() -> None:
-    found = serious.send_reasons("WebFetch", {"url": f"{LOCAL}/bot123456:AAA/sendMessage?chat_id=1"}, None)
-    assert found and not serious.sends(found)
 
 
 def test_token_log_filter_scrubs_message_args_and_traceback() -> None:

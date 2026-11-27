@@ -9,7 +9,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -89,11 +88,12 @@ class CommandClassifyTests(_Env):
         self.assertEqual(outbound.mailsend_check(gone, str(self.outside))[0], "deny")
         # `cd ~нет_такого`: expanduser бросает RuntimeError, обработчик не падает.
         self.assertEqual(outbound.mailsend_check(f"cd ~нет-такого-xyz; {PY} --help", "/x")[0], "mention")
-        # Другие разделители после `cd DIR` простой формой не стали.
+        # Другие разделители после `cd DIR`: запуск не в начале команды, не узнаётся
+        # (с 27.11.2026, этап 3 защит): без билета письмо не уйдёт.
         for sep in ("||", "|", "&", ";;"):
             with self.subTest(sep=sep):
                 self.assertEqual(outbound.mailsend_check(
-                    f"cd /home/user/src/claude-tg-bot {sep} {self.cmd()}", "/x")[0], "mention")
+                    f"cd /home/user/src/claude-tg-bot {sep} {self.cmd()}", "/x")[0], "")
 
     def test_dollar_in_single_quotes_is_text(self) -> None:
         # Ревью Codex 11.11.2026: тема `'Оклад $5000'` давала карточку команды
@@ -124,19 +124,29 @@ class CommandClassifyTests(_Env):
                 self.assertEqual(outbound.mailsend_check(self.cmd(f" {flag}"), None)[0], "dry")
 
     def test_tricky_forms_give_command_card(self) -> None:
-        for cmd in (f'bash -c "{self.cmd()}"', f"x=$({self.cmd()})", f"`{self.cmd()}`",
-                    f"{self.cmd()} | tee /tmp/log", f"{self.cmd()}; rm -f /tmp/x",
+        # Запуск в начале команды, но не простой формой: карточка команды без билета.
+        for cmd in (f"{self.cmd()} | tee /tmp/log", f"{self.cmd()}; rm -f /tmp/x",
                     f"{self.cmd()} > /tmp/log", f"{self.cmd()} 2> /tmp/err", f"{self.cmd()} &",
                     f"{self.cmd()} |& head", f"{self.cmd()} | sed -i s/a/b/ {self.body}",
                     f"{self.cmd()} | head; git push", f"{self.cmd()} |", f"{self.cmd()} ;",
                     f"{self.cmd()} | grep issue#12; rm -rf /tmp/x", f"{self.cmd()} < /dev/null",
                     f"{self.cmd()} ;; cat x", f"{self.cmd()} | /usr/bin/head", f"{self.cmd()} | rg --pre=sh x",
                     f"{PY} --to a@b.c 2>&1 --subject s --body-file {self.body}",
-                    f"{self.cmd()}\xa0#x; rm -rf /tmp/zz", f"{self.cmd()}\x0b#x; rm -rf /tmp/zz",
-                    f"bash <<'EOF'\n{self.cmd()}\nEOF", f"FOO=1 {self.cmd()}",
-                    f"timeout 60 {self.cmd()}", "python -c 'import claude_tg_bot.mailsend'"):
+                    f"{self.cmd()}\xa0#x; rm -rf /tmp/zz", f"{self.cmd()}\x0b#x; rm -rf /tmp/zz"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
+        # Не в начале команды (с 27.11.2026, этап 3 защит): не узнаётся, письмо
+        # без билета mailsend не отправит.
+        for cmd in (f'bash -c "{self.cmd()}"', f"x=$({self.cmd()})", f"`{self.cmd()}`",
+                    f"bash <<'EOF'\n{self.cmd()}\nEOF", f"FOO=1 {self.cmd()}",
+                    f"timeout 60 {self.cmd()}", "python -c 'import claude_tg_bot.mailsend'",
+                    # ревью Codex 27.11.2026: строка-комментарий и чужой модуль
+                    # не запуск mailsend; имя модуля в кавычках не узнаётся
+                    f"#{self.cmd()}", f"#./{self.cmd()}",
+                    "python -m claude_tg_bot.mailsend-example --to a@b.c",
+                    f"python -m 'claude_tg_bot.mailsend' --to a@b.c --subject s --body-file {self.body}"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "")
 
     def test_reader_tail_keeps_kind(self) -> None:
         # Карточки 09.11.2026: справка и сухой прогон с `| head`, `; cat` шли
@@ -168,14 +178,18 @@ class CommandClassifyTests(_Env):
             with self.subTest(cmd=cmd):
                 self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "")
 
-    def test_run_in_other_forms_gives_command_card(self) -> None:
-        for cmd in (f"python3 src/claude_tg_bot/mailsend.py --to a@b.c",
+    def test_run_in_other_forms_not_recognized(self) -> None:
+        # С 27.11.2026 (этап 3 защит) узнаётся только запуск в начале команды:
+        # прочие формы идут без карточки, письмо без билета mailsend не отправит.
+        for cmd in ("python3 src/claude_tg_bot/mailsend.py --to a@b.c",
                     f'echo "$({self.cmd()})"', f"git status\n{self.cmd()}",
                     "cd src/claude_tg_bot && python -m mailsend --to a@b.c",
                     "python3 - <<'EOF'\nfrom claude_tg_bot import mailsend\nmailsend.main()\nEOF",
                     f"env A=1 {self.cmd()}", f"sh -c 'git status; {self.cmd()}'"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "")
+        # В начале команды, но не простой формой (подстановка): карточка команды.
+        self.assertEqual(outbound.mailsend_check(f"{PY} --to a@b.c --subject \"$(cat s)\"", "/x")[0], "mention")
 
     def test_mentions_in_other_commands_are_not_mailsend(self) -> None:
         # Сообщение коммита, шаблон поиска, текст: письмо так не уходит.
@@ -191,8 +205,7 @@ class CommandClassifyTests(_Env):
                 self.assertEqual(outbound.mailsend_check(cmd, "/x"), ("", None))
 
     def test_rtk_prefix_and_quoted_import(self) -> None:
-        # Разбор по outbound.executed_text (третье ревью 03.11.2026): `rtk git
-        # commit` это git, его сообщение не исполняется; `rtk python` исполняет.
+        # С 27.11.2026 узнаётся только запуск в начале команды: `rtk …` и импорт не узнаются.
         for cmd in ("rtk git commit -m 'fix mailsend: python -m claude_tg_bot.mailsend'",
                     "rtk proxy git commit -m 'python -m claude_tg_bot.mailsend'"):
             with self.subTest(cmd=cmd):
@@ -200,7 +213,7 @@ class CommandClassifyTests(_Env):
         for cmd in (f"rtk {self.cmd()}", "rtk python -m claude_tg_bot.mailsend --to a@b.c",
                     "python3 -c \"import importlib; importlib.import_module('claude_tg_bot.mailsend').main()\""):
             with self.subTest(cmd=cmd):
-                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "mention")
+                self.assertEqual(outbound.mailsend_check(cmd, "/x")[0], "")
 
     def test_bad_letter_denied(self) -> None:
         for cmd in (f"{PY} --to hr@example.com --subject S --body-file {self.body} "
@@ -262,10 +275,10 @@ class HandleApproveTests(_Env):
         cfg = SimpleNamespace(
             approve_shared_secret="s3", primary_chat_id=1, state_dir=self.state, approve_timeout_sec=5,
             approve_auto_chat_keys=frozenset({"1"}), approve_whitelist_paths=(),
-            mcp_auto_allow_re=None, bash_auto_allow_re=re.compile(r".*"),
+            mcp_auto_allow_re=None,
         )
         bot_data = {"unattended_sids": {"sid"} if unattended else set(),
-                    "untrusted_sids": set(), "burst_until_by_target": {"1": time.time() + 600}}
+                    "untrusted_sids": set()}
         tool_input = {"command": command, "description": "письмо", **(extra or {})}
         request = SimpleNamespace(
             app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
@@ -288,7 +301,7 @@ class HandleApproveTests(_Env):
             resp = asyncio.run(approval.handle_approve(request))
         return json.loads(resp.text), card
 
-    def test_send_goes_to_card_in_auto_chat_and_burst(self) -> None:
+    def test_send_goes_to_card_in_auto_chat(self) -> None:
         out, card = self._decide(self.cmd())
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
@@ -298,7 +311,7 @@ class HandleApproveTests(_Env):
 
     def test_unattended_send_refused_without_card(self) -> None:
         # Фоновый ран письмо человеку не шлёт: черновик в отчёт (решение Ивана 03.11.2026).
-        for cmd in (self.cmd(), f'bash -c "{self.cmd()}"'):
+        for cmd in (self.cmd(),):
             with self.subTest(cmd=cmd[:40]):
                 out, card = self._decide(cmd, unattended=True)
                 self.assertEqual(out["decision"], "deny")
@@ -311,11 +324,13 @@ class HandleApproveTests(_Env):
         self.assertEqual(out["decision"], "allow")
         card.assert_not_called()
 
-    def test_tricky_form_gets_card_not_auto(self) -> None:
+    def test_tricky_form_not_recognized(self) -> None:
+        # С 27.11.2026 (этап 3 защит) запуск не в начале команды не узнаётся:
+        # команда идёт без карточки, билета на письмо нет, mailsend откажет.
         out, card = self._decide(f'bash -c "{self.cmd()}"')
-        self.assertEqual(out["decision"], "deny")
-        card.assert_called()
-        self.assertTrue(card.call_args.args[2].tool_input[outbound.MAILSEND_CARD_KEY]["warning"])
+        self.assertEqual(out["decision"], "allow")
+        card.assert_not_called()
+        self.assertFalse(list(mailsend.ticket_dir(self.state).glob("*.json")))
 
     def test_commit_mentioning_mailsend_keeps_auto_approve(self) -> None:
         out, card = self._decide('git commit -m "fix mailsend approval"')
@@ -378,6 +393,42 @@ class SendAfterCardTests(_Env):
         smtp.send_message.assert_not_called()
         self.assertIn(_("нет одобрения карточкой на это письмо: запускай без обходов, чтобы бот показал "
                         "карточку, и не меняй текст и вложения после неё"), text)
+
+    def test_direct_send_call_needs_ticket(self) -> None:
+        # Вызов mailsend.send из своего python хук с 27.11.2026 не узнаёт:
+        # билет проверяет сама send (ревью этапа 3 защит).
+        args = mailsend.build_parser().parse_args(
+            ["--to", "hr@example.com", "--subject", "x", "--body-file", str(self.body)])
+        letter = mailsend.load_letter(args, dirs=(self.allowed,), limit=10**6, base=None)
+        with patch.object(mailsend.smtplib, "SMTP_SSL") as ssl_cls:
+            with self.assertRaises(mailsend.MailError):
+                mailsend.send(letter, "iv@example.com", "p", state_dir=self.state, secret="s3")
+            ssl_cls.assert_not_called()
+            mailsend.write_ticket(self.state, letter.digest(), "s3")
+            smtp = ssl_cls.return_value.__enter__.return_value
+            smtp.send_message.return_value = {}
+            mailsend.send(letter, "iv@example.com", "p", state_dir=self.state, secret="s3")
+            smtp.send_message.assert_called_once()
+
+    def test_server_refusal_is_not_maybe_sent(self) -> None:
+        # Ревью Codex 27.11.2026: явный отказ сервера (554 на данные) это «не
+        # ушло», а «могло уйти» только на обрыве связи.
+        import smtplib
+        args = mailsend.build_parser().parse_args(
+            ["--to", "hr@example.com", "--subject", "x", "--body-file", str(self.body)])
+        letter = mailsend.load_letter(args, dirs=(self.allowed,), limit=10**6, base=None)
+        cases = ((smtplib.SMTPDataError(554, b"rejected"), False),
+                 (smtplib.SMTPRecipientsRefused({"hr@example.com": (550, b"no")}), False),
+                 (smtplib.SMTPSenderRefused(553, b"no", "iv@example.com"), False),
+                 (smtplib.SMTPServerDisconnected("drop"), True))
+        for error, maybe in cases:
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(mailsend.smtplib, "SMTP_SSL") as ssl_cls:
+                mailsend.write_ticket(self.state, letter.digest(), "s3")
+                ssl_cls.return_value.__enter__.return_value.send_message.side_effect = error
+                with self.assertRaises(mailsend.MailError) as caught:
+                    mailsend.send(letter, "iv@example.com", "p", state_dir=self.state, secret="s3")
+                self.assertIs(isinstance(caught.exception, mailsend.MailMaybeSent), maybe)
 
     def test_approved_letter_sent_once(self) -> None:
         self._approve()
@@ -450,7 +501,7 @@ class MailCardTextTests(_Env):
         self.assertIn(_("{size} Б").format(size=13), text)
         self.assertNotIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
 
-    def test_long_body_full_view_and_no_burst_buttons(self) -> None:
+    def test_long_body_full_view_and_buttons(self) -> None:
         tool_input = self._input("абв " * 1500 + "КОНЕЦ")
         text = approval._format_tool_call("Bash", tool_input, "sid")
         self.assertIn(_("⚠️ <b>текст длиннее карточки: прочитай целиком по 📄 до ✅</b>"), text)
@@ -468,7 +519,6 @@ class MailCardTextTests(_Env):
             kb = bot.send_message.call_args.kwargs["reply_markup"]
             return [b.callback_data for row in kb.inline_keyboard for b in row]
         data = asyncio.run(go())
-        self.assertFalse(any(d.endswith(("auto15", "auto60")) for d in data))
         self.assertTrue(any(d.startswith("apprfull:") for d in data))
 
 

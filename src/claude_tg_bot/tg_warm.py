@@ -153,7 +153,10 @@ def _warm_schedule(app: Application, chat_key: str) -> None:
     _warm_save(app)
     cfg: Config = bd["cfg"]
     delay = max(1.0, mark["at"] + cfg.warm_idle_min * 60 - time.time())
-    jq.run_once(_warm_tick, when=delay, name=f"warm:{chat_key}", data=(chat_key, gen))
+    # Опоздавшее задание (сон машины) решает _warm_skip_reason (пропуск с причиной в журнале),
+    # а не молчаливый пропуск планировщика через секунду после срока.
+    jq.run_once(_warm_tick, when=delay, name=f"warm:{chat_key}", data=(chat_key, gen),
+                job_kwargs={"misfire_grace_time": None})
 
 
 def _warm_skip_reason(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,

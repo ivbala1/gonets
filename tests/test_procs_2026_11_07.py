@@ -312,6 +312,57 @@ class RunBoundedSyncTests(unittest.TestCase):
         self.addCleanup(_kill_quietly, child)
         self.assertTrue(_gone(child))
 
+    def test_term_grace_lets_group_clean_up(self) -> None:
+        # git на SIGTERM снимает .git/index.lock; SIGKILL сразу его оставлял
+        # (BACKLOG «SIGKILL сразу у git», образец Свода 8be1936).
+        import subprocess
+        import tempfile
+        import shutil
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mark = os.path.join(tmp, "cleaned")
+        script = f"trap 'echo ok > {mark}; exit 0' TERM; sleep 60 & wait"
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            procs.run_bounded_sync(["sh", "-c", script], timeout=0.5, env=None, term_grace=5)
+        self.assertTrue(os.path.exists(mark))
+        self.assertLess(time.monotonic() - started, 3)  # вышли все: срок не дожидается
+
+    def test_term_grace_git_leaves_no_index_lock(self) -> None:
+        # Настоящий git add, повисший на фильтре: с SIGKILL сразу
+        # .git/index.lock оставался (проверено 27.11.2026), с SIGTERM снят.
+        import shutil
+        import subprocess
+        import tempfile
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo, True)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(["git", "-C", repo, "config", "filter.slow.clean", "sleep 60; cat"], check=True)
+        with open(os.path.join(repo, ".gitattributes"), "w") as f:
+            f.write("*.slow filter=slow\n")
+        with open(os.path.join(repo, "a.slow"), "w") as f:
+            f.write("x")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            procs.run_bounded_sync(["git", "-C", repo, "add", "a.slow"], timeout=1, env=None,
+                                   text=True, term_grace=5)
+        self.assertFalse(os.path.exists(os.path.join(repo, ".git", "index.lock")))
+
+    def test_term_grace_then_kill_whole_group(self) -> None:
+        # Внук не отвечает на SIGTERM: через срок SIGKILL всей группе, сирот нет.
+        import subprocess
+        pidfile = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"procs-test-g-{os.getpid()}")
+        self.addCleanup(lambda: os.path.exists(pidfile) and os.unlink(pidfile))
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            procs.run_bounded_sync(["sh", "-c", f"trap '' TERM; sleep 60 & echo $! > {pidfile}; wait"],
+                                   timeout=0.5, env=None, term_grace=0.5)
+        elapsed = time.monotonic() - started
+        child = int(open(pidfile).read())
+        self.addCleanup(_kill_quietly, child)
+        self.assertTrue(_gone(child))
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 4)
+
     def test_stdin_closed_without_input(self) -> None:
         # Без input stdin пуст, а не терминал бота: программа не ждёт ввода.
         res = procs.run_bounded_sync(["cat"], timeout=5, env=None)
@@ -347,6 +398,7 @@ class RunBoundedSyncTests(unittest.TestCase):
         self.assertEqual(first["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("TELEGRAM_BOT_TOKEN", first)
         self.assertEqual(second, {"GIT_INDEX_FILE": "/i", "GIT_TERMINAL_PROMPT": "0"})
+        self.assertEqual({c.kwargs["term_grace"] for c in run.call_args_list}, {backlog.GIT_TERM_GRACE})
 
 
 class RunClaudeJsonTests(unittest.TestCase):
@@ -373,8 +425,9 @@ class RunClaudeJsonTests(unittest.TestCase):
         self.assertEqual(text, "ok - x")
         self.assertEqual(args, [
             "/bin/claude", "-p", "--output-format", "json", "--permission-mode", "plan",
-            "--tools", "", "--no-session-persistence", "--settings", str(paths.hook_settings()),
-            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+            "--tools", "", "--no-session-persistence", "--setting-sources", "",
+            "--settings", str(paths.hook_settings()),
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--effort", "xhigh"])
         # Перенос в _oneshot: корень репозитория тот же, настройки хука на месте.
         with patch.dict("os.environ", {"CLAUDE_HOOK_SETTINGS": ""}):
             self.assertEqual(paths.hook_settings(), ROOT / "claude-hook-settings.json")
@@ -390,7 +443,7 @@ class RunClaudeJsonTests(unittest.TestCase):
         from claude_tg_bot.skills.news_digest import __main__ as news
         with patch.object(chat, "run_claude_json", return_value="a") as one:
             self.assertEqual(chat.run_digest_claude("p", 7), "a")
-        one.assert_called_once_with("p", timeout=7)
+        one.assert_called_once_with("p", timeout=7, model="opus")
         with patch.object(news, "run_claude_json", return_value="b") as two:
             self.assertEqual(news.run_claude("p", 7, "m"), "b")
         two.assert_called_once_with("p", timeout=7, model="m")
@@ -470,7 +523,6 @@ SPAWN_ALLOWED = {
     "src/claude_tg_bot/config.py::_validate_claude_version": "claude --version при старте, timeout",
     "src/claude_tg_bot/skills/transcribe/__main__.py::probe_duration": "ffprobe без потомков, timeout",
     "src/claude_tg_bot/skills/transcribe/__main__.py::split_audio": "ffmpeg без потомков, timeout",
-    "src/claude_tg_bot/skills/immich_relay/__main__.py::_ssh": "ssh BatchMode, timeout",
     "tools/export_public.py::*": "отдельный инструмент без пакета бота",
     "bot-down-notify.py::*": "сторож без пакета бота",
 }

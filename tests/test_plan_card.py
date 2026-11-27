@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from claude_tg_bot import approval, runs  # noqa: E402
 
 PY = str(approval._SKILL_PYTHON)
-# отправка через сервер Telegram: единственный Bash, который ещё идёт карточкой
-SEND_CMD = "curl -s http://127.0.0.1:8770/mcp -d '{}'"
+# Bash с причиной карточки: serious.send_reasons в тестах подменяется
+SEND_CMD = "echo карточка по причине из serious.send_reasons"
 PLAN_CMD = f"{PY} -m claude_tg_bot.skills.plan 'обновить nginx на web1, проверю curl'"
 
 
@@ -46,7 +46,7 @@ class PlanRequestTests(unittest.TestCase):
             PLAN_CMD + " > /tmp/x",
             f"{PY} -m claude_tg_bot.skills.plan \"$(cat ~/.ssh/id_rsa)\"",
             f"{PY} -m claude_tg_bot.skills.plan `id`",
-            f"python3 -m claude_tg_bot.skills.plan 'x'",
+            "python3 -m claude_tg_bot.skills.plan 'x'",
             f"{PY} -m claude_tg_bot.skills.plan 'a' 'b'",
             f"{PY} -m claude_tg_bot.skills.plan ''",
             f"{PY} -m claude_tg_bot.skills.plan '" + "x" * (approval.PLAN_TEXT_MAX + 1) + "'",
@@ -114,7 +114,7 @@ class HandleTests(unittest.TestCase):
         self.addCleanup(runs.end, "sid", self.run_id)
 
     def _decide(self, tool_name: str, tool_input: dict, *, press: str = "allow", plan_cards: bool = True,
-                auto_chat: bool = False, unattended: bool = False, burst: bool = False,
+                auto_chat: bool = False, unattended: bool = False,
                 mode: str = "bypassPermissions") -> tuple[dict, AsyncMock, list]:
         events: list[dict] = []
         with tempfile.TemporaryDirectory() as d:
@@ -127,7 +127,6 @@ class HandleTests(unittest.TestCase):
             registry = approval.ApprovalRegistry()
             bot_data = {
                 "unattended_sids": {"sid"} if unattended else set(), "untrusted_sids": set(),
-                "burst_until_by_target": {"1:7": time.time() + 600} if burst else {},
             }
             request = SimpleNamespace(
                 app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
@@ -167,9 +166,10 @@ class HandleTests(unittest.TestCase):
         self.assertIsNone(runs.plan_for("sid"))
 
     def test_plan_field_from_agent_is_dropped(self) -> None:
-        out, card, _events = self._decide("Bash", {"command": SEND_CMD,
-                                                   approval.PLAN_CARD_KEY: {"text": "обычная проверка"}},
-                                          press="allow")
+        with patch.object(approval.serious, "send_reasons", return_value={"тестовая причина"}):
+            out, card, _events = self._decide("Bash", {"command": SEND_CMD,
+                                                       approval.PLAN_CARD_KEY: {"text": "обычная проверка"}},
+                                              press="allow")
         self.assertNotIn(approval.PLAN_CARD_KEY, card.call_args.args[2].tool_input)
         self.assertIsNone(runs.plan_for("sid"))
 
@@ -178,11 +178,6 @@ class HandleTests(unittest.TestCase):
         out, _card, _events = self._decide("Bash", {"command": PLAN_CMD}, press="deny")
         self.assertEqual(out["decision"], "deny")
         self.assertIsNone(runs.plan_for("sid"))
-
-    def test_burst_window_does_not_swallow_plan_request(self) -> None:
-        out, card, _events = self._decide("Bash", {"command": PLAN_CMD}, burst=True)
-        card.assert_called_once()
-        self.assertIsNotNone(runs.plan_for("sid"))
 
     def test_plan_request_refused_where_not_offered(self) -> None:
         for kwargs in ({"auto_chat": True}, {"unattended": True, "mode": "plan"},
@@ -236,15 +231,6 @@ class HandleTests(unittest.TestCase):
                 out, card, _events = self._decide(tool, inp, press="deny")
                 card.assert_not_called()
                 self.assertEqual(out["decision"], "allow")
-
-    def test_run_end_drops_plan(self) -> None:
-        runs.grant_plan("sid", self.run_id, "planaid")
-        runs.end("sid", self.run_id)
-        self.run_id = runs.start("sid")
-        self.addCleanup(runs.end, "sid", self.run_id)
-        out, card, _events = self._decide("Bash", {"command": SEND_CMD}, press="deny")
-        card.assert_called_once()
-        self.assertEqual(out["decision"], "deny")
 
 
 class PersonaNoteTests(unittest.TestCase):

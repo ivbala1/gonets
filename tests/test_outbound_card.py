@@ -1,5 +1,5 @@
 """Отправка от имени Ивана (Telegram, Gmail) всегда через карточку: мимо
-автоаппрува чата, фонового рана и окна /auto (решение Ивана 12.10.2026)."""
+автоаппрува чата и фонового рана (решение Ивана 12.10.2026)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import json
 import re
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +20,7 @@ from claude_tg_bot.i18n import _  # noqa: E402
 
 
 class OutboundCardTests(unittest.TestCase):
-    def _decide(self, tool_name: str, tool_input: dict, *, unattended: bool = False,
-                burst: bool = False) -> tuple[dict, AsyncMock]:
+    def _decide(self, tool_name: str, tool_input: dict, *, unattended: bool = False) -> tuple[dict, AsyncMock]:
         with tempfile.TemporaryDirectory() as d:
             cfg = SimpleNamespace(
                 approve_shared_secret="", primary_chat_id=1, state_dir=Path(d),
@@ -33,7 +31,6 @@ class OutboundCardTests(unittest.TestCase):
             bot_data = {
                 "unattended_sids": {"sid"} if unattended else set(),
                 "untrusted_sids": set(),
-                "burst_until_by_target": {"1": time.time() + 600} if burst else {},
             }
             request = SimpleNamespace(
                 app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
@@ -68,12 +65,6 @@ class OutboundCardTests(unittest.TestCase):
         self.assertEqual(out["decision"], "deny")
         self.assertEqual(out["reason"], _(outbound.UNATTENDED_HINT))
         card.assert_not_called()
-
-    def test_send_not_allowed_in_burst_window(self) -> None:
-        out, card = self._decide("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"},
-                                 burst=True)
-        self.assertEqual(out["decision"], "deny")
-        card.assert_called()
 
     def test_other_send_verbs_go_to_card(self) -> None:
         for tool in ("mcp__telegram__send_voice", "mcp__telegram__edit_message",
@@ -156,8 +147,8 @@ class OutboundCardTextTests(unittest.TestCase):
 
 
 class OutboundCallbackTests(unittest.TestCase):
-    """Кнопки карточки отправки: окно ⏩ не открывается, чужое сообщение
-    решения не принимает, своя ✅ разрешает."""
+    """Кнопки карточки отправки: чужое сообщение решения не принимает, своя ✅
+    разрешает (снятое окно ⏩ проверяет test_serious_2026_11_03.py)."""
 
     def _press(self, decision: str, *, message_id: int = 10) -> object:
         async def go() -> object:
@@ -191,10 +182,6 @@ class OutboundCallbackTests(unittest.TestCase):
     def test_own_card_approve_allows(self) -> None:
         self.assertEqual(self._press("allow"), "allow")
 
-    def test_burst_button_does_not_allow_outbound(self) -> None:
-        self.assertIsNone(self._press("auto15"))
-        self.assertIsNone(self._press("auto60"))
-
     def test_press_from_other_message_ignored(self) -> None:
         self.assertIsNone(self._press("allow", message_id=11))
 
@@ -217,7 +204,7 @@ class CardTimeoutTests(unittest.TestCase):
             approve_auto_chat_keys=frozenset(), approve_whitelist_paths=(),
             mcp_auto_allow_re=None, approve_timeout_sec=5 if press else 0.01,
         )
-        bot_data = {"unattended_sids": set(), "untrusted_sids": set(), "burst_until_by_target": {}}
+        bot_data = {"unattended_sids": set(), "untrusted_sids": set()}
         request = SimpleNamespace(
             app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
                  "registry": approval.ApprovalRegistry(),

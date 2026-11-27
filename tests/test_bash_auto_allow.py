@@ -11,8 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from unittest import mock  # noqa: E402
+
+from claude_tg_bot import approval  # noqa: E402
 from claude_tg_bot.approval import (  # noqa: E402
-    _BOT_ROOT,
     _browser_forgery_reason,
     _scan_bash_segments,
     _whitelist_target_ok,
@@ -167,9 +169,21 @@ class MemoryWriteAutoAllowTests(unittest.TestCase):
         self.assertIsNone(self.allowed(f"{self.mem} --scope personal --id x --file {link}"))
 
 
+_BOT_ROOT = Path("/home/user/src/claude-tg-bot")
+
+
 class BotRepoWhitelistTests(unittest.TestCase):
     """Код и настройки бота не пишутся без карточки даже при whitelist на весь
-    репозиторий: правка скилла плюс его вызов без карточки это запуск кода."""
+    репозиторий: правка скилла плюс его вызов без карточки это запуск кода.
+
+    Корень бота постоянный: в рабочем дереве `.claude/worktrees/...` настоящий
+    корень сам лежит под закрытым `.claude`, и проверка пути отвечала бы
+    «нельзя» раньше, чем дойдёт до корня."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(approval, "_BOT_ROOT", _BOT_ROOT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_only_memory_drafts_inside_bot_repo(self) -> None:
         state = _BOT_ROOT / "state"

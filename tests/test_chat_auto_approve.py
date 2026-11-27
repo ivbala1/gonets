@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from claude_tg_bot import approval  # noqa: E402
 from claude_tg_bot.approval import _chat_auto_allowed  # noqa: E402
-from claude_tg_bot.burst import burst_target_key  # noqa: E402
+from claude_tg_bot.approval import origin_chat_key as burst_target_key  # noqa: E402
 
 KEYS = frozenset({"123456789", "-100:7"})
 
@@ -55,10 +55,9 @@ class ChatAutoSecretTests(unittest.TestCase):
                 approve_shared_secret="", primary_chat_id=1, state_dir=Path(d),
                 approve_auto_chat_keys=frozenset() if unattended else frozenset({"1"}),
                 approve_whitelist_paths=(), mcp_auto_allow_re=re.compile(r"get[A-Za-z_]*"),
-                bash_auto_allow_re=re.compile(r"(cat|ls|grep) .*"),
             )
             bot_data = {"unattended_sids": {"sid"} if unattended else set(),
-                        "untrusted_sids": set(), "burst_until_by_target": {}}
+                        "untrusted_sids": set()}
             request = SimpleNamespace(
                 app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
                      "registry": approval.ApprovalRegistry(),
@@ -92,7 +91,7 @@ class ChatAutoSecretTests(unittest.TestCase):
         card.assert_not_called()
 
     def test_send_goes_to_card_in_auto_chat(self):
-        out, card = self._decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"})
+        out, card = self._decide("mcp__plugin_engineering_github__add_issue_comment", {"body": "x"})
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
 
@@ -116,7 +115,7 @@ class ChatAutoSecretTests(unittest.TestCase):
     def test_unattended_send_denied_without_card(self):
         # из фонового рана отправка людям мимо карточки отправки: отказ сразу,
         # карточка ждала бы без человека весь срок (deny:outbound-unattended)
-        out, card = self._decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"},
+        out, card = self._decide("mcp__plugin_engineering_github__add_issue_comment", {"body": "x"},
                                  unattended=True)
         self.assertEqual(out["decision"], "deny")
         card.assert_not_called()

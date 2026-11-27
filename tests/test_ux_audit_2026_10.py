@@ -46,8 +46,7 @@ def _card_press(decision: str, *, card_html: str = "🟠 <b>Меняет:</b> ф
                                  effective_chat=SimpleNamespace(id=1))
         ctx = SimpleNamespace(application=SimpleNamespace(bot_data={"cfg": cfg, "registry": registry}),
                               bot_data={})
-        with patch.object(bot, "burst_set", return_value=0.0):
-            await bot.on_callback(update, ctx)
+        await bot.on_callback(update, ctx)
         return pending, msg, query
     return asyncio.run(go())
 
@@ -166,7 +165,8 @@ class HelpCommandTests(unittest.TestCase):
         self.assertNotIn("destructive", text)
         self.assertNotIn("итоговый план", text)
         self.assertIn(stop_word(), text)
-        self.assertIn("📋", text)
+        # Карточка плана выключена (PLAN_CARDS по умолчанию 0): справка её не обещает (27.11.2026).
+        self.assertNotIn("📋", text)
 
 
 class UsageLimitLineTests(unittest.TestCase):

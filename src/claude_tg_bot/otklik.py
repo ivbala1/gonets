@@ -33,12 +33,17 @@
 раньше срока и позже AT_WINDOW_SEC после него; пачка «✅ Все N» такие записи
 не берёт, правка по ✏️ без своего `--at` наследует время заменённой.
 
+Ответ живому человеку (решение Ивана 27.11.2026): запись с `--person` идёт
+карточкой в личку, а не в тему откликов, и отчёт её отправки бот пересылает
+в личку; пачка «✅ Все N» её не берёт, правка по ✏️ пометку наследует.
+
 Usage (агент, из корня репозитория бота):
     .venv/bin/python -m claude_tg_bot.otklik new --title "Acme, Senior IT Ops" \\
         --channel "письмо на hr@example.com, PDF резюме EN" --file текст.txt [--replaces <id>]
     ... new ... --tg @hr_example [--attach резюме.pdf]       # одно касание, Telegram
     ... new ... --mail hr@example.com --subject "DevOps" [--reply-to <Message-ID>] [--attach резюме.pdf]
     ... new ... --mail hr@example.com --subject "DevOps" --at "2026-11-28 09:30"  # уйдёт в срок по ✅
+    ... new ... --tg @recruiter --person            # ответ человеку: карточка в личке
     .venv/bin/python -m claude_tg_bot.otklik take --id <id>     # текст и номер попытки, один раз
     .venv/bin/python -m claude_tg_bot.otklik show --id <id> --take <попытка>  # перечитать
     .venv/bin/python -m claude_tg_bot.otklik done --id <id> --take <попытка> --status sent --note "ссылка"
@@ -63,7 +68,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from . import jsonstore, tg_api
+from . import handoff, jsonstore, tg_api
 from .buttons import keyboard
 from .i18n import N_, _
 
@@ -97,11 +102,15 @@ AT_MAX_SEC = 14 * 86400
 QUIET_UNTIL = (8, 30)
 # Запас на строку статуса: сообщение потом правится, а лимит Telegram 4096.
 NEW_TEXT_CAP = tg_api.TEXT_LIMIT - 300
+# ✏️ на карточке в теме откликов: правку пишет личка (там Домовой со всем
+# контекстом), бот кладёт туда строку для ответа (tg_otklik, 27.11.2026).
+EDIT_IN_PRIMARY = N_("✏️ напиши в личке, что поправить, ответом на строку бота там")
+EDIT_ASK = N_("✏️ напиши, что поправить, ответом на это сообщение")
 STATUS_LINES = {
     "pending": "",
     "approved": N_("✅ одобрено, отправляю…"),
     "sending": N_("📤 отправляю…"),
-    "edit": N_("✏️ напиши, что поправить, ответом на это сообщение"),
+    "edit": EDIT_ASK,
     "skipped": N_("⏭ пропущено"),
     "sent": N_("📤 отправлено"),
     "failed": N_("⚠️ не ушло, по словам агента"),
@@ -502,6 +511,8 @@ def render(rec: dict[str, Any]) -> str:
         line = _("⚠️ не ушло, нажми ✅ ещё раз")
     elif rec.get("status") == "approved" and rec.get("at"):
         line = _("✅ одобрено, уйдёт {when}; ✋ отменит до срока").format(when=at_label(rec))
+    elif rec.get("status") == "edit" and rec.get("thread_id"):
+        line = _(EDIT_IN_PRIMARY)
     else:
         line = _(STATUS_LINES.get(rec.get("status", ""), ""))
     if line:
@@ -545,6 +556,23 @@ def approved_prompt(rec: dict[str, Any], base: Path) -> str:
               id=rec['id'], title=rec['title'], channel=rec['channel'], sha=rec['sha'])
         + "\n" + _(SEND_HINT)
     )
+
+
+BATCH_HEAD = N_(
+    "[Кнопка «✅ Все {count}»] Иван одобрил пачку откликов, и этот ран один отправляет их все: других ранов "
+    "на них нет. Отправь по очереди каждый из списка, не останавливаясь после первого; порядок для каждого "
+    "ниже, он дан на примере первого, для остальных подставь их id, а канал бери из строки «Куда» их take:\n{items}\n"
+    "Отказ take у одного: его не отправляй, причину скажи в итоге и переходи к следующему. Ран кончается, "
+    "когда по каждому id списка есть sent, failed или причина, почему не взят; итог назови по каждому.")
+
+
+def batch_prompt(recs: list[dict[str, Any]], base: Path) -> str:
+    """Ран «✅ Все N»: список всей пачки впереди, порядок отправки на примере
+    первого. Раньше ран получал текст одиночного ✅ про первый отклик, и
+    остальные держались на одной фразе в конце (сбой 27.11.2026: из пяти
+    ушёл один)."""
+    items = "\n".join(f"- {rec['id']}: {(str(rec.get('title') or '').splitlines() or [''])[0]}" for rec in recs)
+    return _(BATCH_HEAD).format(count=len(recs), items=items) + "\n\n" + approved_prompt(recs[0], base)
 
 
 SEND_HINT = N_(
@@ -938,8 +966,18 @@ def _send_args(args: argparse.Namespace, text: str = "") -> dict[str, Any]:
     return send
 
 
+def card_place(primary_chat_id: int, otklik_chat_key: str) -> dict[str, int]:
+    """Куда класть карточку и «✅ Все N»: тема откликов (решение Ивана 27.11.2026:
+    карточки и отчёты целиком в теме «📨 Отклики»), без неё личка."""
+    parsed = handoff.parse_chat_key(otklik_chat_key) if otklik_chat_key else None
+    if parsed is not None and parsed[1] is not None:
+        return {"chat_id": parsed[0], "message_thread_id": parsed[1]}
+    return {"chat_id": primary_chat_id}
+
+
 def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
-             chat_key: str, sources: frozenset[str]) -> int:
+             chat_key: str, sources: frozenset[str], place: dict[str, int] | None = None) -> int:
+    place = place or {"chat_id": primary_chat_id}
     text = Path(args.file).read_text(encoding="utf-8").strip()
     if not text:
         print(_("otklik: пустой текст"), file=sys.stderr)
@@ -961,12 +999,15 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
         return 1
     rec = new_record(args.title, args.channel, text, send)
     rec["source"] = chat_key or str(primary_chat_id)
+    if getattr(args, "person", False):
+        rec["person"] = True
     if rec["source"] not in sources:
         print(_("otklik: отклики готовят только чаты Домового, а не {key}").format(key=rec["source"]),
               file=sys.stderr)
         return 1
     body = render(rec)
-    if len(body) > NEW_TEXT_CAP:
+    from .replies import utf16_len
+    if utf16_len(body) > NEW_TEXT_CAP:
         print(_("otklik: сообщение длиннее {limit} знаков, сократи текст").format(limit=NEW_TEXT_CAP),
               file=sys.stderr)
         return 1
@@ -992,6 +1033,8 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
             # Правка по ✏️ уходит туда же, где отклик готовили. Прежнее
             # состояние старой в новой записи: обрыв до отправки откатит замену.
             rec["source"] = source_of(old)
+            if old.get("person"):
+                rec["person"] = True   # правка ответа человеку тоже в личку
             rec["replaces"] = {"id": old["id"], "status": old.get("status"), "note": old.get("note") or ""}
             # Новая с данными отката раньше старой: обрыв между записями не
             # оставит заменённую без пути назад (ревью Codex 22.10.2026).
@@ -1002,10 +1045,16 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
             save(base, rec)
     if old is not None and not _show_in_chat(old, base):
         print(_("otklik: старый отклик закрыт, но его сообщение не обновилось"), file=sys.stderr)
-    res = _bot_api("sendMessage", {
-        "chat_id": primary_chat_id, "text": body, "link_preview_options": {"is_disabled": True},
-        "disable_notification": quiet_now(),
-    })
+    if rec.get("person"):
+        place = {"chat_id": primary_chat_id}   # ответ человеку в личку (27.11.2026)
+    msg = {"text": body, "link_preview_options": {"is_disabled": True}, "disable_notification": quiet_now()}
+    res = _bot_api("sendMessage", {**place, **msg})
+    if res is None and "message_thread_id" in place:
+        # Тема закрыта или удалена: карточка в личку, как до 27.11.2026.
+        # Неподтверждённая отправка в тему тоже сюда: там может остаться копия
+        # без кнопок и записи, это дешевле потерянной карточки.
+        place = {"chat_id": primary_chat_id}
+        res = _bot_api("sendMessage", {**place, **msg})
     if res is None:
         # Иван новой записи не видел: её нет, заменённая снова как была.
         with locked(base):
@@ -1016,7 +1065,11 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
             _show_in_chat(old, base)
         return 1
     with locked(base):
-        rec["chat_id"] = primary_chat_id
+        rec["chat_id"] = place["chat_id"]
+        if "message_thread_id" in place:
+            # Сбой отправки идёт строкой в личку: тема откликов заглушена.
+            rec["thread_id"] = place["message_thread_id"]
+            rec["alarm_chat_id"] = primary_chat_id
         rec["message_id"] = int(res["result"]["message_id"])
         rec["status"] = "pending"
         save(base, rec)
@@ -1044,16 +1097,37 @@ def _created_at(rec: dict) -> datetime | None:
     return t if t.tzinfo else t.astimezone()
 
 
-def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
+def report_to_primary(base: Path, chat_key: str, since: datetime) -> bool:
+    """Итог рана нужен в личке, тема откликов заглушена (27.11.2026): ран
+    чата взял не раньше since ответ человеку (`--person`, его карточка в
+    личке) или отклик, отмеченный сбоем (done --status failed), или оставил
+    одобренный без отправки (агент не взял текст, причина или вопрос в итоге).
+    Одобренный другим ✅ во время рана тоже даёт пересылку: лишнее сообщение
+    дешевле потерянной причины."""
+    since = since.replace(microsecond=0)
+    for rec in _records(base):
+        att = rec.get("attempt") or {}
+        if rec.get("status") == "approved" and not rec.get("at") and sender_of(rec) == chat_key:
+            return True
+        if (rec.get("status") == "failed" or rec.get("person")) and att.get("chat") == chat_key:
+            t = _created_at({"created": att.get("at")})
+            if t is not None and t >= since:
+                return True
+    return False
+
+
+def _cmd_all(base: Path, primary_chat_id: int, chat_key: str, place: dict[str, int] | None = None) -> int:
     """Одно сообщение с кнопкой «✅ Все N» под показанной пачкой: только свежие
-    карточки этого чата, каждая названа в списке. Ждущих меньше двух: ничего,
+    карточки этого чата без ответов людям (их карточки в личке), каждая названа в списке. Ждущих меньше двух: ничего,
     хватает кнопки на карточке. Кнопка последней, как у карточки: сообщение,
     потом файл пачки, потом кнопка."""
+    place = place or {"chat_id": primary_chat_id}
     source = chat_key or str(primary_chat_id)
     fresh_from = datetime.now(timezone.utc) - timedelta(hours=BATCH_FRESH_HOURS)
     with locked(base):
         recs = [r for r in _records(base) if r.get("status") == "pending" and r.get("message_id")
-                and not r.get("at") and r.get("chat_id") is not None and source_of(r) == source
+                and not r.get("at") and not r.get("person") and r.get("chat_id") is not None
+                and source_of(r) == source
                 and (t := _created_at(r)) is not None and t > fresh_from][-BATCH_MAX:]
     if len(recs) < 2:
         print(_("otklik: ждущих меньше двух, кнопка не нужна"))
@@ -1061,18 +1135,21 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str) -> int:
     lines = [_("📨 Ждут «ок»: {count}").format(count=len(recs))]
     lines += [f"{i}. {r['title'][:150]}" for i, r in enumerate(recs, 1)]
     bid = uuid.uuid4().hex[:12]
-    res = _bot_api("sendMessage", {"chat_id": primary_chat_id, "text": "\n".join(lines),
-                                   "disable_notification": quiet_now()})
+    msg = {"text": "\n".join(lines), "disable_notification": quiet_now()}
+    res = _bot_api("sendMessage", {**place, **msg})
+    if res is None and "message_thread_id" in place:
+        place = {"chat_id": primary_chat_id}   # тема закрыта: как в new
+        res = _bot_api("sendMessage", {**place, **msg})
     if res is None:
         return 1
     path = _batch_path(base, bid)
     with locked(base):
         jsonstore.write_json(path, {
-            "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
+            "chat_id": place["chat_id"], "message_id": int(res["result"]["message_id"]),
             "items": [{"id": r["id"], "sha": r["sha"], "gen": gen_of(r), "chat_id": r["chat_id"],
                        "message_id": r["message_id"]} for r in recs]})
     if _bot_api("editMessageReplyMarkup", {
-        "chat_id": primary_chat_id, "message_id": int(res["result"]["message_id"]),
+        "chat_id": place["chat_id"], "message_id": int(res["result"]["message_id"]),
         "reply_markup": keyboard([[{"text": _("✅ Все {count}").format(count=len(recs)),
                                     "data": f"{BATCH_PREFIX}:{bid}"}]]),
     }) is None:
@@ -1156,6 +1233,8 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--attach", default="", help="файл к отправке: имя и sha256 на карточке")
     p_new.add_argument("--at", default="",
                        help="отправить в срок: \"ГГГГ-ММ-ДД ЧЧ:ММ\" по времени бота, только с --tg или --mail")
+    p_new.add_argument("--person", action="store_true",
+                       help="ответ живому человеку, а не отклик на вакансию: карточка и отчёт в личке")
     sub.add_parser("all", help="прислать кнопку «✅ Все N» под пачкой ждущих откликов")
     p_take = sub.add_parser("take", help="взять одобренный текст для отправки")
     p_take.add_argument("--id", required=True)
@@ -1177,14 +1256,15 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(skip_hook_validation=True)
     base = otklik_dir(cfg.state_dir)
     chat_key = os.environ.get("CLAUDE_TG_CHAT_KEY", "").strip()
+    place = card_place(cfg.primary_chat_id, getattr(cfg, "otklik_chat_key", ""))
     try:
         if args.cmd == "new":
             # Личка, мастерская (её поиски готовят отклики) и чаты с автоаппрувом.
             sources = (frozenset({str(cfg.primary_chat_id), getattr(cfg, "workshop_chat_key", "")} - {""})
                        | cfg.approve_auto_chat_keys)
-            return _cmd_new(args, base, cfg.primary_chat_id, chat_key, sources)
+            return _cmd_new(args, base, cfg.primary_chat_id, chat_key, sources, place)
         if args.cmd == "all":
-            return _cmd_all(base, cfg.primary_chat_id, chat_key)
+            return _cmd_all(base, cfg.primary_chat_id, chat_key, place)
         if args.cmd == "take":
             return _cmd_take(args, base, chat_key)
         if args.cmd == "show":

@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 
 log = logging.getLogger(__name__)
@@ -191,13 +192,18 @@ async def run_bounded(
 def run_bounded_sync(
     argv: Sequence[str], *, timeout: float, env: Mapping[str, str] | None,
     cwd: str | os.PathLike[str] | None = None, input: bytes | str | None = None,
-    text: bool = False,
+    text: bool = False, term_grace: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Синхронный двойник run_bounded для скиллов и вспомогательных модулей:
     как `subprocess.run(argv, input=, capture_output=True, timeout=, text=)`,
     но в своей группе, и на таймауте SIGKILL получает вся группа, а не только
     верхний процесс (у `subprocess.run` внуки остались бы жить). На таймауте
-    пробрасывает subprocess.TimeoutExpired, как run."""
+    пробрасывает subprocess.TimeoutExpired, как run.
+
+    `term_grace` (секунды): сначала SIGTERM группе и ожидание всей группы
+    до этого срока, потом SIGKILL оставшимся. Для git: на SIGTERM он снимает
+    свои замки, SIGKILL сразу оставлял `.git/index.lock` (образец Свода,
+    svodgit._stop_group, 26.11.2026)."""
     proc = subprocess.Popen(
         list(argv),
         stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
@@ -209,10 +215,30 @@ def run_bounded_sync(
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except BaseException:
-        kill_group(proc, signal.SIGKILL)
+        if term_grace is None or not _term_group_sync(proc, term_grace):
+            kill_group(proc, signal.SIGKILL)
         try:
             proc.communicate(timeout=REAP_TIMEOUT_SEC)
         except subprocess.TimeoutExpired:
-            log.warning("pid=%s не вышел за %s с после SIGKILL", proc.pid, REAP_TIMEOUT_SEC)
+            log.warning("pid=%s не вышел за %s с после остановки", proc.pid, REAP_TIMEOUT_SEC)
         raise
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+
+
+def _term_group_sync(proc: subprocess.Popen, grace: float) -> bool:
+    """SIGTERM группе `proc` и ожидание до `grace` секунд, пока не выйдут все,
+    а не только лидер: вложенный git из хука снимает свой замок после выхода
+    верхнего. True: группа пуста, SIGKILL не нужен (по опустевшему номеру его
+    не слать). Каналы дочитывает communicate, иначе писатель в полный канал
+    не дошёл бы до выхода."""
+    kill_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    try:
+        proc.communicate(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    while group_alive(proc):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True

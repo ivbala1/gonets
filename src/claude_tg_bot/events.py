@@ -39,6 +39,18 @@ KEEP_DONE_SEC = 8 * 24 * 3600
 FRESH_MAX_AGE_SEC = 600
 KEY_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
 _ID_RE = re.compile(r"[0-9a-f]{24}")
+# Ключ события поручения на время Домового (domovoy/poruch.py): номер строки и
+# время вхождения. Ран такого события не получает отказа на необратимое у
+# заказчика (этап 1 защит, «ок» Ивана 27.11.2026, svod/docs/2026-11-27-zashchity.md).
+# Подлинность держит только токен /event: ключ может прислать любой доверенный процесс
+# (принятый риск, docs/audit-2026-11/guard3-decisions.md). Вид ключа общий с
+# domovoy/poruch.py (event_key): сменится там, пометки не будет и вернётся отказ.
+PORUCH_KEY_RE = re.compile(r"poruch:p[0-9]+:[0-9]{12}")
+
+
+def is_poruch(rec: dict[str, Any] | None) -> bool:
+    """Событие с диска пришло из строки поручения (и не несёт чужого текста)."""
+    return bool(rec) and not rec.get("untrusted") and bool(PORUCH_KEY_RE.fullmatch(str(rec.get("key") or "")))
 
 
 def event_dir(state_dir: Path) -> Path:

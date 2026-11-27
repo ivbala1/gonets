@@ -254,7 +254,7 @@ class _JobQueue:
     def get_jobs_by_name(self, name: str) -> list[_Job]:
         return [j for j in self.named if j.name == name and not j.removed]
 
-    def run_once(self, callback, *, when: float, name: str, data: object) -> None:
+    def run_once(self, callback, *, when: float, name: str, data: object, job_kwargs: dict | None = None) -> None:
         self.jobs.append((when, name, data))
         self.named.append(_Job(name))
 

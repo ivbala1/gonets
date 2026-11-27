@@ -20,6 +20,7 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 
 from claude_tg_bot import approval, claude_runner, config, untrusted  # noqa: E402
 from claude_tg_bot.skills import _oneshot  # noqa: E402
+from claude_tg_bot.i18n import _  # noqa: E402
 
 
 class AgentEnvTests(unittest.TestCase):
@@ -258,6 +259,9 @@ class UntrustedInitGuardTests(unittest.TestCase):
         result, kill = self._run([*self.TOOLS_1019, "Teleport"], untrusted=True)
         self.assertTrue(result.is_error)
         self.assertIn("Teleport", result.text)
+        # Сообщение называет оба списка untrusted (ревью Codex 24.11.2026).
+        self.assertIn("untrusted.UNTRUSTED_READ_TOOLS", result.text)
+        self.assertIn("untrusted.UNTRUSTED_ASK_TOOLS", result.text)
         kill.assert_called_once()
 
     def test_untrusted_run_with_known_tools_answers(self) -> None:
@@ -274,6 +278,10 @@ class UntrustedInitGuardTests(unittest.TestCase):
     def test_untrusted_run_without_init_stops(self) -> None:
         result, kill = self._run(None, untrusted=True)
         self.assertTrue(result.is_error)
+        # Причина своими словами, а не «нет замка» (ревью Codex 24.11.2026).
+        self.assertIn(_("(событие init не пришло)"), result.text)
+        self.assertNotIn("нет замка", result.text)
+        self.assertNotIn("no lock", result.text)
         kill.assert_called_once()
 
     def test_untrusted_run_with_bad_tool_list_stops(self) -> None:
@@ -478,9 +486,10 @@ class HandleApproveWebFetchTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(self._decide(url)["decision"], "allow")
 
-    def test_telegram_server_url_cards(self) -> None:
-        # Сервер Telegram на loopback это отправка людям. Карточка не ушла: итог deny.
-        self.assertEqual(self._decide("http://127.0.0.1:8770/mcp")["decision"], "deny")
+    def test_telegram_server_url_passes(self) -> None:
+        # С 27.11.2026 (этап 3 защит) адрес WebFetch не разбирается: WebFetch
+        # только читает (GET), вызов инструмента сервера Telegram это POST.
+        self.assertEqual(self._decide("http://127.0.0.1:8770/mcp")["decision"], "allow")
 
     def test_other_local_names_pass(self) -> None:
         # Прочее без карточки: узкое правило Н8 не берёт имена (nip.io, .lan).

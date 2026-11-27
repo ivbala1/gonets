@@ -415,7 +415,7 @@ async def on_run_watch_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -
     status.forget_alert(alert_id)
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
     proc = procs.get(status.chat_key)
-    if proc is None or proc.returncode is not None:
+    if not _b.procs_mod.running(proc):  # и внук вышедшего claude (27.11.2026)
         note = "🛑 " + _("процесса уже нет")
     else:
         note = await _b._cancel_running(ctx, status.chat_key, proc)

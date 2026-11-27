@@ -1,43 +1,38 @@
-"""Причины карточки подтверждения: только отправка людям от имени Ивана.
+"""Причины карточки подтверждения: доступ и отправка людям, необратимое у заказчика.
 
 С 04.11.2026 (решение Ивана «Да, только отправки»,
 docs/design-2026-11-04-system-boundaries.md) решение бота зовёт send_reasons.
 MCP-отправки Telegram, Gmail, Slack и письма mailsend решает outbound.decide;
-здесь отправки мимо него: MCP внешнего сервиса, сервер Telegram на loopback,
-публикация текста на GitHub, почта из Bash, Bot API Telegram и Slack, REST
-Weeek и Jira. С 11.11.2026 ещё необратимое на серверах заказчиков из
-CLIENT_HOSTS (Irreversible). Прочее удаление, push, вложенный агент, правка
-защиты и секреты идут без карточки. Прежний разбор этих классов (модель
-«только опасное» 03.11.2026, аудит guard3) удалён 04.11.2026, он есть в
-истории git до коммита e97faa2.
+здесь MCP внешнего сервиса, который пишет людям или даёт им доступ
+(share, invite, publish). С 11.11.2026 ещё необратимое на серверах
+заказчиков из CLIENT_HOSTS (Irreversible): с 27.11.2026 одна эта причина в
+живом разговоре и в ране поручения идёт без карточки, прочему фону отказ.
+С 27.11.2026 (этап 3 защит, svod/docs/2026-11-27-zashchity.md) текст команд
+Bash и адрес WebFetch на отправку не разбираются: публикация на GitHub, почта
+из Bash, Bot API, REST Weeek и Jira, сервер Telegram на loopback идут без
+карточки; прежний разбор есть в истории git до этого коммита. Разбор оболочки
+ниже (_Lexer, _programs) нужен только необратимому у заказчика.
 
-Это эвристика, не граница: скрипт из файла, REST прочих сервисов и адрес,
-склеенный в коде, разбор не видит; защита от ошибки агента, не от
-намеренного обхода (docs/audit-2026-11/guard3-decisions.md).
+Это эвристика, не граница: защита от ошибки агента, не от намеренного обхода
+(docs/audit-2026-11/guard3-decisions.md).
 """
 from __future__ import annotations
 
 import bisect
-import ipaddress
 import logging
 import re
 import shlex
-import socket
 from collections.abc import Iterable
 from typing import Any
 from functools import lru_cache
-from urllib.parse import urlsplit
 
-from . import outbound, paths
+from . import outbound
 from .i18n import N_, _
 
 log = logging.getLogger(__name__)
 
-BOT_ROOT = paths.BOT_ROOT
 
-
-# Отправка людям мимо карточки отправки (сервер Telegram на loopback, внешний
-# сервис): как отправка, окно ⏩ её не пропускает, из фонового рана отказ.
+# Отправка людям мимо карточки отправки (MCP внешнего сервиса): из фонового рана отказ.
 class Outbound(str):
     pass
 
@@ -47,10 +42,16 @@ def sends(why: Iterable[str]) -> bool:
     return any(isinstance(w, Outbound) for w in why)
 
 
-# Необратимое на сервере заказчика (цель 2б, 11.11.2026): окно ⏩ пропускает
-# (плановое обслуживание), из фонового рана отказ.
+# Необратимое на сервере заказчика (цель 2б, 11.11.2026): из фонового рана
+# отказ; с 27.11.2026 (этап 1 защит) живой разговор и ран поручения Домового
+# идут без карточки и отказа, решает approval.handle_approve.
 class Irreversible(str):
     pass
+
+
+class CheckFailed(Irreversible):
+    """Проверка хоста упала: фону отказ, как необратимому, но пропуска поручению и
+    живому разговору не даёт (ревью Codex 27.11.2026)."""
 
 
 def irreversible(why: Iterable[str]) -> bool:
@@ -81,6 +82,8 @@ _IRREVERSIBLE_RE = re.compile(r"""
     | (?<![\w/.-])(?<![^|]\|)(?:(?<=\s)(?:shutdown|reboot|poweroff|halt)(?![\w-])  # не путь, не `a|reboot|b` шаблона
        | (?:shutdown|reboot|poweroff|halt)(?![\w-]|\|[^|]))
     | \bsystemctl\b[^|;&\n]{0,1000}(?<![\w-])(?:stop|disable|mask)\b | \bservice\s+\S+\s+stop\b
+    | \brsync\b[^|;&\n]{0,1000}\s--del(?:ete)?\b | \bapt(?:-get|itude)?(?![\w-])[^|;&\n]{0,200}\s(?:--)?(?:auto)?purge\b
+    | \bgit\b(?>[^|;&\n]{0,300}?\sreset\s)[^|;&\n]{0,300}(?<![\w-])--hard\b  # атомарно: иначе квадратично
     | \b(?:Remove-Item|Remove-VM\w*|Remove-AD\w*|Remove-Mailbox|Remove-Partition|Clear-Disk|Format-Volume
          |Restart-Computer|Stop-Computer|Stop-Service|Stop-VM)\b | \b(?:rd|del)\b[^|;&\n]{0,1000}\s/s\b
 """, re.IGNORECASE | re.VERBOSE)
@@ -125,11 +128,43 @@ def _client_irreversible(command: str, hosts: tuple[str, ...]) -> str:
 
 # Аргументы не исполняются, а шаблоны и вывод в них бывают со словами из списка
 # (`grep -r "delete from"`, `last reboot`, `journalctl -g shutdown`).
-_READ_PROGS = outbound._TEXT_TOOLS | {"last", "lastb", "journalctl", "dmesg"}
+_READ_PROGS = outbound._TEXT_TOOLS | {"last", "lastb", "journalctl", "dmesg", "zgrep"}
 # Ключи ssh со значением (`-p 22`, `-vp 22`, `-oX=Y` несёт значение сам).
 _SSH_OPTS = ("BbcDEeFIiJLlmOoPpQRSWw", frozenset())
 # `git` командой, а не частью имени или пути (`find /srv/git … -exec rm -rf`, `git-server`).
 _GIT_RM_RE = re.compile(r"(?<![\w./=-])(?<!-u\s)git(?:\s+(?:-[Cc]\s+\S+|-(?![Cc](?:\s|$))\S+))*\s+rm\b")
+# rsync, apt, git (список Ивана 27.11.2026): удаление в приёмнике, purge, reset --hard.
+_RSYNC_DELETE_RE = re.compile(r"--del(?:ete(?:-[a-z-]+)?)?")
+# Ключи rsync со значением отдельным словом: значение не путь.
+_RSYNC_VALUED = frozenset({
+    "-e", "-f", "-T", "-B", "-M", "--rsh", "--filter", "--exclude", "--include", "--exclude-from",
+    "--include-from", "--files-from", "--password-file", "--log-file", "--log-file-format", "--temp-dir",
+    "--partial-dir", "--backup-dir", "--link-dest", "--compare-dest", "--copy-dest", "--chmod", "--chown",
+    "--usermap", "--groupmap", "--bwlimit", "--timeout", "--contimeout", "--port", "--suffix", "--max-size",
+    "--min-size", "--max-delete", "--rsync-path", "--out-format", "--block-size", "--modify-window",
+    "--compress-level", "--skip-compress", "--info", "--debug", "--sockopts", "--outbuf", "--remote-option",
+    "--checksum-choice", "--compress-choice", "--iconv", "--stop-after", "--stop-at", "--address", "--protocol",
+    "--write-batch", "--read-batch", "--only-write-batch", "--checksum-seed", "--max-alloc", "--copy-as",
+    "--early-input", "-@", "--zl", "--zc", "--cc", "--stderr"})
+_APT_PURGE = frozenset({"purge", "autopurge"})
+_APT_DRY = frozenset({"--simulate", "--dry-run", "--just-print", "--no-act", "--recon"})
+
+
+def _dry_run(args: list[str], long: frozenset[str], short: str, valued: str) -> bool:
+    """Пробный прогон (`rsync -avn`, `apt-get -s purge`): ничего не меняет, не карточка.
+    valued: короткие ключи со значением, остаток связки после них это значение."""
+    for a in args:
+        if a in long:
+            return True
+        if re.fullmatch(r"-[A-Za-z]+", a):
+            for ch in a[1:]:
+                if ch == short:
+                    return True
+                if ch in valued:
+                    break
+    return False
+
+
 # Своё временное: агент убирает его за собой по правилам, это не карточка.
 # После `/tmp/` имя, а не `$D` (пустая у себя в двойных кавычках: весь /tmp), `$(`, точка.
 _TMP_PATH_RE = re.compile(r"(?:(?:/var|/private)?/tmp|~/tmp)/[^*?\s$`.]")
@@ -202,6 +237,11 @@ def _irreversible_in(command: str, found: re.Pattern[str], remote: bool, depth: 
     temp_vars |= {f"${{{v[1:]}}}" for v in temp_vars}
     has_xargs = bool(re.search(r"\bxargs\b", executed))
     for name, args in progs:
+        if outbound.git_reset_hard([name, *args]):
+            # Местный клон рядом с ssh не в счёт: только на сервере или с его именем у git.
+            if remote or found.search(shlex.join([name, *args])):
+                return "git reset --hard"
+            continue
         # Строка тела heredoc для клиента SQL (`UPDATE t SET …`): тело проверено целиком выше.
         if name in _READ_PROGS or name.lower() in _SQL_HEADS:
             continue
@@ -229,6 +269,28 @@ def _irreversible_in(command: str, found: re.Pattern[str], remote: bool, depth: 
         m = re.fullmatch(_SQL_CLIENTS, name) and _SQL_RE.search((text))
         if m:
             return " ".join(m.group(0).split())[:60]
+        if name == "rsync":
+            # Удаление идёт в приёмнике: на сервере заказчика, если сам rsync идёт там или
+            # сервер в любом пути, кроме первого (источника). Ключи бывают и после приёмника.
+            # Забор с сервера в местную копию (`rsync --delete h:/x ./y`) не в счёт.
+            # Значение ключа отдельным словом не путь, и после связки `-avze` тоже; после `--` всё пути.
+            paths = [a for i, a in enumerate(opts)
+                     if not a.startswith("-") and not (i and (opts[i - 1] in _RSYNC_VALUED or re.fullmatch(
+                         r"-[A-Za-z]*[efTBM]", opts[i - 1])))] + args[len(opts) + 1:]
+            if (any(_RSYNC_DELETE_RE.fullmatch(a.split("=", 1)[0]) for a in opts) and not _HELP & set(opts)
+                    and (remote or any(found.search(a) for a in paths[1:]))
+                    and not _dry_run(opts, frozenset({"--dry-run"}), "n", "efTBM")):
+                return " ".join(a for a in [name, *opts] if a.startswith("--del") or a == name)[:60]
+            continue
+        if name in ("apt", "apt-get", "aptitude"):
+            # Подкоманда (первое слово без `-`, не значение -o/-c/-t) или ключ `--purge`;
+            # `apt search purge` не в счёт. Как у git: местный apt рядом с ssh не в счёт.
+            sub = next((a for i, a in enumerate(opts) if not a.startswith("-")
+                        and not (i and re.fullmatch(r"-[A-Za-z]*[oct]", opts[i - 1]))), "")
+            if ((sub in _APT_PURGE or "--purge" in opts) and (remote or found.search(text))
+                    and not _dry_run(opts, _APT_DRY, "s", "oct")):
+                return f"{name} {sub if sub in _APT_PURGE else '--purge'}"
+            continue
         # `git rm` удаляет только восстановимое из git (`find … -exec git rm -r`).
         if name == "rm":
             # После `--` и `-old` это путь.
@@ -300,38 +362,26 @@ def _container_command(name: str, args: list[str]) -> list[str]:
     return []
 
 
-def send_reasons(tool_name: str, tool_input: dict, cwd: str | None, *,
-                 telegram_port: int = 8770, client_hosts: tuple[str, ...] = ()) -> set[str]:
+def send_reasons(tool_name: str, tool_input: dict, *,
+                 client_hosts: tuple[str, ...] = ()) -> set[str]:
     """Почему действие идёт карточкой; пусто: без карточки.
 
-    Outbound (окно ⏩ не пропускает, из фона отказ): MCP внешнего сервиса,
-    который пишет людям; Bash и WebFetch к серверу Telegram на loopback.
-    Обычная причина (окно ⏩ пропускает, как до 04.11.2026): MCP share,
-    invite, publish; публикация текста на GitHub из Bash (`gh pr create`, `gh
-    issue comment`, изменяющий `gh api`); почта из Bash (`mail`, `msmtp`,
-    `sendmail`, curl по smtp); Bot API Telegram и Slack; запись в Weeek и
-    комментарии Jira через REST."""
+    Outbound (из фона отказ): MCP внешнего сервиса, который пишет людям.
+    Обычная причина: MCP share, invite, publish. Irreversible: необратимое на
+    сервере заказчика из Bash. Текст команд Bash и адрес WebFetch на отправку
+    не разбираются с 27.11.2026 (этап 3 защит)."""
     try:
         if tool_name.startswith("mcp__"):
             return _mcp(tool_name)
         if tool_name in ("Bash", "Monitor"):
-            found = _bash(str(tool_input.get("command", "")), cwd, telegram_port)
-            try:  # сбой здесь не теряет найденную выше отправку
+            try:
                 word = _client_irreversible(str(tool_input.get("command", "")), client_hosts)
             except Exception:
                 log.exception("serious: client check failed")
-                word = _("проверка не удалась")
+                return {CheckFailed(_("необратимое на сервере заказчика: {word}").format(
+                    word=_("проверка не удалась")))}
             if word:
-                found.add(Irreversible(_("необратимое на сервере заказчика: {word}").format(word=word)))
-            return found
-        if tool_name == "WebFetch":
-            url = str(tool_input.get("url", ""))
-            found: set[str] = set()
-            if _telegram_loopback_url(url, telegram_port):
-                found.add(Outbound(_("отправка через сервер Telegram мимо проверки")))
-            if _bot_api_send(url):
-                found.add(_("отправка людям через Bot API Telegram или Slack"))
-            return found
+                return {Irreversible(_("необратимое на сервере заказчика: {word}").format(word=word))}
     except Exception:
         log.exception("serious: send check failed tool=%s", tool_name)
         return {_("проверка не удалась")}
@@ -373,70 +423,7 @@ def _mcp(tool_name: str) -> set[str]:
     return out
 
 
-# --- Bash --------------------------------------------------------------------
-
-# Локальный адрес сервера Telegram: `127.0.0.1`, `127.1`, `localhost`, `localhost.`,
-# `[::1]`, `[::ffff:127.0.0.1]`, `0.0.0.0` и `0` в месте адреса (`0:8770`,
-# `/dev/tcp/0/8770`, `"0"`). Защита от ошибки агента, не от намеренного обхода
-# (`0x7f000001`, переменные): решение Ивана 03.11.2026, README.
-_LOOPBACK_RE = re.compile(
-    r"(?<![\w.])(?:127(?:\.\d+){1,3}|(?:ip6-)?localhost\.?|0\.0\.0\.0|\[?::1\]?"
-    r"|0(?=:\d|/\d)|(?<=['\"])0(?=['\"]))(?![\w.])", re.IGNORECASE)
-_MAIL_PROGS = frozenset({"mail", "mailx", "sendmail", "msmtp", "mutt", "swaks"})
-_SEND_PROG_RE = re.compile(r"\b(?:gh|mailx?|sendmail|msmtp|mutt|swaks)\b")
-# Запрос к Bot API Telegram или Slack, который пишет людям (curl, python),
-# письмо curl по SMTP, текст людям через REST Weeek и Jira: до 04.11.2026 шли
-# карточкой через «секрет в сеть» или «загрузка файла». Адрес и метод ищутся
-# отдельно: база адреса бывает в переменной (`B=…; curl "$B/sendMessage"`).
-# Путь Bot API узнаётся и без облачного узла: свой сервер telegram-bot-api
-# (TELEGRAM_BOT_API_URL, tg_api) стоит на другом адресе, путь `/bot<токен>/`
-# тот же: токен литералом, переменной оболочки (`$T`, `${T}`, `$1`, `$(cat …)`,
-# `"$T"`, `$(< файл)`) или вставкой в строку Python (`{tok}`, `" + tok`, `%s`).
-# Модуль бота tg_api из Python (`tg_api.post(токен, "sendMessage", …)`, `from
-# …tg_api import post`, метод в переменной): строка метода отправки где угодно
-# в выполняемом тексте с tg_api.
-_TG_BOT_PATH = r"/bot(?:\d{5,}:[\w-]+|\$[{(]?\s*[\w<]|[{\"'`]|%[sr(])"
-_TG_MODULE_RE = re.compile(r"\btg_api\b")
-_TG_METHOD_LITERAL_RE = re.compile(r"['\"](?:send|forward|copy|edit)\w*['\"]", re.IGNORECASE)
-_API_HINT_RE = re.compile(r"api\.telegram\.org|slack\.com/api|smtps?://|weeek\.net|atlassian\.net|\btg_api\b|"
-                          + _TG_BOT_PATH, re.IGNORECASE)
-_TG_API_RE = re.compile(r"api\.telegram\.org/bot|" + _TG_BOT_PATH, re.IGNORECASE)
-_TG_SEND_RE = re.compile(r"/(?:send|forward|copy|edit)\w*", re.IGNORECASE)
-_SLACK_API_RE = re.compile(r"slack\.com/api", re.IGNORECASE)
-_SLACK_SEND_RE = re.compile(r"\b(?:chat\.(?:postMessage|scheduleMessage|postEphemeral|update)"
-                            r"|files\.(?:upload\w*|completeUploadExternal))\b")
-_SMTP_RE = re.compile(r"smtps?://", re.IGNORECASE)
-_REST_TEXT_HOST_RE = re.compile(r"api\.weeek\.net|atlassian\.net/rest/api/\S*comment", re.IGNORECASE)
-_WRITE_REQUEST_RE = re.compile(r"(?:-X\s*|--request[=\s]+|--method[=\s]+)['\"]?(?:POST|PUT|PATCH)\b"
-                               r"|(?:^|\s)(?:-[A-Za-z]*[dF]|--data(?:-\w+)?|--form|--json|--post-(?:data|file)"
-                               r"|--body-(?:data|file))(?=[\s=@'\"]|$)")
-
-
-def _bash(command: str, cwd: str | None, telegram_port: int) -> set[str]:
-    out: set[str] = set()
-    # Сервер Telegram на loopback принимает запросы без пароля: `curl` или
-    # `python` отправили бы сообщение от имени Ивана мимо карточки. Аргументы
-    # текстовых команд (шаблон grep, сообщение коммита) не в счёт.
-    if telegram_port and _LOOPBACK_RE.search(command):
-        executed = outbound.executed_text(command)
-        if _LOOPBACK_RE.search(executed) and re.search(rf"(?<![\w.]){telegram_port}(?!\d)", executed):
-            out.add(Outbound(_("отправка через сервер Telegram мимо проверки")))
-    if _SEND_PROG_RE.search(command):
-        for prog, args in _programs(command):
-            if prog == "gh":
-                out.update(_gh_send(args))
-            elif prog in _MAIL_PROGS:
-                out.add(_("письмо из Bash ({prog})").format(prog=prog))
-    if _API_HINT_RE.search(command):
-        executed = outbound.executed_text(command)
-        if _bot_api_send(executed) or (_SMTP_RE.search(executed) and "--mail-rcpt" in executed):
-            out.add(_("отправка людям через Bot API Telegram или Slack"))
-        if _REST_TEXT_HOST_RE.search(executed) and _WRITE_REQUEST_RE.search(executed):
-            # Комментарий или карточка в трекере задач (Weeek, Jira): текст
-            # читают люди, на эту карточку опирается навык трекера (ревью 04.11.2026).
-            out.add(_("текст людям через REST внешнего сервиса (Weeek, Jira)"))
-    return out
-
+# --- Разбор оболочки для необратимого у заказчика -----------------------------
 
 _WRAPPER_VALUE = outbound.WRAPPER_VALUE
 # Обёртки с позиционным словом перед командой: маска, приоритет, файл замка.
@@ -921,96 +908,3 @@ def _programs(command: str, depth: int = 0) -> list[tuple[str, list[str]]]:
             out.append((name, words[1:]))
             break
     return out
-
-
-def _bot_api_send(text: str) -> bool:
-    return bool((_TG_API_RE.search(text) and _TG_SEND_RE.search(text))
-                or (_TG_MODULE_RE.search(text) and _TG_METHOD_LITERAL_RE.search(text))
-                or (_SLACK_API_RE.search(text) and _SLACK_SEND_RE.search(text)))
-
-
-# --- GitHub ------------------------------------------------------------------
-
-# Подкоманды gh, которые публикуют текст от имени Ивана.
-_GH_TEXT = frozenset({("pr", "create"), ("pr", "comment"), ("pr", "review"), ("pr", "edit"), ("issue", "create"),
-                      ("issue", "comment"), ("issue", "edit"), ("release", "create"), ("release", "upload"),
-                      ("gist", "create")})
-_GH_VALUE_FLAGS = frozenset({"-R", "--repo", "--hostname", "-H", "--header", "-X", "--method", "-q", "--jq",
-                             "-t", "--template", "--title", "-b", "--body", "-F", "-f", "--field",
-                             "--raw-field", "--input", "-B", "--base", "-l", "--label"})
-
-
-def _gh_positionals(args: list[str]) -> list[str]:
-    pos: list[str] = []
-    i = 0
-    while i < len(args):
-        if args[i] in _GH_VALUE_FLAGS:
-            i += 2
-            continue
-        if not args[i].startswith("-"):
-            pos.append(args[i])
-        i += 1
-    return pos
-
-
-def _gh_send(args: list[str]) -> set[str]:
-    """Публикация текста на GitHub: подкоманды _GH_TEXT, закрытие с
-    комментарием (`gh pr close -c`) и изменяющий `gh api`."""
-    pos = _gh_positionals(args)
-    if tuple(pos[:2]) in _GH_TEXT or (tuple(pos[:2]) in (("pr", "close"), ("issue", "close")) and any(
-            a in ("-c", "--comment") or a.startswith("--comment=") for a in args)):
-        return {_("публикация на GitHub (gh {a} {b})").format(a=pos[0], b=pos[1])}
-    if pos[:2] == ["api", "graphql"]:
-        if re.search(r"\bmutation\b", " ".join(args)) or "--input" in args:
-            return {_("изменение через GitHub API")}
-    elif pos[:1] == ["api"]:
-        # Метод по значению опции; без неё gh с полями шлёт POST (ревью Codex 03.11.2026).
-        method = ""
-        for i, a in enumerate(args):
-            if a in ("-X", "--method") and i + 1 < len(args):
-                method = args[i + 1].upper()
-            elif a.startswith("-X") and len(a) > 2:
-                method = a[2:].upper()
-            elif a.startswith("--method="):
-                method = a.split("=", 1)[1].upper()
-        fields = any(a in ("-f", "-F", "--field", "--raw-field", "--input") or
-                     a.startswith(("--field=", "--raw-field=", "--input=")) for a in args)
-        if method in ("POST", "PUT", "PATCH", "DELETE") or (not method and fields):
-            return {_("изменение через GitHub API")}
-    return set()
-
-
-# --- WebFetch ----------------------------------------------------------------
-
-# Сокращённая запись IPv4 (`127.1`, `2130706433`, `0x7f000001`): её разбирает
-# inet_aton, как и сам клиент.
-_SHORT_IPV4_RE = re.compile(r"(?:0x[0-9a-f]*|\d+)(?:\.(?:0x[0-9a-f]*|\d+)){0,3}")
-
-
-def _telegram_loopback_url(url: str, telegram_port: int) -> bool:
-    """WebFetch на loopback с портом сервера Telegram (guard3, Н8). Имя
-    loopback только localhost, localhost.localdomain и *.localhost (RFC 6761);
-    `localhost.example.com` обычный внешний адрес."""
-    if not telegram_port:
-        return False
-    try:
-        u = urlsplit(url.strip())
-        host = (u.hostname or "").lower().rstrip(".")
-        port = u.port
-    except ValueError:
-        return False
-    if port != telegram_port:
-        return False
-    ip = None
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        if _SHORT_IPV4_RE.fullmatch(host):
-            try:
-                ip = ipaddress.ip_address(socket.inet_aton(host))
-            except (OSError, ValueError):
-                ip = None
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return host in ("localhost", "localhost.localdomain") or host.endswith(".localhost") or bool(
-        ip and (ip.is_loopback or ip.is_unspecified))

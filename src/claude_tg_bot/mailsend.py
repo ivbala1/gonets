@@ -319,10 +319,16 @@ def preview(letter: Letter, sender: str) -> str:
     return "\n".join(lines)
 
 
-def send(letter: Letter, user: str, password: str) -> tuple[str, dict[str, Any]]:
+def send(letter: Letter, user: str, password: str, *, state_dir: Path, secret: str) -> tuple[str, dict[str, Any]]:
     """Отправка через smtp.gmail.com:465 (SSL). Копию в «Отправленных» Gmail
     кладёт сам по отправке через свой SMTP (по отзывам пользователей, в
-    документации Google не нашли; проверить на первом письме)."""
+    документации Google не нашли; проверить на первом письме). Без билета
+    карточки на это письмо отказ: билет проверяется здесь, а не только в main,
+    потому что с 27.11.2026 хук узнаёт лишь запуск модуля в начале команды, а
+    вызов `send` из своего python шёл бы мимо карточки (ревью этапа 3 защит)."""
+    refusal = take_ticket(state_dir, letter.digest(), secret)
+    if refusal:
+        raise MailError(refusal)
     msg = build_message(letter, user)
     ctx = ssl.create_default_context()
     sending = False
@@ -334,15 +340,17 @@ def send(letter: Letter, user: str, password: str) -> tuple[str, dict[str, Any]]
     except smtplib.SMTPAuthenticationError as e:
         raise MailError(_("Gmail не принял логин: код {code}").format(code=e.smtp_code)) from e
     except (smtplib.SMTPServerDisconnected, OSError) as e:
-        if sending:
+        # Явный отказ сервера (получатели, отправитель, данные) значит, что
+        # письмо не принято; «могло уйти» только на обрыве (ревью Codex 27.11.2026).
+        refused_by_server = isinstance(e, (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused,
+                                           smtplib.SMTPDataError))
+        if sending and not refused_by_server:
             # Обрыв во время передачи: ответ на конец письма мог потеряться
             # после приёма. «Не ушло» вело к новой карточке и второму письму
             # (аудит outbound 31.10.2026).
             raise MailMaybeSent(_("SMTP: связь оборвалась при отправке ({error}): письмо могло уйти. "
                               "Проверь «Отправленные» в Gmail, прежде чем просить новую карточку").format(
                                   error=type(e).__name__)) from e
-        raise MailError(f"SMTP: {type(e).__name__}: {e}") from e
-    except smtplib.SMTPException as e:
         raise MailError(f"SMTP: {type(e).__name__}: {e}") from e
     return str(msg["Message-ID"]), dict(refused)
 
@@ -374,12 +382,9 @@ def main(argv: list[str] | None = None) -> int:
             print(preview(letter, sender))
             print(_("\n(сухой режим: ничего не отправлено)"))
             return 0
-        refusal = take_ticket(cfg.state_dir, letter.digest(), cfg.approve_shared_secret)
-        if refusal:
-            print(f"mailsend: {refusal}", file=sys.stderr)
-            return 1
         user, password = load_credentials(env_file)
-        message_id, refused = send(letter, user, password)
+        message_id, refused = send(letter, user, password, state_dir=cfg.state_dir,
+                                   secret=cfg.approve_shared_secret)
     except MailMaybeSent as e:
         print(f"mailsend: {e}", file=sys.stderr)
         return 3

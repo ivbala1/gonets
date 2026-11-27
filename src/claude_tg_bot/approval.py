@@ -39,12 +39,11 @@ from telegram.error import NetworkError
 from telegram.ext import Application
 
 from . import audit, buttons, events, mailsend, otklik, outbound, paths, runs, serious, untrusted
-from .burst import burst_target_key
 from .config import LOOPBACK_HOSTS, Config, background_chat_keys
 from .i18n import _, N_
 from .limits import clock
 from .outbound import _esc, _esc_truncate
-from .replies import is_unconfirmed
+from .replies import is_unconfirmed, split_for_telegram, utf16_len
 
 log = logging.getLogger(__name__)
 
@@ -54,19 +53,6 @@ MULTIEDIT_PER_SIDE_CAP = 400
 DIFF_INPUT_CAP = 20000
 AUDIT_LOG_NAME = "audit.jsonl"
 
-
-# Tools, исключённые из burst-окна. По осознанному решению Ивана окно
-# разрешает ЛЮБЫЕ действия (вкл. Bash/Write/Edit) на 15 мин / 1 ч — иначе на
-# самый частый инструмент (Bash) приходился пучок ручных аппрувов. Размен
-# удобства на безопасность: в открытом окне rm/push/curl проходят без карточки.
-# С 28.10.2026 (решение Ивана «Пусть окно пускает») окно пускает и команды,
-# которые читают или пишут секрет: кнопки ⏩ на такой карточке были, а
-# следующая команда с токеном снова шла карточкой (до 04.11.2026 в audit
-# decision="allow:burst:secret"). Отправка наружу и фоновые раны окно
-# по-прежнему не берёт. С 29.10.2026 (решение Ивана «⏩ и дубли») окно берёт и
-# обдумывание задачи: там без него каждая проверка шла карточкой.
-# Set оставлен пустым, чтобы при необходимости снова что-то исключить точечно.
-_BURST_DENY_TOOLS: frozenset[str] = frozenset()
 
 # Карточка плана (шаг 2 карточек, решение Ивана 29.10.2026): текст плана во
 # входе карточки под этим ключом. Агент просит её командой скилла plan; права
@@ -91,11 +77,11 @@ class Pending:
     target_thread_id: int | None = None
     # Чат рана, если карточка показана не там (мастерская показывает в личке).
     origin_key: str = ""
-    # Рабочий каталог агента из входа хука: относительный путь в команде
-    # оценивается от него (ревью 11.10.2026).
-    cwd: str | None = None
     # Запуск claude, который ждёт ответа (runs.py): разрешение на план выдаётся ему.
     run_id: str = ""
+    # Все причины карточки: необратимое на сервере заказчика (serious.Irreversible),
+    # заголовок свой, а не «отправка людям» (отбор 27.11.2026).
+    client: bool = False
     # Срок нажатия (time.time()): его показывает карточка (ux2, 01.11.2026).
     deadline: float = 0.0
     # HTML отправленной карточки: итог срока дописывается в неё правкой.
@@ -104,9 +90,6 @@ class Pending:
     # сообщения в нажатии. Агент знает ключ бота и мог переписать карточку
     # через Bot API (проект 03.11.2026, п. 4).
     card_text: str = ""
-    # Отправка людям мимо карточки отправки (serious.Outbound): окно ⏩ тоже
-    # не положено.
-    sends: bool = False
     # Клавиатура карточки, как её нарисовал бот (keyboard_rows): на ✅
     # сверяется с клавиатурой сообщения в нажатии, подмена подписи кнопки
     # даёт отказ (ревью 03.11.2026).
@@ -126,9 +109,9 @@ class ApprovalRegistry:
         session_id: str | None = None,
         target_chat_id: int | None = None,
         target_thread_id: int | None = None,
-        cwd: str | None = None,
         origin_key: str = "",
         run_id: str = "",
+        client: bool = False,
     ) -> Pending:
         aid = uuid.uuid4().hex[:12]
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -140,9 +123,9 @@ class ApprovalRegistry:
             session_id=session_id,
             target_chat_id=target_chat_id,
             target_thread_id=target_thread_id,
-            cwd=cwd,
             origin_key=origin_key,
             run_id=run_id,
+            client=client,
         )
         self._items[aid] = p
         return p
@@ -254,14 +237,16 @@ CARD_TEXT_CAP = 3800
 
 
 def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: str | None,
-                      cwd: str | None = None) -> str:
+                      *, client: bool = False) -> str:
     """Карточка: заголовок, затем описание вызова (HTML, escape-нуто). С
-    04.11.2026 карточка только на отправку людям, оценки опасности по разбору
-    команды нет. Если вышло длиннее лимита Telegram, тело заменяется
-    обрезанным полным текстом: целиком он доступен по «📄»."""
-    head = _("📤 <b>отправка людям от твоего имени</b>: проверь адресата и текст")
+    04.11.2026 карточка на отправку людям; client: необратимое на сервере
+    заказчика, заголовок свой. Если вышло длиннее лимита Telegram, тело
+    заменяется обрезанным полным текстом: целиком он доступен по «📄»."""
+    head = (_("⚠️ <b>необратимое на сервере заказчика</b>: проверь сервер и команду") if client
+            else _("📤 <b>отправка людям от твоего имени</b>: проверь адресата и текст"))
     card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id)}"
-    if len(card) <= CARD_TEXT_CAP:
+    # В UTF-16, как считает Telegram (эмодзи по две единицы); теги в счёт: с запасом.
+    if utf16_len(card) <= CARD_TEXT_CAP:
         return card
     # Отправка наружу: сырой текст вместо карточки терял заголовок «от твоего
     # имени», текст письма и адресата в конце длинной команды (аудит outbound
@@ -271,9 +256,12 @@ def _format_tool_call(tool_name: str, tool_input: dict[str, Any], session_id: st
             outbound.is_send(tool_name) and isinstance(tool_input, dict)):
         for cap in (1000, 400, 100):
             card = f"{head}\n{_format_tool_body(tool_name, tool_input, session_id, text_cap=cap)}"
-            if len(card) <= CARD_TEXT_CAP:
+            if utf16_len(card) <= CARD_TEXT_CAP:
                 return card
-    raw = full_view_text(tool_name, tool_input)
+    # Начало в 2500 единиц UTF-16, а не знаков: эмодзи по две, иначе запасной
+    # текст сам выходил за предел Telegram (копия ошибки 3607640). Срез в 2500
+    # знаков до резки: длинный вход не перебирается целиком.
+    raw = split_for_telegram(full_view_text(tool_name, tool_input)[:2500], 2500)[0]
     return (f"{head}\n🛠 <b>{_esc_truncate(str(tool_name), 100)}</b>  "
             + _("<i>карточка длинная, целиком по кнопке 📄</i>") + "\n"
             f"<pre>{_esc_truncate(raw, 2500)}</pre>")
@@ -845,8 +833,10 @@ def _agent_role_refusal(cfg: Config, chat_key: str, tool_input: dict[str, Any]) 
     model = str(tool_input.get("model") or "").strip().lower()
     effort = str(tool_input.get("effort") or "").strip().lower()
     if model not in AGENT_MODELS or effort not in AGENT_EFFORTS:
-        return _("general-purpose без явных model и effort наследует модель и усилие главного рана "
-                 "(дорого). Возьми {hint}").format(hint=hint)
+        # Без явных model и effort помощник идёт по настройкам Свода
+        # (CLAUDE_CODE_SUBAGENT_MODEL=opus, CLAUDE_CODE_SUBAGENT_EFFORT=high с 27.11.2026).
+        return _("general-purpose без явных model и effort идёт на Opus high (дорого). "
+                 "Возьми {hint}").format(hint=hint)
     return None
 
 
@@ -1031,7 +1021,8 @@ async def send_approval_request(
                 + _("✅: остальные шаги этого запуска без карточек. Карточкой остаётся только "
                     "отправка людям.") + "</i>")
     else:
-        text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id, pending.cwd)
+        text = _format_tool_call(pending.tool_name, pending.tool_input, pending.session_id,
+                                 client=pending.client)
     if pending.origin_key:
         head = (_("📨 <b>Отклики</b>") if pending.origin_key == getattr(cfg, "otklik_chat_key", "")
                 else _("🛠 <b>Мастерская</b>"))
@@ -1061,7 +1052,7 @@ async def send_approval_request(
                      "Куда в отклике: {channel}\n<b>сверь адресата выше с «Куда»</b>").format(
                 id=match["id"], title=_esc_truncate(str(match.get("title")), 100),
                 channel=_esc_truncate(str(match.get("channel")), 200))
-        if len(text) + len(note) > CARD_TEXT_CAP + 150:
+        if utf16_len(text) + utf16_len(note) > CARD_TEXT_CAP + 150:
             # Карточка у предела Telegram 4096: пометка короче, номер остаётся.
             note = (_("⚠️ <b>возможен повтор</b> отклика {id}") if repeat else
                     _("✅ совпадает с одобренным откликом {id}; <b>сверь адресата с «Куда»</b>")).format(
@@ -1082,16 +1073,6 @@ async def send_approval_request(
             {"text": _("✅ Делай план"), "data": f"appr:{pending.approval_id}:allow"},
             {"text": _("❌ Не надо"), "data": f"appr:{pending.approval_id}:deny"},
         ]]
-    # ⏩ burst-кнопки показываем для всех инструментов (см. _BURST_DENY_TOOLS):
-    # окно auto-approve по решению Ивана покрывает любые действия.
-    # Отправке от имени Ивана окно не положено: каждая идёт своей карточкой.
-    if (pending.tool_name not in _BURST_DENY_TOOLS and not outbound.is_send(pending.tool_name)
-            and outbound.MAILSEND_CARD_KEY not in pending.tool_input and not isinstance(plan, dict)
-            and not pending.sends):
-        rows.append([
-            {"text": "⏩ 15m", "data": f"appr:{pending.approval_id}:auto15"},
-            {"text": "⏩ 1h", "data": f"appr:{pending.approval_id}:auto60"},
-        ])
     if needs_full_view(pending.tool_input, pending.tool_name):
         rows.append([{"text": _("📄 Полностью"), "data": f"apprfull:{pending.approval_id}"}])
     kb = buttons.markup(rows)
@@ -1307,12 +1288,10 @@ async def handle_approve(request: web.Request) -> web.Response:
     target_chat_id = target[0] if target else cfg.primary_chat_id
     target_thread_id = target[1] if target else None
 
-    # Burst auto-approve: пользователь явно открыл окно через /auto или нажал
-    # ⏩ Auto на approve-карточке. Окно scoped по Telegram target (чат + topic),
-    # чтобы auto в одной ветке не разрешал tools из другой. Видимость через audit
-    # decision="allow:burst" + одно уведомление при истечении окна.
-    target_key = burst_target_key(target_chat_id, target_thread_id)
-    # Фоновая тема (мастерская, отклики): права и окно ⏩ считаются по ней, а
+    # Ключ чата карточки: автоаппрув чата (APPROVE_AUTO_CHAT_KEYS) и журнал.
+    # Окно ⏩ (/auto) снято 27.11.2026 (этап 3 защит).
+    target_key = origin_chat_key(target_chat_id, target_thread_id)
+    # Фоновая тема (мастерская, отклики): права считаются по ней, а
     # показ (карточки, уведомления, таймаут) в личке, тема заглушена (проект
     # Домового 22.10.2026, тема откликов с 11.11.2026).
     origin_key = (f"{target_chat_id}:{target_thread_id}" if target_thread_id is not None
@@ -1323,14 +1302,8 @@ async def handle_approve(request: web.Request) -> web.Response:
         origin_key = ""
     # Чат рана (роль субагента, одно касание): у фоновой темы её ключ, а не личка показа.
     run_chat_key = origin_key or origin_chat_key(target_chat_id, target_thread_id)
-    burst_windows: dict[str, float] = application.bot_data.get("burst_until_by_target") or {}
-    burst_until = float(burst_windows.get(target_key, 0.0))
-    # burst НЕ применяем при неизвестном session_id (target резолвился на primary
-    # fallback) — иначе чужая/незарегистрированная сессия попала бы в burst-окно,
-    # открытое в primary-чате. Инструменты больше не фильтруем (_BURST_DENY_TOOLS
-    # пуст): окно по решению Ивана разрешает любые действия.
-    # Unattended-раны (/at, /event wake, plan-режим) не наследуют окно /auto:
-    # человека рядом нет, а текст мог прийти из внешнего события.
+    # Unattended-раны (/at, /event wake, plan-режим): человека рядом нет, а
+    # текст мог прийти из внешнего события.
     unattended_sids: set[str] = application.bot_data.get("unattended_sids") or set()
     is_unattended = scheduled or (bool(session_id) and session_id in unattended_sids)
     # Ран по чужому тексту (/event untrusted): отказ всему, кроме MCP-чтения,
@@ -1411,7 +1384,7 @@ async def handle_approve(request: web.Request) -> web.Response:
     sending = outbound.is_send(tool_name)
     exec_sids: set[str] = application.bot_data.get("task_exec_sids") or set()
     # Запрос карточки плана: раньше всех автоаппрувов, иначе вызов
-    # скилла прошёл бы без карточки (окно ⏩). Сам вызов прав
+    # скилла прошёл бы без карточки (чат с автоаппрувом). Сам вызов прав
     # не даёт; где план не положен, отказ с пояснением (ревью Codex 29.10).
     plan_text = ""
     if plan_req is not None:
@@ -1449,7 +1422,7 @@ async def handle_approve(request: web.Request) -> web.Response:
             sending = True
     # Карточка только на отправку людям (решение Ивана 04.11.2026,
     # docs/design-2026-11-04-system-boundaries.md): удаление, push, сервер
-    # заказчика (кроме необратимого на нём, serious.Irreversible, 11.11.2026),
+    # заказчика (необратимое на нём, serious.Irreversible: отказ фону ниже),
     # вложенный агент, правка защиты и секрет без карточки; причина
     # отправки идёт карточкой мимо всех автоаппрувов ниже. Чужой текст,
     # перезапуск бота и общие данные решены выше и сюда не доходят. С
@@ -1458,13 +1431,33 @@ async def handle_approve(request: web.Request) -> web.Response:
     danger_why: set[str] = set()
     if not sending and not plan_text:
         danger_why = await asyncio.to_thread(
-            serious.send_reasons, tool_name, tool_input, cwd,
-            telegram_port=getattr(cfg, "telegram_mcp_port", 8770),
+            serious.send_reasons, tool_name, tool_input,
             client_hosts=getattr(cfg, "client_hosts", ()))
-    # Отправка людям мимо карточки отправки (сервер Telegram на loopback,
-    # внешний сервис) из фонового рана: отказ сразу, карточка ждала бы без
+    # Отправка людям мимо карточки отправки (MCP внешнего сервиса) из фонового рана: отказ сразу, карточка ждала бы без
     # человека весь срок (решение Ивана 03.11.2026).
     # Так же необратимое на сервере заказчика (цель 2б, 11.11.2026).
+    # Этап 1 защит («ок» Ивана 27.11.2026, svod/docs/2026-11-27-zashchity.md):
+    # необратимое у заказчика без отказа и без карточки в живом разговоре и в
+    # ране строки поручения Домового (poruch_sids); прочий фон отказ сохраняет.
+    # Снимается, только когда других причин нет: иначе прежний путь (отказ фону,
+    # карточка в живом) с полной причиной в журнале.
+    # Живой здесь ран, начатый Иваном сейчас (live_sids ставит бот): не отклик
+    # по таймеру, не обдумывание задачи, не отложенное. Сбой самой проверки
+    # (serious.CheckFailed) пропуска не даёт.
+    with_human = target is not None and not is_unattended
+    poruch_sids: set[str] = application.bot_data.get("poruch_sids") or set()
+    live_sids: set[str] = application.bot_data.get("live_sids") or set()
+    client_pass = ""
+    client_why: list[str] = []
+    if danger_why and all(isinstance(w, serious.Irreversible) and not isinstance(w, serious.CheckFailed)
+                          for w in danger_why):
+        if is_unattended and not scheduled and bool(session_id) and session_id in poruch_sids:
+            client_pass = "allow:client-poruch"
+        elif with_human and bool(session_id) and session_id in live_sids:
+            client_pass = "allow:client-live"
+        if client_pass:
+            client_why = sorted(danger_why)
+            danger_why = set()
     outward = serious.sends(danger_why)
     if is_unattended and (outward or serious.irreversible(danger_why)):
         decision = "deny:outbound-unattended" if outward else "deny:irreversible-unattended"
@@ -1513,7 +1506,6 @@ async def handle_approve(request: web.Request) -> web.Response:
             await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
                                     tool_input=tool_input, decision=verdict.audit)
             return web.json_response({"decision": verdict.decision, "reason": verdict.reason})
-    with_human = target is not None and not is_unattended
     if (not sending and not plan_text and not danger_why
             # Запись в whitelist идёт своей веткой ниже, с заметкой «✍️» в футере хода.
             and not (with_human and _whitelist_hit(tool_name, tool_input, cfg))
@@ -1521,9 +1513,11 @@ async def handle_approve(request: web.Request) -> web.Response:
             and not (tool_name == "Bash" and not is_unattended and memory_write_auto_allowed(
                 str(tool_input.get("command", "")), cfg.state_dir / MEMORY_DRAFTS_DIRNAME))):
         aid = uuid.uuid4().hex[:12]
-        log.info("approve auto-allow aid=%s tool=%s target=%s (default)", aid, tool_name, target_key)
+        decision = client_pass or "allow:default"
+        log.info("approve auto-allow aid=%s tool=%s target=%s (%s)", aid, tool_name, target_key,
+                 decision.removeprefix("allow:"))
         await asyncio.to_thread(_audit, audit_path, approval_id=aid, tool_name=tool_name,
-                                tool_input=tool_input, decision="allow:default")
+                                tool_input=tool_input, decision=decision, why=client_why or None)
         return web.json_response({"decision": "allow", "reason": "default"})
     straight = bool(danger_why)
     # Чат с автоаппрувом по умолчанию (APPROVE_AUTO_CHAT_KEYS): без карточек
@@ -1559,38 +1553,12 @@ async def handle_approve(request: web.Request) -> web.Response:
         )
         return web.json_response({"decision": "allow", "reason": "task:exec"})
 
-    burst_eligible = (
-        target is not None and not is_unattended and tool_name not in _BURST_DENY_TOOLS
-        and not sending
-        and not plan_text
-        # Отправку людям окно не пропускает.
-        and not outward
-    )
-    if burst_eligible and time.time() < burst_until:
-        aid = uuid.uuid4().hex[:12]
-        log.info(
-            "approve auto-allow aid=%s tool=%s target=%s (burst until=%.0f)",
-            aid, tool_name, target_key, burst_until,
-        )
-        await asyncio.to_thread(
-            _audit,
-            audit_path,
-            approval_id=aid,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            decision="allow:burst",
-        )
-        return web.json_response({"decision": "allow", "reason": "burst"})
-
-    # Path-whitelist auto-approve: Write/Edit/MultiEdit/NotebookEdit внутри разрешённых
-    # каталогов — без Telegram-карточки, с пост-фактум уведомлением. Operator visibility
-    # сохраняется через уведомление + audit decision="allow:whitelist".
-    # Для unattended-ранов, дошедших сюда (plan-режим), авто-разрешения
-    # выключены (кроме MCP-чтения, см. ниже): whitelist путей
-    # включает рабочие каталоги (в т.ч. репозиторий самого бота), а bash-regex
-    # допускает запись аргументами внешне безобидных команд (`sort -o`,
-    # `git branch -D`). Пока человек в чате — это осознанный размен на удобство;
-    # для /at, /event и plan-ранов размена нет, там всё через карточку.
+    # Белый список путей: Write/Edit/MultiEdit/NotebookEdit без карточки и вне
+    # него (allow:default выше, с 04.11.2026); в нём только отметка «✍️»
+    # (строкой футера хода, без него сообщением; в фоновой теме только журнал)
+    # и запись allow:whitelist. Без отметки: чат с автоаппрувом и ран после
+    # «Делай» (allow:chat-auto, allow:task-exec выше), ран без человека и
+    # незнакомая сессия (allow:default).
     whitelist = () if is_unattended or straight else cfg.approve_whitelist_paths
     if whitelist:
         target_path = _target_path(tool_name, tool_input)
@@ -1646,6 +1614,7 @@ async def handle_approve(request: web.Request) -> web.Response:
                 tool_name=tool_name,
                 tool_input=tool_input,
                 decision="allow:memory-write",
+                why=client_why or None,
             )
             saved = [c for c in calls if not c["dry_run"]]
             if origin_key:
@@ -1699,11 +1668,10 @@ async def handle_approve(request: web.Request) -> web.Response:
         session_id=session_id,
         target_chat_id=target_chat_id,
         target_thread_id=target_thread_id,
-        cwd=cwd,
         origin_key=origin_key,
         run_id=run_id,
+        client=bool(danger_why) and all(isinstance(w, serious.Irreversible) for w in danger_why),
     )
-    pending.sends = outward
     log.info("approve request aid=%s tool=%s sid=%s", pending.approval_id, tool_name, (session_id or "?")[:8])
     # 2-3 попытки: секундный лаг Telegram/502 не должен молча превращаться в
     # deny — Claude обойдёт «отклонённый» шаг, а пользователь этого не увидит.

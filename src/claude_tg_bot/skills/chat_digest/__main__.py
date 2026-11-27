@@ -237,10 +237,15 @@ async def mark_read(creds: TelegramCreds, chat: ChatUnread) -> list[str]:
     return problems
 
 
+# Модель сводки чатов: до 27.11.2026 бралась из настроек пользователя (opus);
+# run_claude_json их больше не читает (--setting-sources "").
+DIGEST_MODEL = "opus"
+
+
 def run_digest_claude(prompt: str, timeout: int) -> str:
     """Ран сводки без единого инструмента (_oneshot.run_claude_json): в
     промпте чужие сообщения."""
-    return run_claude_json(prompt, timeout=timeout)
+    return run_claude_json(prompt, timeout=timeout, model=DIGEST_MODEL)
 
 
 

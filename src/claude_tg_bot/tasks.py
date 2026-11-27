@@ -4,16 +4,18 @@ BACKLOG.md).
 
 Задача это обычная тема, только одноразовая. Входы: «🛠 В работу» под
 новостью, /task, поручение Домовому (скилл task_new через POST /task). Бот
-заводит тему и сразу запускает обдумывание: ран только на чтение, агент
-первой строкой пишет «Понял так: результат, проверю там-то» и либо задаёт
-вопросы, либо даёт проект решения с маркером <<DO>>. Под проектом одна кнопка
-«▶️ Делай»; то же слово «делай» текстом или голосом. Любое другое сообщение
-продолжает обдумывание, проект снимается. Без нажатия не выполняется ничего
+заводит тему и сразу запускает обдумывание: изменений до «Делай» нет по
+правилу в промте (замка «только чтение» нет с 04.11.2026), агент первой
+строкой пишет «Понял так: результат, проверю там-то» и либо задаёт вопросы,
+либо даёт проект решения с маркером <<DO>>. Под проектом одна кнопка «▶️ Делай»;
+то же слово «делай» текстом или голосом. Любое другое сообщение продолжает
+обдумывание, проект снимается. Без нажатия не выполняется ничего
 (самостоятельные скиллы убраны решением Ивана 19.10.2026).
 
-Выполнение одно на весь бот: пока оно идёт, «Делай» другой задачи отвечает
-«занято» и кнопка остаётся рабочей; очереди нет (разбор 19.10.2026: общая
-очередь ни разу не понадобилась). Права выдаются рану выполнения (approval: allow:task-exec),
+Выполнение одно на весь бот: пока оно идёт, «Делай» другой задачи ставит её
+в очередь (отметка queued_at у проекта под «Делай»), и она стартует сама после
+идущего, по порядку нажатий (решение Ивана 27.11.2026). Поправка в теме
+снимает задачу с очереди вместе с проектом. Права выдаются рану выполнения (approval: allow:task-exec),
 а не теме; отправка людям идёт карточкой. Итог остаётся в теме,
 тема ждёт «🗑 Закрыть» и удаляется следующим утром после него; задача из
 лички получает после закрытия строку итога в личку (решение Ивана
@@ -32,6 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import jsonstore, paths
+from .config import now_local
 from .i18n import _, N_
 from .limits import clock
 from .skills.news_digest.core import INSTALL_RULE, Item, cut_words
@@ -60,7 +63,8 @@ NAME_INPUT_MAX = 1000
 CALLBACK_PREFIX = "nt"
 
 # Статусы: creating (тема ещё создаётся), thinking (обдумывание: всё только
-# чтением), proposed (проект решения ждёт «Делай»), running (выполнение),
+# чтением), proposed (проект решения ждёт «Делай»; с queued_at одобрен и ждёт
+# очереди выполнения), running (выполнение),
 # done (выполнено, ждёт закрытия),
 # failed (выполнение не вышло или прервано), closed (закрыта кнопкой, удалится
 # утром), gone (тема удалена; запись остаётся, чтобы
@@ -651,7 +655,7 @@ def run_reply(texts, last: str) -> str:
 # ---- Переходы (все под замком реестра у вызывающего, без await внутри) ----
 
 def drop_plan(task: dict, status: str = "thinking") -> dict:
-    task.update(status=status, plan="", plan_sha="", skill="", offer_due=None)
+    task.update(status=status, plan="", plan_sha="", skill="", offer_due=None, queued_at=None)
     return task
 
 
@@ -669,6 +673,10 @@ def touch(task: dict, text: str | None, seen_sha: str | None = None) -> str:
     # seen_sha: проект, который был, когда Иван отправил голосовое; пока шла
     # расшифровка, его могли сменить, и «делай» тогда не про новый (ревью Codex 19.10).
     if status == "proposed" and is_go(text) and (seen_sha is None or seen_sha == task.get("plan_sha")):
+        return "go"
+    if status == "running" and not task.get("exec_started") and is_go(text):
+        # Одобрено (насос очереди уже взял), ран ещё не начался: «делай» не
+        # поправка, одобрение остаётся (ревью очереди 27.11.2026).
         return "go"
     task["rev"] = task.get("rev", 0) + 1
     if status == "running" and not task.get("exec_started"):
@@ -713,7 +721,7 @@ def propose(task: dict, rev: int, plan: str, skill: str) -> bool:
     # Скилл в отпечатке: старая кнопка не одобрит тот же текст с другим
     # скиллом (ревью Codex 19.10).
     sha = plan_sha(f"{plan}\n<<DO:{skill}>>" if skill else plan)
-    task.update(status="proposed", plan=plan, plan_sha=sha, skill=skill, offer_due=None)
+    task.update(status="proposed", plan=plan, plan_sha=sha, skill=skill, offer_due=None, queued_at=None)
     return True
 
 
@@ -734,7 +742,7 @@ def exec_current(task: dict | None, ref: dict) -> bool:
 
 
 def _to_running(task: dict) -> dict:
-    task.update(status="running", exec_started=None, exec_gen=task.get("exec_gen", 0) + 1)
+    task.update(status="running", exec_started=None, queued_at=None, exec_gen=task.get("exec_gen", 0) + 1)
     return task
 
 
@@ -747,24 +755,44 @@ def _busy(data: dict, live) -> bool:
     return bool(live) or running(data) is not None
 
 
+def waiting(data: dict) -> list[dict]:
+    """Очередь выполнения по порядку нажатий."""
+    return sorted((t for t in data.values() if t.get("status") == "proposed" and t.get("queued_at")),
+                  key=lambda t: (t["queued_at"], t.get("id", "")))
+
+
 def approve(data: dict, tid: str, sha: str, live=(),
             press: str | None = None) -> tuple[str, dict | None]:
     """«▶️ Делай»: ("running", задача), если выполнять некому мешать;
-    ("busy", задача), если идёт другое выполнение: проект ждёт дальше, кнопка
-    рабочая, очереди нет (разбор 19.10.2026); ("stale", задача или None),
-    если проект уже не тот или задача не ждёт одобрения; ("dup", задача),
-    если это нажатие (press, id callback) уже принято. Выполнение одно на
-    весь бот (ревью Codex 15.10)."""
+    ("queued", задача), если идёт другое выполнение: задача ждёт в очереди
+    и стартует сама (решение Ивана 27.11.2026);
+    ("stale", задача или None), если проект уже не тот или задача не ждёт
+    одобрения; ("dup", задача), если это нажатие (press, id callback) уже
+    принято. Выполнение одно на весь бот (ревью Codex 15.10)."""
     task = data.get(tid)
     if task is not None and press and task.get("accepted_press") == press:
         # Telegram доставил то же нажатие заново после аварии (ревью Codex 14.10).
         return "dup", task
     if task is None or task.get("status") != "proposed" or task.get("plan_sha") != sha:
         return "stale", task
-    if _busy(data, live):
-        return "busy", task
     task["accepted_press"] = press
+    if _busy(data, live):
+        if not task.get("queued_at"):
+            # Микросекунды: два нажатия в одну секунду встают по порядку.
+            task["queued_at"] = now_local().isoformat(timespec="microseconds")
+        # Задача ждёт очереди: кнопку «не запустилось» после рестарта не слать.
+        task["offer_due"] = None
+        return "queued", task
     return "running", _to_running(task)
+
+
+def pump(data: dict, live=()) -> dict | None:
+    """Выполнение освободилось: первая задача очереди становится running.
+    Проверка и переход одним блоком под замком реестра у вызывающего."""
+    if _busy(data, live):
+        return None
+    queue = waiting(data)
+    return _to_running(queue[0]) if queue else None
 
 
 def after_exec(task: dict, ok: bool) -> str:
@@ -825,6 +853,8 @@ def short_name(task: dict) -> str:
 def stage_line(task: dict) -> str:
     """Строка этапа на карточке."""
     status = task.get("status", "")
+    if status == "proposed" and task.get("queued_at"):
+        return _(QUEUED_LINE)
     if status == "running":
         started = task.get("exec_started")
         if started:
@@ -832,6 +862,9 @@ def stage_line(task: dict) -> str:
     line = STAGE_LINES.get(status)
     return _(line) if line else ""
 
+
+QUEUED_LINE = N_("В очереди: начну сам, когда дойдёт черёд. Другое сообщение здесь снимет "
+                 "проект и очередь.")
 
 STAGE_LINES = {
     "creating": N_("Обдумываю…"),
@@ -850,6 +883,7 @@ STAGE_NAMES = {
     "creating": N_("тема заводится"),
     "thinking": N_("обдумывание"),
     "proposed": N_("ждёт «Делай»"),
+    "queued": N_("в очереди"),
     "running": N_("выполняется"),
     "done": N_("выполнено, ждёт закрытия"),
     "failed": N_("не вышло"),
@@ -988,6 +1022,8 @@ def open_list(opened: list[dict], with_id: bool = False) -> str:
     lines = []
     for t in opened:
         status = t.get("status", "")
+        if status == "proposed" and t.get("queued_at"):
+            status = "queued"
         stage = _(STAGE_NAMES[status]) if status in STAGE_NAMES else status
         link = f": {topic_link(t['chat_id'], t['thread_id'])}" if t.get("thread_id") else ""
         head = f"{t['id']} «{short_name(t)}» " if with_id else ""

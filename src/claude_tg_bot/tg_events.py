@@ -125,9 +125,12 @@ def _event_ref(store: Path, event_id: str | None, silent: bool, deal_asks: bool 
     if not event_id:
         return None
     rec = events.load(store, event_id)
-    # deal_asks только истиной: задание /at без поля шлёт обычные карточки.
+    # deal_asks и poruch только истиной: задание /at без поля идёт обычным фоном.
+    # poruch: ран строки поручения Домового (events.is_poruch). Задание /at при
+    # переносе лимитом её не несёт: оно теряет fresh и продолжило бы прежнюю
+    # сессию темы (ревью Codex 27.11.2026); такой ран получает отказ, как фон.
     return {"event_id": event_id, "expires_at": rec.get("expires_at") if rec else None, "silent": silent,
-            "deal_asks": True if deal_asks else None}
+            "deal_asks": True if deal_asks else None, "poruch": True if events.is_poruch(rec) else None}
 
 
 def _event_show_target(app: Application, rec: dict) -> tuple[int, int | None, str]:

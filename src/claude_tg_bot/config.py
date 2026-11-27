@@ -39,6 +39,11 @@ DEFAULT_MCP_AUTO_ALLOW_REGEX = (
 BOT_ENV_FILE = paths.ENV_FILE
 
 
+def parse_client_hosts(raw: str) -> tuple[str, ...]:
+    """CLIENT_HOSTS: имена, IP, суффиксы с точкой через запятую или пробел."""
+    return tuple(h.lower() for h in re.split(r"[\s,]+", raw) if h)
+
+
 def agent_env(base: dict[str, str] | None = None, *, env_file: Path = BOT_ENV_FILE) -> dict[str, str]:
     """Окружение для дочернего агента: копия base (по умолчанию os.environ)
     без секретов бота. Из .env берутся только имена ключей."""
@@ -88,10 +93,16 @@ TZ_ENV = "CLAUDE_TG_BOT_TZ"
 
 
 def _system_zone_name() -> str:
-    """Имя часового пояса системы (Europe/Berlin) или пустая строка."""
+    """Имя часового пояса системы (Europe/Berlin) или пустая строка.
+    Копия `domovoy.common._system_zone_name`, сверка тестом
+    `tests/test_domovoy_copies_2026_11_27.py`."""
     tz = os.environ.get("TZ", "").strip().lstrip(":")
-    if "/" in tz:
-        return tz
+    if tz:   # имя пояса («Europe/Berlin», «UTC»), если zoneinfo его знает; путь и POSIX-строка нет
+        try:
+            ZoneInfo(tz)
+            return tz
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
     try:
         name = Path("/etc/timezone").read_text(encoding="utf-8").strip()
         if name:
@@ -116,7 +127,8 @@ def local_zone() -> ZoneInfo:
 
 def zone_mismatch() -> str | None:
     """Предупреждение, если local_zone() молча взял UTC: имя пояса негодное
-    (опечатка в CLAUDE_TG_BOT_TZ или TZ) или его нет (/etc/localtime копия
+    (опечатка в CLAUDE_TG_BOT_TZ; опечатка в TZ с 27.11.2026 уходит к файлам
+    системы, как у Домового) или его нет (/etc/localtime копия
     файла: контейнеры, часть WSL), а система живёт в другом поясе. Узнавать
     пояс по копии не учим: на ПК и маке ссылка (BACKLOG 07.11.2026)."""
     name = os.environ.get(TZ_ENV, "").strip() or _system_zone_name()
@@ -595,11 +607,9 @@ class Config:
     # Юнит сервера Telegram: из него корни файлов для проверки пути send_file
     # до карточки (outbound.path_refusal). None: проверки нет.
     telegram_mcp_unit: Path | None = None
-    # Порт сервера Telegram на loopback: Bash, который туда ходит, идёт карточкой
-    # (serious.py, отправка мимо проверки). 0: проверки нет.
-    telegram_mcp_port: int = 8770
     # Серверы заказчиков (CLIENT_HOSTS: имена, IP, суффиксы с точкой): Bash с
-    # таким хостом и необратимым словом идёт карточкой (serious.py). Пусто: выключено.
+    # таким хостом и необратимым словом из фона получает отказ (serious.py,
+    # кроме рана поручения; в живом разговоре без карточки с 27.11.2026). Пусто: выключено.
     client_hosts: tuple[str, ...] = ()
     # Группа и тема «Новостей» (NEWS_TG_CHAT_ID, NEWS_TG_THREAD_ID): пометка
     # агенту в теме и группа тем задач. None: не задано или не число.
@@ -616,6 +626,9 @@ class Config:
     # усилие отдельные: отправка по готовому тексту это механика. Пусто: ✅ как
     # раньше, в чате, где отклик готовили.
     otklik_chat_key: str = ""
+    # Тема хода перезапуска по заявке из лички (RESTART_CHAT_KEY, решение Ивана
+    # 27.11.2026): «принята» и «перезапущен» туда, в личку только сбой. Пусто: личка.
+    restart_chat_key: str = ""
     otklik_model: str = "sonnet"
     otklik_effort: str = "medium"
 
@@ -639,8 +652,9 @@ def _topic_key(raw: str) -> str | None:
 
 
 def background_chat_keys(cfg: Any) -> frozenset[str]:
-    """Фоновые темы бота: мастерская и отклики. Ивана в них нет: карточки,
-    передача экрана и итог показываются в личке. getattr: в тестах cfg без полей."""
+    """Фоновые темы бота: мастерская и отклики. Ивана в них нет: карточки
+    одобрения, передача экрана и итог показываются в личке (итог рана откликов
+    с 27.11.2026 только при сбое). getattr: в тестах cfg без полей."""
     return frozenset(k for k in (getattr(cfg, "workshop_chat_key", ""), getattr(cfg, "otklik_chat_key", "")) if k)
 
 
@@ -1035,6 +1049,11 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         print(f"[config] WARNING: OTKLIK_CHAT_KEY={os.environ.get('OTKLIK_CHAT_KEY')!r} не вида <chat>:<thread> или совпадает "
               "с мастерской, тема откликов выключена", file=sys.stderr)
         otklik_chat_key = ""
+    restart_chat_key = _topic_key(os.environ.get("RESTART_CHAT_KEY", ""))
+    if restart_chat_key is None:
+        print(f"[config] WARNING: RESTART_CHAT_KEY={os.environ.get('RESTART_CHAT_KEY')!r} не вида "
+              "<chat>:<thread>, ход перезапуска идёт в личку", file=sys.stderr)
+        restart_chat_key = ""
     limit_reserve_chats = frozenset(
         k.strip() for k in os.environ.get("CLAUDE_TG_LIMIT_RESERVE_CHATS", "").split(",") if k.strip()
     )
@@ -1109,8 +1128,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         plan_cards=plan_cards,
         telegram_mcp_unit=Path(unit).expanduser() if (unit := os.environ.get(
             "TELEGRAM_MCP_UNIT", "~/.config/systemd/user/telegram-mcp.service").strip()) else None,
-        telegram_mcp_port=_int_env("TELEGRAM_MCP_PORT", 8770),
-        client_hosts=tuple(h.lower() for h in re.split(r"[\s,]+", os.environ.get("CLIENT_HOSTS", "")) if h),
+        client_hosts=parse_client_hosts(os.environ.get("CLIENT_HOSTS", "")),
         news_tg_chat_id=_int_env("NEWS_TG_CHAT_ID", None),
         news_tg_thread_id=_int_env("NEWS_TG_THREAD_ID", None),
         telegram_bot_api_url=bot_api_url,
@@ -1125,6 +1143,7 @@ def load_config(*, skip_hook_validation: bool = False) -> Config:
         workshop_effort=os.environ.get("WORKSHOP_EFFORT", "high").strip(),
         workshop_scope=os.environ.get("WORKSHOP_SCOPE", "").strip(),
         otklik_chat_key=otklik_chat_key,
+        restart_chat_key=restart_chat_key,
         otklik_model=os.environ.get("OTKLIK_MODEL", "sonnet").strip(),
         otklik_effort=os.environ.get("OTKLIK_EFFORT", "medium").strip(),
     )

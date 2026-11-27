@@ -702,7 +702,7 @@ async def _task_add_run(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str)
     """Ход обдумывания по словам из _task_add; учёт работы снимается здесь."""
     try:
         upd = _b._synthetic_update(ctx.bot, task["chat_id"], task["thread_id"])
-        await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True)
+        await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True, live=False)
     except Exception:
         log.exception("task addition run failed %s", task["id"])
     finally:
@@ -719,7 +719,9 @@ async def _task_intro(ctx: ContextTypes.DEFAULT_TYPE, task: dict, prompt: str) -
         try:
             # Обычный режим, как следующие ходы обдумывания (решение Ивана
             # 04.11.2026: замка «только чтение» нет, правило в промте).
-            await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True)
+            # live=False: задачу мог завести и фоновый ран (task_new), в обдумывании
+            # Ивана рядом нет; необратимое у заказчика с карточкой (этап 1 защит).
+            await _b._dispatch_to_claude(upd, ctx, prompt, send_voice_reply=False, admitted=True, live=False)
         except Exception:
             log.exception("news task intro failed %s", task["id"])
         # Задачу могли закрыть, пока уходил ответ: снимок с заведения темы затёр
@@ -773,8 +775,8 @@ async def _task_do(ctx: ContextTypes.DEFAULT_TYPE, tid: str, sha: str, press: st
                    query=None, reply_to: Any = None) -> None:
     """«▶️ Делай» кнопкой или словом. Одобрение привязано к отпечатку
     проекта: устаревшая кнопка не выполнит новый текст. Выполнение свободно:
-    сразу; занято другой задачей: ответ «занято», проект ждёт дальше и кнопка
-    остаётся рабочей (очередь убрана, разбор 19.10.2026)."""
+    сразу; занято другой задачей: задача встаёт в очередь и стартует сама
+    после идущего (_task_pump, решение Ивана 27.11.2026)."""
     bd = ctx.application.bot_data
     cfg: Config = bd["cfg"]
 
@@ -787,6 +789,13 @@ async def _task_do(ctx: ContextTypes.DEFAULT_TYPE, tid: str, sha: str, press: st
 
     if bd.get("draining") or bd.get("stopping"):
         await say(_("♻️ бот готовится к перезапуску: скажи «делай» после рестарта"), alert=True)
+        return
+    # Очередь, которую насос пропустил (реестр не читался, первые секунды
+    # после старта), идёт раньше этого нажатия; нажата сама голова: выполняется.
+    if _task_pump(ctx) == tid:
+        if query is not None:
+            await strip_buttons(query)
+        await say(_("▶️ Выполняю"))
         return
     # Проверка ожидания, переход и учёт работы без await между ними: рестарт
     # не начнётся между одобрением и стартом выполнения.
@@ -805,10 +814,13 @@ async def _task_do(ctx: ContextTypes.DEFAULT_TYPE, tid: str, sha: str, press: st
     if kind == "dup":
         await say(_("Это нажатие уже принято"))
         return
-    if kind == "busy":
+    if kind == "queued":
         who = _("«{name}»").format(name=tasks.short_name(holder)) if holder else _("другая задача")
-        await say(_("⏳ Сейчас выполняется {who}. Когда закончится, нажми «Делай» ещё раз или напиши «делай».").format(who=who),
+        await say(_("⏳ Поставил в очередь: начну сам, когда дойдёт черёд. Сейчас выполняется {who}.").format(who=who),
                   alert=True)
+        if query is not None:
+            await strip_buttons(query)
+        await _b._task_card(ctx, task)
         return
     if kind == "stale":
         if task is not None and task.get("plan_sha") == sha and task.get("status") == "running":
@@ -865,6 +877,29 @@ def _task_exec_release(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
     bd = ctx.application.bot_data
     bd["active_work"] -= 1
     bd.setdefault("task_exec_live", set()).discard(task["id"])
+
+
+def _task_pump(ctx: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Выполнение освободилось: первая задача очереди стартует сама (решение
+    Ивана 27.11.2026). Перед перезапуском не стартует ничего, очередь ждёт в
+    реестре и двинется после старта (_tasks_startup). Без await до учёта:
+    второй насос увидит выполнение занятым. Вернёт id запущенной задачи."""
+    bd = ctx.application.bot_data
+    if bd.get("draining") or bd.get("stopping"):
+        return None
+    try:
+        with tasks.locked(tasks.registry_dir(bd["cfg"].state_dir)) as data:
+            task = tasks.pump(data, _task_live(bd))
+            task = dict(task) if task else None
+    except (OSError, ValueError) as e:
+        log.error("tasks registry unreadable, queue not moved: %s", e)
+        return None
+    if task is None:
+        return None
+    _task_exec_admit(ctx, task)
+    log.info("news task %s started from queue", task["id"])
+    ctx.application.create_task(_task_exec(ctx, task))
+    return task["id"]
 
 
 def _task_live(bd: dict) -> set[str]:
@@ -986,6 +1021,7 @@ async def _task_exec(ctx: ContextTypes.DEFAULT_TYPE, task: dict) -> None:
     finally:
         async def release() -> None:
             _task_exec_release(ctx, task)
+            _task_pump(ctx)
 
         # Процесс выполнения не вышел и после SIGKILL: занято до выхода.
         if not _task_release_after_exit(ctx, unexited, release):
@@ -1129,17 +1165,19 @@ async def on_task_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _task_do(ctx, tid, sha, press=query.id, query=query)
         return
     # Закрытие: не посреди рана, иначе тема закроется, а агент продолжит
-    # (ревью Codex 13.10). Замок темы берётся без ожидания: запрос, вставший
+    # (ревью Codex 13.10). Замок темы только проверяется: запрос, вставший
     # в очередь после, увидит закрытую задачу и не уйдёт в Claude.
     lock = _b._chat_lock(ctx, f"{task['chat_id']}:{task['thread_id']}")
     if lock.locked():
         await _b._answer_quietly(query, _("Агент в теме работает: дождись конца или /cancel, потом закрой"),
                               show_alert=True)
         return
-    async with lock:
-        closed = _task_update(cfg, tid, expect=tasks.CLOSABLE, status="closed",
-                              closed=datetime.now().astimezone().isoformat(timespec="seconds"),
-                              note_due=tasks.note_target(task, cfg.primary_chat_id) is not None or None)
+    # Без ожидания и самого замка: только что отпущенный замок достаётся
+    # сперва ждущему рану, и тот ушёл бы в незакрытую задачу (ревью
+    # 27.11.2026). Между проверкой и записью await нет.
+    closed = _task_update(cfg, tid, expect=tasks.CLOSABLE, status="closed",
+                          closed=datetime.now().astimezone().isoformat(timespec="seconds"),
+                          note_due=tasks.note_target(task, cfg.primary_chat_id) is not None or None)
     if closed is None:
         await _b._answer_quietly(query, _("Сейчас закрыть нельзя: идёт выполнение"), show_alert=True)
         return
@@ -1266,7 +1304,8 @@ async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """При старте бота ранов нет. Выполнение, которое правда стартовало,
     становится failed с пометкой «прервал рестарт»: что успело сделаться,
     Иван проверит сам (ревью Codex 15.10: после аварии не повторять вслепую).
-    Не стартовавшее (и запись из очереди до 19.10.2026) снова ждёт «Делай»."""
+    Не стартовавшее (и запись со статусом queued до 19.10.2026) снова ждёт
+    «Делай». Очередь (queued_at) остаётся и двинется в _tasks_startup."""
     cfg: Config = ctx.application.bot_data["cfg"]
     base = tasks.registry_dir(cfg.state_dir)
     moved: list[tuple[dict, str | None]] = []
@@ -1282,7 +1321,7 @@ async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 task.update(status="proposed", accepted_press=None, offer_due=True)
                 task.pop("queued_at", None)
                 moved.append((dict(task), None))
-            elif status == "proposed" and task.get("offer_due"):
+            elif status == "proposed" and task.get("offer_due") and not task.get("queued_at"):
                 # Кнопка после прошлого рестарта не ушла (_task_offer_do).
                 moved.append((dict(task), None))
             else:
@@ -1327,7 +1366,7 @@ async def _tasks_recover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _tasks_startup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Через полминуты после старта: права бота в группе новостей и уборка."""
+    """Через полминуты после старта: права бота в группе новостей, уборка и очередь выполнения."""
     chat_id = _tasks_chat_id(ctx.application.bot_data["cfg"])
     if chat_id is not None:
         try:
@@ -1344,6 +1383,9 @@ async def _tasks_startup(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _tasks_housekeeping(ctx, startup=True)
     except (OSError, ValueError) as e:
         log.error("news tasks registry unreadable: %s", e)
+    finally:
+        # Очередь, ждавшая перезапуска, двигается сама (решение Ивана 27.11.2026).
+        _task_pump(ctx)
 
 
 # В конце: bot импортирует этот модуль при своей загрузке. Имена bot и

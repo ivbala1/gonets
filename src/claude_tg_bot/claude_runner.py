@@ -486,13 +486,15 @@ async def ensure_oauth_fresh(claude_bin: str, *, buffer_sec: int = 120) -> None:
             # Ран идёт без хука бота и его запретов: инструментов и MCP у него
             # нет, остальное отказ без вопроса, сессия не сохраняется. Без
             # этого он видел Bash, Gmail и allow из настроек пользователя
-            # (ревью Codex 19.10.2026, проверено на 2.1.303). --tools
-            # принимает несколько слов: за ним флаг, а не запрос.
+            # (ревью Codex 19.10.2026, проверено на 2.1.303). Настройки
+            # пользователя тоже не читаются: ядро и хук памяти здесь лишние
+            # (замер 27.11.2026: 17,8 тыс. токенов и 8 с против 4,2 тыс. и 4 с).
+            # --tools принимает несколько слов: за ним флаг, а не запрос.
             # Таймаут и отмена: run_bounded убивает всю группу.
             await run_bounded(
                 [claude_bin, "-p", "--tools", "", "--strict-mcp-config",
                  "--permission-mode", "dontAsk", "--no-session-persistence",
-                 "--output-format", "json",
+                 "--setting-sources", "", "--output-format", "json",
                  "--model", "claude-haiku-4-5-20251001", "ok"],
                 timeout=45, env=agent_env(),
             )
@@ -610,8 +612,11 @@ async def run_claude(
     permission_mode: str = "bypassPermissions",
     unattended_sids: set[str] | None = None,
     untrusted_sids: set[str] | None = None,
+    poruch_sids: set[str] | None = None,
+    live_sids: set[str] | None = None,
     on_session_start: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    user_stopped: Callable[[], bool] | None = None,
     cost_totals: MutableMapping[str, str] | None = None,
     autocompact: str = "",
     on_run_start: Callable[[], None] | None = None,
@@ -640,6 +645,10 @@ async def run_claude(
     untrusted_sids - не None для рана по чужому тексту: набор инструментов
         прежний, режим dontAsk с правилами ask (UNTRUSTED_ASK_TOOLS), sid
         регистрируется на время рана, и хук отклоняет всё, кроме MCP на чтение.
+    poruch_sids - не None для рана строки поручения Домового (событие с ключом
+        poruch:…): sid регистрируется на время рана, хук не отказывает ему в
+        необратимом на сервере заказчика (этап 1 защит, 27.11.2026).
+    live_sids - не None для рана, начатого Иваном сейчас: то же без карточки.
     on_session_start - зовётся с session_id каждой попытки до запуска
         процесса: бот пишет по нему постоянные метки раньше, чем промпт
         попадёт в транскрипт (ревью 12.10.2026).
@@ -649,6 +658,9 @@ async def run_claude(
         вызывающему (ревью Codex 14.10).
     activity_cb - зовётся на каждое событие stream-json (не только tool_use):
         по нему бот считает тишину рана для сторожа зависаний.
+    user_stopped - True, когда ран снял сам Иван (/cancel, «!», /reset force,
+        «Прервать»): claude, вышедший с кодом 0 раньше своего фонового внука,
+        тогда не обычный успех, а снятый ран (решение Ивана 27.11.2026).
     should_stop - True, когда бот останавливается: сверяется перед каждой
         попыткой и сразу после создания процесса. Сигнал остановки, пришедший
         во время подготовки OAuth, гасит только уже известные процессы, и
@@ -865,11 +877,15 @@ async def run_claude(
         # Номер этого запуска: разрешение на план живёт до его конца (runs.py).
         run_id = runs.start(active_sid)
         if unattended_sids is not None:
-            # Пометка «человека за клавиатурой нет»: handle_approve не применит
-            # к этой сессии открытое окно /auto.
+            # Пометка «человека за клавиатурой нет»: handle_approve отказывает
+            # такой сессии в отправке людям и необратимом у заказчика.
             unattended_sids.add(active_sid)
         if untrusted_sids is not None:
             untrusted_sids.add(active_sid)
+        if poruch_sids is not None:
+            poruch_sids.add(active_sid)
+        if live_sids is not None:
+            live_sids.add(active_sid)
         timed_out = False
         final_event: dict | None = None
         result_texts: list[str] = []
@@ -896,7 +912,7 @@ async def run_claude(
             if session_targets is not None and session_targets.pop(old, None) is not None:
                 session_targets[real] = (target_chat_id, target_thread_id)
             runs.rebind(old, real, run_id)
-            for marks in (unattended_sids, untrusted_sids):
+            for marks in (unattended_sids, untrusted_sids, poruch_sids, live_sids):
                 if marks is not None and old in marks:
                     marks.discard(old)
                     marks.add(real)
@@ -977,7 +993,7 @@ async def run_claude(
                                 evt.get("type") == "result" and evt.get("is_error") is not True):
                             blocked_tools.append(_("(событие init не пришло)"))
                         if blocked_tools:
-                            log.error("untrusted run stopped chat=%s: no lock for tools %s",
+                            log.error("untrusted run stopped by tool-set check chat=%s: %s",
                                       chat_key, ", ".join(blocked_tools))
                             kill_process_tree(proc, signal.SIGKILL)
                             stderr_task.cancel()
@@ -1077,6 +1093,10 @@ async def run_claude(
                 unattended_sids.discard(active_sid)
             if untrusted_sids is not None:
                 untrusted_sids.discard(active_sid)
+            if poruch_sids is not None:
+                poruch_sids.discard(active_sid)
+            if live_sids is not None:
+                live_sids.discard(active_sid)
             # F2: abandoned approvals cleanup делает bot.py после run_claude —
             # там доступен ctx.bot для edit_message_reply_markup (в run_claude
             # его нет, а async edit в finally рискует при CancelledError).
@@ -1139,6 +1159,8 @@ async def run_claude(
         and not fork_at
         and not att.timed_out
         and att.returncode not in (0, -15, -9, 143, 137)
+        # Ран снял Иван: свежая сессия пошла бы после его отмены (ревью Codex 27.11.2026).
+        and not (user_stopped is not None and user_stopped())
         and _is_stale_session_error(att.stderr.decode(errors="replace"))
     ):
         log.warning(
@@ -1152,8 +1174,11 @@ async def run_claude(
 
     if att.blocked_tools:
         return ClaudeResult(
-            text=_("⛔ ран по чужому тексту остановлен: нет замка у инструментов {tools} "
-                   "(claude_runner.UNTRUSTED_ASK_TOOLS)").format(tools=", ".join(att.blocked_tools)),
+            # Причина бывает и не в замке: init не пришёл или список в нём неверный
+            # (метки в скобках от untrusted.unknown_tools и разбора выше).
+            text=_("⛔ ран по чужому тексту остановлен проверкой набора инструментов: {tools}. "
+                   "Если это новый встроенный инструмент, вписать его в untrusted.UNTRUSTED_READ_TOOLS "
+                   "(только читает) или untrusted.UNTRUSTED_ASK_TOOLS (под замком)").format(tools=", ".join(att.blocked_tools)),
             session_id=att.active_sid, is_error=True,
         )
 
@@ -1164,6 +1189,43 @@ async def run_claude(
             text=_("⛔ claude убит по таймауту ({timeout}s)").format(timeout=max_runtime_sec),
             session_id=att.active_sid, is_error=True, texts=tuple(att.result_texts),
             **_request_fields(att),
+        )
+
+    def _error_cost(out: dict | None) -> tuple[float | None, float, str]:
+        """Цена рана без обычного итога: (цена, сумма сессии, sid)."""
+        total, _unused = _usage_stats(out) if out else (0.0, 0)
+        err_sid = (out.get("session_id") if out else None) or att.active_sid
+        if total <= 0:
+            cost = 0.0
+        elif warm_fork_sid:
+            cost = _warm_cost(cost_totals, existing, total)
+        else:
+            cost = _answer_cost(cost_totals, err_sid, total, att.resumed)
+            if fork_at:
+                # Ошибочный первый ход дела: оценка от суммы сессии вопроса.
+                cost = _warm_cost(cost_totals, fork_at[0], total)
+        return cost, total, err_sid
+
+    if (att.returncode == 0 and user_stopped is not None and user_stopped()
+            and not (att.final_event and att.final_event.get("is_error") is True)):
+        # Claude вышел сам, а ран держал вывод процесс его группы, пока Иван не
+        # снял её (/cancel, «!», /reset force, «Прервать»; решение 27.11.2026):
+        # не обычный успех. Готовый ответ уходит с пометкой об остановке, а не
+        # законченной работой (итог-ошибка идёт веткой ошибки); сессию не пишем (сброс посреди рана не
+        # откатится), свежую сохранит бот по эпохе (_keep_failed_session).
+        cost, total, stop_sid = _error_cost(att.final_event)
+        head = _("⛔ ран остановлен")
+        # Как обычный путь: текст итога в result, у старых форматов в response.
+        said = str(att.final_event.get("result") or att.final_event.get("response") or "") if att.final_event else ""
+        text = _("{head}; ответ claude до остановки:").format(head=head) + "\n\n" + said if said else head
+        log.info("claude stopped by user after exit chat=%s sid=%s cost=%s",
+                 chat_key, stop_sid[:8], f"${cost:.4f}" if cost is not None else "?")
+        return ClaudeResult(
+            text=text, session_id=stop_sid, cost_usd=cost, session_cost_usd=total,
+            context_tokens=att.ctx_last or 0, context_max=att.ctx_max, compacted=att.compacted,
+            is_error=True, rate=att.rate,
+            # Тексты как у снятого сигналом: сводку «✅» тема задачи найдёт.
+            texts=tuple(att.result_texts), **_request_fields(att), signalled=True,
         )
 
     if att.returncode != 0 or (att.final_event and att.final_event.get("is_error") is True):
@@ -1184,17 +1246,7 @@ async def run_claude(
         raw_out = att.stdout.decode(errors="replace")
         out = att.final_event
         stderr_txt = att.stderr.decode(errors="replace").strip()
-        total, _unused = _usage_stats(out) if out else (0.0, 0)
-        err_sid = (out.get("session_id") if out else None) or att.active_sid
-        if total <= 0:
-            cost = 0.0
-        elif warm_fork_sid:
-            cost = _warm_cost(cost_totals, existing, total)
-        else:
-            cost = _answer_cost(cost_totals, err_sid, total, att.resumed)
-            if fork_at:
-                # Ошибочный первый ход дела: оценка от суммы сессии вопроса.
-                cost = _warm_cost(cost_totals, fork_at[0], total)
+        cost, total, err_sid = _error_cost(out)
         text = _format_error_text(att.returncode, out, stderr_txt, raw_out)
         log.error(
             "claude rc=%s stop=%s api_status=%s msg=%r",

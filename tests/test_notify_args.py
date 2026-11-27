@@ -59,7 +59,7 @@ class NotifyArgsTests(unittest.TestCase):
     def test_here_goes_to_run_chat_and_thread(self):
         # Перевод текста людям рядом с карточкой отправки (решение 08.11.2026).
         cfg = _fake_cfg()
-        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-100500:77"}):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-100500:77", "CLAUDE_TG_SHOW_CHAT_KEY": ""}):
             with patch.object(notify, "load_config", return_value=cfg):
                 with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
                     rc = notify.main(["--here", "перевод"])
@@ -69,7 +69,7 @@ class NotifyArgsTests(unittest.TestCase):
 
     def test_here_private_chat_without_thread(self):
         cfg = _fake_cfg()
-        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "111"}):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "111", "CLAUDE_TG_SHOW_CHAT_KEY": ""}):
             with patch.object(notify, "load_config", return_value=cfg):
                 with patch.object(notify.httpx, "post", return_value=_ok_response()) as post:
                     rc = notify.main(["--here", "перевод"])
@@ -103,7 +103,7 @@ class NotifyArgsTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_here_with_explicit_chat_is_error(self):
-        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-1:5"}):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-1:5", "CLAUDE_TG_SHOW_CHAT_KEY": ""}):
             with patch.object(notify.httpx, "post") as post:
                 with redirect_stderr(io.StringIO()):
                     rc = notify.main(["--here", "--chat-id", "-1", "т"])
@@ -111,7 +111,7 @@ class NotifyArgsTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_here_foreign_chat_refused(self):
-        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-999:1"}):
+        with patch.dict(notify.os.environ, {"CLAUDE_TG_CHAT_KEY": "-999:1", "CLAUDE_TG_SHOW_CHAT_KEY": ""}):
             with patch.object(notify, "load_config", return_value=_fake_cfg()):
                 with patch.object(notify.httpx, "post") as post:
                     with redirect_stderr(io.StringIO()):

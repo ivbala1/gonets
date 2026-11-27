@@ -24,7 +24,7 @@ from telegram.constants import ChatAction
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
-    ApplicationHandlerStop,
+    ApplicationHandlerStop,  # noqa: F401  тесты берут через модуль bot
     CallbackQueryHandler,
     MessageReactionHandler,
     CommandHandler,
@@ -42,26 +42,17 @@ from .approval import (
     RUN_NOTES,
     _SKILL_PYTHON,
     ApprovalRegistry,
-    build_aiohttp_app,
+    build_aiohttp_app,  # noqa: F401  lifecycle зовёт через модуль bot (_b)
     card_matches,
     full_view_text,
+    origin_chat_key,
 )
 from .auth import LoginManager
-from .burst import (
-    BURST_DEFAULT_SEC,
-    burst_clear,
-    burst_duration_for_decision,
-    burst_set,
-    burst_target_key,
-    burst_until_ts,
-    format_burst_local,
-    parse_duration,
-)
 from .claude_runner import ClaudeResult, SessionStore, kill_process_tree, run_claude  # noqa: F401 (kill_process_tree: lifecycle и тесты через bot)
 from .overrides import PersistentDict
 from .config import Config, EFFORT_LEVELS, agent_env, background_chat_keys, local_zone, now_local
 from . import procs as procs_mod
-from . import audit, bot_api_server, buttons, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, retention, tasks, tg_api, transcripts
+from . import audit, bot_api_server, buttons, deals, handoff, hangs, inflight, limits, outbound, reactions, restart, retention, tasks, tg_api, transcripts  # noqa: F401  restart берут через модуль bot
 from .skills.news_digest import core as news
 from .replies import (
     extract_ask_markers,
@@ -105,8 +96,9 @@ except ModuleNotFoundError as e:
         raise
     on_app_queue_pick = start_app_queue_watch = None
 from .tg_otklik import (  # noqa: F401  перенесено из bot.py
-    _otklik_close_attempts, _otklik_loud, _otklik_show, _otklik_sync, _otklik_unknown_notice, on_otklik_all_pick,
-    on_otklik_pick, otklik_at_cancelled, otklik_at_fire,
+    _otklik_back_loud, _otklik_close_attempts, _otklik_report_to_primary, _otklik_loud, _otklik_restart_loud,
+    _otklik_show, _otklik_sync,
+    _otklik_unknown_notice, on_otklik_all_pick, on_otklik_pick, otklik_at_cancelled, otklik_at_fire,
 )
 from .tg_deals import (  # noqa: F401  перенесено из bot.py
     DEAL_FIRST_NOTE, _deal_finish, _deal_open, _deal_reply_target, _deal_swipe, _deal_turn,
@@ -116,7 +108,7 @@ from .tg_tasks import (  # noqa: F401  перенесено из bot.py
     ADD_PENDING, _is_task_ask_reply, _task_add_cost, _task_add_run, _task_card, _task_command,
     _task_cost_seen, _task_do, _task_exec_finish, _task_for, _task_from_http, _task_note,
     _task_seen_sha, _task_start, _task_thought, _task_touch, _task_touch_now, _task_turn,
-    _task_update, _tasks_housekeeping, _tasks_recover, _tasks_startup, on_task, on_task_pick,
+    _task_update, _tasks_housekeeping, _tasks_recover, _tasks_startup, _task_pump, on_task, on_task_pick,
 )
 from .tg_at import (  # noqa: F401  перенесено из bot.py
     _at_fire, at_put, on_at, _parse_at_when, _schedule_at_job, schedule_later,
@@ -467,41 +459,6 @@ async def _cleanup_abandoned_approvals(
     return len(abandoned)
 
 
-async def on_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = ctx.application.bot_data["cfg"]
-    if not _is_allowed(cfg, update):
-        return
-    msg = update.message
-    parts = (msg.text or "").split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    target_key, chat_id, thread_id = _chat_key(update)
-
-    if arg.lower() in ("off", "stop", "0"):
-        was = burst_clear(ctx, target_key)
-        await msg.reply_text(
-            _("⏸ auto-approve выключен в этой ветке.")
-            if was
-            else _("⏸ auto-approve в этой ветке и так выключен.")
-        )
-        return
-
-    duration = BURST_DEFAULT_SEC
-    if arg:
-        parsed = parse_duration(arg)
-        if parsed is None:
-            await msg.reply_text(
-                _("⚠️ формат: /auto [Nm|Nh|Ns]. Примеры: /auto 15m, /auto 1h, /auto off.")
-            )
-            return
-        duration = parsed
-
-    until = burst_set(ctx, target_key, duration, chat_id, thread_id)
-    mins = int((until - time.time()) // 60)
-    await msg.reply_text(
-        _("⏩ auto-approve включён в этой ветке на ~{mins} мин (до {until})").format(mins=mins, until=format_burst_local(until))
-    )
-
-
 def _effort_for(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, target_key: str) -> str:
     """Effort для конкретного чата/ветки: per-chat override или дефолт из cfg.
     Override переживает рестарт (state/effort_overrides.json, с 22.10.2026);
@@ -639,18 +596,24 @@ def _scope_note(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> str | None:
 
 async def _workshop_forward(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: str,
                             thread_id: int | None, reply: str, failed: bool, question: str = "",
-                            loud: bool = False) -> None:
+                            loud: bool = False, brief: bool = False) -> None:
     """Итог рана мастерской в личку: первая строка итога и суть, ссылка на тему
     за подробностями; вопрос мастерской отдельной строкой в конце, обрезка
     его не съедает. Сбой рана со звуком, даже если ран тихий (поиск, наряд);
     итог с меткой <<LOUD>> тоже со звуком (сторож билетов на подтверждённую
-    цену, 05.11.2026), обычный итог без."""
+    цену, 05.11.2026), обычный итог без. brief: только первый абзац итога
+    (поручение на время: Ивану строка, ответ целиком в теме и файле, решение
+    Ивана 27.11.2026)."""
     text = reply.strip() or _("(пустой ответ)")
+    otk = _is_otklik_topic(cfg, chat_key)
+    if brief and not failed:
+        head_par, _sep, rest = text.partition("\n\n")
+        if rest.strip():
+            text = head_par.rstrip() + (_("\n… целиком в теме откликов") if otk else _("\n… целиком в теме мастерской"))
     # Предел Telegram в единицах UTF-16 (эмодзи по две), а не в знаках.
     if utf16_len(question) > cfg.telegram_text_limit // 4:
         question = split_for_telegram(question, cfg.telegram_text_limit // 4)[0].rstrip() + "…"
     cap = cfg.telegram_text_limit - 200 - utf16_len(question)
-    otk = _is_otklik_topic(cfg, chat_key)
     if utf16_len(text) > cap:
         text = split_for_telegram(text, cap)[0].rstrip() + (_("\n… целиком в теме откликов") if otk else _("\n… целиком в теме мастерской"))
     if question:
@@ -830,8 +793,9 @@ def _is_otklik_topic(cfg: Any, chat_key: str) -> bool:
 
 
 def _is_background(cfg: Any, chat_key: str) -> bool:
-    """Фоновая тема (мастерская или отклики): Ивана в ней нет, карточки,
-    тревога и итог идут в личку, вопрос текстом, метки «позже» нет."""
+    """Фоновая тема (мастерская или отклики): Ивана в ней нет, карточки
+    одобрения, тревога и итог идут в личку (итог рана откликов с 27.11.2026
+    только при сбое), вопрос текстом, метки «позже» нет."""
     return chat_key in background_chat_keys(cfg)
 
 
@@ -930,11 +894,13 @@ async def _drop_session_for_scope_change(ctx, chat_key, msg) -> bool:
               "Сначала /cancel, потом повторите команду.")
         )
         return False
-    async with lock:
-        sessions.remove(chat_key)
-        # Эпоха, а не только модель сессии: иначе кнопка вопроса старой
-        # сессии ответила бы в новую, уже под другим скоупом (ревью 12.10.2026).
-        _bump_session_epoch(ctx, chat_key)
+    # Без ожидания замка, как в _reset_session: только что отпущенный замок
+    # достаётся сперва ждущему рану (ревью 27.11.2026). Между проверкой и
+    # записью await нет.
+    sessions.remove(chat_key)
+    # Эпоха, а не только модель сессии: иначе кнопка вопроса старой
+    # сессии ответила бы в новую, уже под другим скоупом (ревью 12.10.2026).
+    _bump_session_epoch(ctx, chat_key)
     return True
 
 
@@ -1551,9 +1517,9 @@ async def on_forum_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             sessions: SessionStore | None = ctx.application.bot_data.get("sessions")
             lock = _chat_lock(ctx, chat_key)
             if sessions is not None and not lock.locked():
-                async with lock:
-                    dropped = sessions.remove(chat_key)
-                    _bump_session_epoch(ctx, chat_key)
+                # Без ожидания замка, как в _reset_session (ревью 27.11.2026).
+                dropped = sessions.remove(chat_key)
+                _bump_session_epoch(ctx, chat_key)
                 if dropped:
                     log.info("topic renamed, claude session reset: %s", chat_key)
                     try:
@@ -1787,9 +1753,11 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         _("Привет. user_id={user_id}, ты в whitelist.\n"
-        "Чтение идёт без карточек. Перед изменениями агент присылает одну карточку «📋 План», "
-        "после ✅ шаги этого запуска идут без карточек. Отдельной карточкой всегда: отправка "
-        "от твоего имени людям. Codex (`gpt:` и запасной путь) "
+        "Чтение и изменения идут без карточек. Карточкой идёт отправка людям от твоего имени "
+        "через MCP (Telegram, Gmail, Slack) и mailsend, выдача им доступа через MCP и необратимое "
+        "на сервере заказчика вне живого разговора и рана поручения. Из фона отправка людям и "
+        "такое необратимое получают отказ. "
+        "Codex (`gpt:` и запасной путь) "
         "работает в своей песочнице без карточек.\n\n"
         "Пока идёт ответ:\n"
         "«стоп» или /cancel: остановить; «ничего не отправляй»: остановить и ждать\n"
@@ -1803,7 +1771,6 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/plan <задача>: сначала план с кнопками, выполнение после ✅\n"
         "/task <что сделать>: отдельная тема задачи в группе «Новостей» (обсуждение, "
         "проект под «▶️ Делай», выполнение, итог)\n"
-        "/auto [15m|1h|off]: окно без карточек в этой теме (по умолчанию 15m, максимум 1h)\n"
         "/compose … /go: накопить сообщения и отправить одним\n"
         "/at 45m|14:30 <текст>: отложенный запрос (/at: список, /at cancel <id>)\n"
         "/resume: подцепить одну из последних сессий, /export: сессию в Markdown, "
@@ -1855,24 +1822,38 @@ async def _reset_session(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, chat_key: 
         # это явное блокирующее админ-действие.
         procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
         proc = procs.get(chat_key)
-        if proc is not None and proc.returncode is None:
-            _mark_user_stop(ctx, chat_key)
+        # Отметка до первого await и без процесса: ран, чей процесс ещё не
+        # создан (вход, запуск), по ней сессию не запишет (run_claude,
+        # user_stopped); до старта его снимают _prestart_cancel и отмена
+        # взятой пачки ниже.
+        _mark_user_stop(ctx, chat_key)
+        killed = bool(_prestart_cancel(ctx, chat_key))
+        taken = ctx.application.bot_data.get("turn_packs_taken", {}).get(chat_key)
+        if taken is not None and not taken.started and not taken.cancelled:
+            # Взятая пачка без процесса: гасит её старт (on_run_start), как
+            # /cancel, иначе её целый ответ пришёл бы как «остановлен».
+            taken.cancelled = True
+            killed = True
+        # store.remove СРАЗУ, до ожидания убийства и не дожидаясь lock:
+        # asyncio.Lock отдаёт его FIFO, и сообщение, уже стоящее в очереди,
+        # получило бы lock раньше нас, с --resume только что «сброшенной»
+        # сессии, а подтверждение reset висело бы до конца того рана (ревью
+        # Codex 27.11.2026: снятый ран отпускал замок, пока мы ждали). Убитый
+        # run вернётся без store.set, очередное сообщение начнёт свежую сессию.
+        prev = store.remove(chat_key)
+        _bump_session_epoch(ctx, chat_key)
+        # procs.running: claude мог уже выйти, а его фоновый внук держит вывод.
+        if procs_mod.running(proc):
             await _terminate_and_wait(chat_key, proc)
             killed = True
             # Pending approvals убитой сессии гасит сам обработчик сообщения
             # после возврата run_claude (deny:claude-exited) — дублировать не нужно.
-        # store.remove СРАЗУ, не дожидаясь lock: asyncio.Lock отдаёт его FIFO,
-        # и сообщение, уже стоящее в очереди, получило бы lock раньше нас —
-        # с --resume только что «сброшенной» сессии, а подтверждение reset
-        # висело бы до конца того рана. Убитый run вернётся по signal-пути
-        # (rc=-15) без store.set, очередное сообщение начнёт свежую сессию.
+    else:
+        # Без ожидания замка: только что отпущенный замок (locked() уже False)
+        # достаётся сперва ждущему рану, и тот взял бы старую сессию (ревью
+        # Codex 27.11.2026). Между проверкой и записью await нет.
         prev = store.remove(chat_key)
         _bump_session_epoch(ctx, chat_key)
-    else:
-        async with lock:
-            # sync — SessionStore не thread-safe на read-modify-write (см. claude_runner).
-            prev = store.remove(chat_key)
-            _bump_session_epoch(ctx, chat_key)
     note = _(" · активный claude прибит") if killed else ""
     return _("Сессия сброшена (была: {prev}){note}. "
              "Следующее сообщение начнёт новый разговор.{revert}").format(
@@ -1932,7 +1913,7 @@ async def on_key_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # вопрос после рестарта (реестр в памяти) и вопрос про уже другой ран
     # ничего не прибивают; тема не собирается заново из сообщения кнопки.
     proc = ctx.application.bot_data["procs"].get(chat_key)
-    pid = proc.pid if proc is not None and proc.returncode is None else 0
+    pid = proc.pid if procs_mod.running(proc) else 0
     token = uuid.uuid4().hex[:8]
     ctx.application.bot_data.setdefault("keys_resets", {})[token] = (
         chat_key, _session_epoch(ctx, chat_key), pid)
@@ -1966,7 +1947,7 @@ async def on_keys_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         chat_key, epoch, pid = entry
         proc = ctx.application.bot_data["procs"].get(chat_key)
-        live = proc is not None and proc.returncode is None
+        live = procs_mod.running(proc)
         if epoch != _session_epoch(ctx, chat_key):
             text = _("Сессия уже сброшена")
         elif _chat_lock(ctx, chat_key).locked() and not (live and proc.pid == pid):
@@ -1999,7 +1980,9 @@ async def on_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, nosend: b
         chat_key = cfg.otklik_chat_key
     procs: dict[str, asyncio.subprocess.Process] = ctx.application.bot_data["procs"]
     proc = procs.get(chat_key)
-    if proc is None or proc.returncode is not None:
+    # Не returncode лидера: claude мог выйти, а его фоновый внук держать вывод
+    # и ран (решение Ивана 27.11.2026: гасить и его).
+    if not procs_mod.running(proc):
         # Сообщение, ещё ждущее склейки, и есть то, что отменяют: иначе бот
         # ответил бы «нет процесса», а запрос ушёл бы следом.
         dropped = (_gather_cancel(ctx, chat_key) + _pack_cancel(ctx, chat_key)
@@ -2158,7 +2141,7 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sid = _current_sid(ctx, chat_key)
     proc = procs.get(chat_key)
     proc_line = "idle"
-    if proc is not None and proc.returncode is None:
+    if procs_mod.running(proc):
         proc_line = f"running pid={proc.pid}"
         side = ctx.application.bot_data.get("foreign_running", {}).get(chat_key)
         if isinstance(side, str) and side.startswith("deal:"):
@@ -2171,12 +2154,6 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uptime = _("{h} ч {m} мин").format(h=up_min // 60, m=up_min % 60)
     pending_count = registry.pending_count
     openai_ok = ctx.application.bot_data.get("openai") is not None
-    burst_until = burst_until_ts(ctx, chat_key)
-    burst_line = (
-        _("включён до {until}").format(until=format_burst_local(burst_until))
-        if burst_until > time.time()
-        else _("выключен")
-    )
     # Скоупинг проекта по имени темы — показываем, что бот «думает» про эту тему
     # (помогает поймать промах кэша имён: тема создана пока бот лежал и т.п.).
     project_line = "—"
@@ -2195,7 +2172,7 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     model_cur = _model_label(ctx, cfg, chat_key)
     memory_line = await _memory_status_line()
     workshop_line = _workshop_status(ctx, cfg) + _otklik_status(ctx, cfg) + _cost_day_line(ctx)
-    head = _status_headline(ctx, chat_key, proc is not None and proc.returncode is None) + "\n"
+    head = _status_headline(ctx, chat_key, procs_mod.running(proc)) + "\n"
     limit = limits.summary()
     if limit:
         head += _("лимит подписки: {limit}").format(limit=limit) + "\n"
@@ -2209,13 +2186,12 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
           "scope (ручная /scope): {scope_line}\n"
           "model (эта ветка): {model}\n"
           "effort (эта ветка): {effort}\n"
-          "auto-approve (эта ветка): {burst_line}\n"
           "pending approvals (всего по боту): {pending_count}\n"
           "voice: {voice}\n"
           "memory: {memory_line}").format(
             uptime=uptime, chat_key=chat_key, sid=sid[:8] if sid else '—', proc_line=proc_line,
             project_line=project_line, scope_line=scope_line, model=model_cur,
-            effort=_effort_for(ctx, cfg, chat_key), burst_line=burst_line,
+            effort=_effort_for(ctx, cfg, chat_key),
             pending_count=pending_count, voice='on' if openai_ok else 'off',
             memory_line=memory_line)
     )
@@ -2280,9 +2256,19 @@ def _drain_defer(ctx: ContextTypes.DEFAULT_TYPE, update: Update, prompt: str, *,
     payload.update(pieces=pieces, prompt=_DRAIN_JOINER.join(t for _ts, t in pieces),
                    voice=bool(payload.get("voice")) or voice,
                    rids=[*payload.get("rids", []), *own_rids])
+    # Сбой записи файла: память возвращается к снимку (снятые записи и
+    # прежний вид своей, в прежнем порядке: _drained_find берёт первую), как
+    # в tg_at.at_put; форма at_put не годится: запись может быть найденной и
+    # в очередь не ставится. Иначе следующая запись файла потеряла бы отложенное.
+    snapshot = dict(store.data)
     for old in replaces:
         store.data.pop(old, None)
-    store.set(jid, json.dumps(payload, ensure_ascii=False))
+    try:
+        store.set(jid, json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        store.data.clear()
+        store.data.update(snapshot)
+        raise
     state_dir = _inflight_dir(ctx.application)
     for rid in own_rids:
         inflight.remove(state_dir, rid)
@@ -2742,12 +2728,11 @@ async def _dispatch_to_claude_impl(
     step_note: str = "",
     later_about: str = "",
     at_jid: str | None = None,
+    live: bool = True,
 ) -> bool | None:
     """unattended=True — запуск без человека за клавиатурой (/at, /event, /plan-режим):
     ручной триггер «gpt:» игнорируется (Codex не проходит через approve-hook и
-    в ручном режиме получает workspace-write), а открытое окно /auto на такой
-    ран не распространяется — иначе внешнее событие с чужим текстом выполняло бы
-    Bash/Write без единой карточки.
+    в ручном режиме получает workspace-write).
     untrusted=True: ран по чужому тексту (/event untrusted), только чтение и
     ответ текстом (claude_runner.UNTRUSTED_ASK_TOOLS), без codex-фоллбэка
     и без отправки файлов по SEND_FILE.
@@ -2849,7 +2834,9 @@ async def _dispatch_to_claude_impl(
     # у остальных свои сверки и права под замком (план, задача, дело, событие,
     # чужой текст, «gpt:»), они ждут замка каждый сам.
     joinable = (
-        not unattended and not untrusted and not forced_codex and deal is None
+        # live: обдумывание задачи (live=False) в пачку живого сообщения не
+        # вливается, иначе получило бы его пометку live_sids (этап 1 защит).
+        live and not unattended and not untrusted and not forced_codex and deal is None
         and exec_task is None and still_wanted is None and on_run_start is None
         and reply_sink is None and reply_sent is None and not deferred and fresh is False
         and expect_plan is None and event_ref is None and not limit_retry
@@ -2892,6 +2879,7 @@ async def _dispatch_to_claude_impl(
     long_wait = (_wait_note(ctx, chat_key, msg, pack)
                  if notice is not None and chat_key == str(getattr(cfg, "primary_chat_id", "")) else None)
     async with _typing_indicator(ctx.bot, chat_id), _counted_lock(ctx, cfg, chat_key, lock, prompt_text, long_wait):
+        run_wall = datetime.now(local_zone())   # под замком темы: сбой отклика именно этого рана
         if notice is not None:
             # Уже в очереди: дождаться уведомления, чтобы «встанет в очередь»
             # не пришло после ответа на этот же запрос; дождавшись, убрать.
@@ -3305,7 +3293,7 @@ async def _dispatch_to_claude_impl(
             # Отметки «после факта» этого рана копятся для футера
             # (approval.add_run_note). Мастерская заглушена: там прежние сообщения.
             run_notes: dict[str, list] = ctx.application.bot_data.setdefault(RUN_NOTES, {})
-            notes_key = burst_target_key(chat_id, thread_id)
+            notes_key = origin_chat_key(chat_id, thread_id)
             notes_bucket: list | None = None
             if not _is_background(cfg, chat_key):
                 notes_bucket = run_notes[notes_key] = []
@@ -3345,10 +3333,27 @@ async def _dispatch_to_claude_impl(
                         ctx.application.bot_data.setdefault("untrusted_sids", set())
                         if untrusted else None
                     ),
+                    # Ран строки поручения Домового: хук не откажет ему в
+                    # необратимом у заказчика (этап 1 защит, 27.11.2026).
+                    poruch_sids=(
+                        ctx.application.bot_data.setdefault("poruch_sids", set())
+                        if unattended and not untrusted and (event_ref or {}).get("poruch") is True
+                        else None
+                    ),
+                    # Ран, начатый Иваном сейчас: необратимое у заказчика без
+                    # карточки. Отложенное на диске (/at, отклик по таймеру,
+                    # перенос на перезапуск) им не считается, кроме хода дела.
+                    live_sids=(
+                        ctx.application.bot_data.setdefault("live_sids", set())
+                        if live and not unattended and not untrusted and (not deferred or deal is not None)
+                        else None
+                    ),
                     show_chat_key=str(cfg.primary_chat_id) if _is_background(cfg, chat_key) else "",
                     on_session_start=_session_started,
                     on_run_start=run_start_cb,
                     should_stop=lambda: bool(ctx.application.bot_data.get("stopping")),
+                    # Пачку, снятую /cancel до создания процесса, тоже снял Иван.
+                    user_stopped=lambda: stop_mark.stopped or (pack is not None and pack.cancelled),
                     unexited=unexited,
                     fork_at=deal.get("fork_at") if deal is not None else None,
                     fresh_retry=deal is None,
@@ -3418,7 +3423,11 @@ async def _dispatch_to_claude_impl(
                 _task_exec_finish(cfg, exec_task, result, bool(ctx.application.bot_data.get("stopping")))
             if result.auth_error == "claude":
                 await _offer_login(update, ctx, "claude")
+            # Ран снял Иван: его ответ не уходит в GPT ни по лимиту, ни по сбою
+            # (итог-ошибка с кодом 0 у рана, снятого после выхода claude).
+            stopped_by_ivan = (stop_mark is not None and stop_mark.stopped) or (pack is not None and pack.cancelled)
             if (result.is_error and result.limit_hit and allow_codex_fallback
+                    and not stopped_by_ivan
                     and not ctx.application.bot_data.get("stopping")):
                 # Исчерпана подписка: до общего перехода на Codex. Codex только
                 # разговаривает и только на сообщение Ивана, остальное ждёт
@@ -3432,6 +3441,7 @@ async def _dispatch_to_claude_impl(
             elif (
                 result.is_error
                 and not untrusted
+                and not stopped_by_ivan
                 # Остановка бота: codex, запущенный после неё, обрывал бы
                 # рестарт так же, как claude (ревью 11.10.2026).
                 and not ctx.application.bot_data.get("stopping")
@@ -3477,7 +3487,8 @@ async def _dispatch_to_claude_impl(
                         unexited=unexited)
                     codex_fallback = True
             elif (result.is_error and not allow_codex_fallback and _is_claude_unavailable(result)
-                  and deal is None and not ctx.application.bot_data.get("stopping")):
+                  and deal is None and not stopped_by_ivan
+                  and not ctx.application.bot_data.get("stopping")):
                 # Одобренный план в GPT не уходит: там нет карточек, а песочница
                 # с записью (проект шага 3, 1.8). Выполнение стоит, Иван решает сам.
                 # Прежняя ✅ уже не действует: в тексте путь повтора (ревью 14.10).
@@ -3538,7 +3549,12 @@ async def _dispatch_to_claude_impl(
         # 19.10.2026). Маркеры проекта и вопроса действуют только у последнего
         # ответа: прежний следующий мог отменить (ревью Codex 19.10).
         earlier = list(texts)
-        if not codex_fallback and earlier[-1] == result.text:
+        # Ответ рана, снятого Иваном после выхода claude, это последний текст
+        # с пометкой спереди (run_claude, user_stopped); при остановке бота
+        # ответом стала весть о перезапуске, и последний текст остаётся.
+        if not codex_fallback and (result.text == earlier[-1] or (
+                result.signalled and result.text.endswith("\n\n" + earlier[-1])
+                and not ctx.application.bot_data.get("stopping"))):
             earlier.pop()
         earlier = [extract_later_marker(extract_voice_marker(extract_quiet_marker(extract_loud_marker(
                        extract_ask_markers(tasks.extract_do(t)[1])[1])[1])[1])[1])[1]
@@ -3568,6 +3584,12 @@ async def _dispatch_to_claude_impl(
     # Метки-флаги до LATER: тот срабатывает, только если стоит последним.
     voice_asked, reply = extract_voice_marker(reply)
     later, reply = extract_later_marker(reply)
+    if user_stop and result.is_error:
+        # Ответ рана, снятого Иваном (и итог-ошибка с кодом 0): показать, но не
+        # исполнять его метки (вопрос кнопками, файлы, «позже», громко,
+        # голосом), как у прежних текстов снятого рана.
+        files_to_send, asks, later = [], [], None
+        loud = voice_asked = False
     if voice_asked and not send_voice_reply:
         if untrusted or unattended or deal is not None:
             # Голос просит только сам Иван в живом ране: метка из чужого текста
@@ -3582,7 +3604,9 @@ async def _dispatch_to_claude_impl(
     # ответ, ведь в чат уходит только последний текст рана (решение 22.10.2026).
     reply = soften_dashes(reply)
     asks = [(soften_dashes(q), [soften_dashes(o) for o in opts]) for q, opts in asks]
-    # Мастерская и тема откликов: ведут себя одинаково (итог в личку и прочее).
+    # Мастерская и тема откликов: ведут себя одинаково (вопрос текстом, итог в
+    # личку), кроме итога темы откликов: он в личку только при сбое, вопросе,
+    # звуке, ответе GPT и неотправленном одобренном (ниже).
     workshop = _is_background(cfg, chat_key)
     ws_question = ""
     if quiet_stop:
@@ -3662,20 +3686,31 @@ async def _dispatch_to_claude_impl(
         # До отправки: сбой Telegram не теряет итог выполнения задачи (ревью
         # Codex 16.10).
         reply_sink.append((full_reply, plan_snapshot, not result.is_error and not codex_fallback))
-    if workshop and unattended and quiet and not (result.is_error or loud or ws_question or codex_fallback):
+    if (workshop and unattended and quiet and not (result.is_error or loud or ws_question or codex_fallback)
+            and (event_ref or {}).get("poruch") is not True):
         # Итог фонового рана с меткой <<QUIET>> рядом с текстом остаётся в теме
         # и в личку не идёт: подготовка утра Домового писала отчёт и метку, а бот
         # пересылал его каждое утро (замер 20-26.11.2026). Сбой, звук, вопрос и
         # ответ запасного GPT доходят; ран по кнопке Ивана (✅) пересылается
-        # всегда: итог там его подтверждение.
+        # всегда: итог там его подтверждение. Итог поручения на время нужен
+        # всегда (domovoy/poruch.py, silent: false), метка его не глушит.
         log.info("workshop forward skipped: quiet chat=%s", chat_key)
+    elif (workshop and _is_otklik_topic(cfg, chat_key)
+          and not (result.is_error or loud or ws_question or codex_fallback)
+          and not await _otklik_report_to_primary(cfg, chat_key, run_wall)):
+        # Отчёт об отправке остаётся в теме откликов: там карточки, и Иван читает
+        # её (решение Ивана 27.11.2026). В личку только сбой (и отмеченный
+        # агентом сбой отправки, и оставшийся одобренным неотправленный
+        # отклик), звук, вопрос, ответ запасного GPT и отправка ответа человеку
+        # (`otklik new --person`: его карточка в личке).
+        log.info("otklik forward skipped: report stays in topic chat=%s", chat_key)
     elif workshop and (unattended or from_callback):
         # Наряд, поиск, ✅: Ивана в теме нет, итог тихо в личку; сбой и итог с
         # меткой <<LOUD>> (снята с текста выше) со звуком. До отправки в тему:
         # её сбой итог не съест.
         await _workshop_forward(ctx, cfg, chat_key, thread_id,
                                 reply[:-len(ws_question)] if ws_question else reply, result.is_error, ws_question,
-                                loud=loud)
+                                loud=loud, brief=(event_ref or {}).get("poruch") is True)
     voiced = False
     # Метка звука: в тихом ране со звуком только сам ответ, файлы, футер и
     # кнопки остаются тихими (replies.extract_loud_marker).
@@ -3825,7 +3860,7 @@ def _something_to_stop(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> bool:
     «не отправляй» это ответ на вопрос Claude и идёт ему (ревью 29.10.2026)."""
     proc = ctx.application.bot_data["procs"].get(chat_key)
     at_jobs = ctx.application.bot_data.get("at_jobs")
-    return bool((proc is not None and proc.returncode is None) or _chat_lock(ctx, chat_key).locked()
+    return bool(procs_mod.running(proc) or _chat_lock(ctx, chat_key).locked()
                 or _gather_pending(ctx, chat_key) or _turn_packs(ctx).get(chat_key)
                 or (at_jobs is not None and _drained_find(at_jobs, chat_key) is not None))
 
@@ -4010,7 +4045,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             into_pack.items.append(PackItem(_news_context(cfg, msg, text), msg, voice=voice_trigger))
         else:
             into_pack = None
-        if lock.locked() and proc is not None and proc.returncode is None:
+        if lock.locked() and procs_mod.running(proc):
             # Сохраняем sid убиваемого рана: run_claude в signal-ветке store.set
             # не делает, и поправка стартовала бы ЧИСТУЮ сессию без контекста
             # (частый случай: первое сообщение в теме, после idle-TTL, /reset).
@@ -4027,7 +4062,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             note = _("⏹ прерываю текущий ран, поправка уйдёт следом…")
             if queued:
                 note += _("\n⚠️ перед ней в очереди ещё {count} сообщ. — /cancel их не трогает").format(count=queued)
-            await msg.reply_text(note)
+            # Сбой показа не отменяет прерывания: отметка уже стоит, и целый
+            # ответ рана иначе пришёл бы как «остановлен» (ревью Codex 27.11.2026).
+            with contextlib.suppress(Exception):
+                await msg.reply_text(note)
             await _terminate_and_wait(chat_key, proc)
             # Пока мы ждали смерти процесса, мог пройти /reset force и снести
             # сессию намеренно — тогда восстанавливать её нельзя (иначе сброс
@@ -4634,14 +4672,14 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _unused, approval_id, decision = data.split(":", 2)
     except ValueError:
         return
-    # "auto" — это allow + активация burst-окна для той же Claude session.
-    # Hook'у возвращаем "allow",
-    # пользователю показываем оба факта (approve конкретный + окно открыто).
-    burst_activated_until: float | None = None
-    burst_duration = burst_duration_for_decision(decision)
-    # Отправка от имени Ивана: решение только с её собственной карточки и без
-    # окна ⏩ (кнопок окна на ней нет, подставленный callback окно не
-    # откроет). Ревью Codex 12.10.2026.
+    # Окно ⏩ снято 27.11.2026 (этап 3 защит): решений, кроме ✅ и ❌, нет;
+    # ⏩ на старой (уже не ждущей) карточке только снимает её кнопки.
+    if decision not in ("allow", "deny"):
+        if registry.get(approval_id) is None:
+            await buttons.strip_buttons(query)
+        return
+    # Отправка от имени Ивана: решение только с её собственной карточки.
+    # Ревью Codex 12.10.2026.
     # Карточка плана так же: её ✅ выдаёт права на весь запуск (ревью Codex 29.10).
     pending_now = registry.get(approval_id)
     if pending_now is not None and (outbound.is_send(pending_now.tool_name)
@@ -4654,19 +4692,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 or msg.chat_id != expected_chat):
             log.warning("approve: aid=%s отправки нажат не с его карточки", approval_id)
             return
-        if burst_duration is not None:
-            log.warning("approve: aid=%s окно ⏩ для отправки не открывается", approval_id)
-            return
-    # Отправка людям мимо карточки отправки: кнопок окна на карточке нет, окно
-    # не открывается.
-    if (pending_now is not None and getattr(pending_now, "sends", False)
-            and burst_duration is not None):
-        log.warning("approve: aid=%s окно ⏩ для отправки не открывается", approval_id)
-        return
     # ✅ только по карточке, которую нарисовал бот: текст, кнопки и сущности
     # текста. Агент знает ключ бота и мог переписать карточку или подписи
     # кнопок через Bot API (проект 03.11.2026, п. 4). ❌ не сверяется.
-    if (pending_now is not None and (decision == "allow" or burst_duration is not None)
+    if (pending_now is not None and decision == "allow"
             and not card_matches(pending_now, query.message)):
         log.warning("approve: aid=%s карточка в Telegram не та, что отправил бот", approval_id)
         registry.resolve(approval_id, CARD_CHANGED)
@@ -4679,8 +4708,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             log.exception("failed to report changed approval card")
         return
-    decision_for_hook = "allow" if burst_duration is not None else decision
-    resolved = registry.resolve(approval_id, decision_for_hook)
+    resolved = registry.resolve(approval_id, decision)
     if resolved is None:
         # Кнопок уже нет (второе нажатие той же карточки) или снять не
         # вышло: молча, как раньше.
@@ -4693,24 +4721,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             log.warning("closed approval card reply failed aid=%s", approval_id, exc_info=True)
         return
-    if burst_duration is not None:
-        chat = update.effective_chat
-        chat_id = resolved.target_chat_id
-        if chat_id is None:
-            if chat is None:
-                return
-            chat_id = chat.id
-        thread_id = resolved.target_thread_id
-        if thread_id is None and query.message and query.message.is_topic_message:
-            thread_id = query.message.message_thread_id
-        # Карточка мастерской показана в личке, а окно открывается её теме
-        # (origin_key); уведомление о конце окна придёт туда же, где карточка.
-        target_key = getattr(resolved, "origin_key", "") or burst_target_key(chat_id, thread_id)
-        burst_activated_until = burst_set(ctx, target_key, burst_duration, chat_id, thread_id)
-    if burst_activated_until is not None:
-        line = _("⏩ одобрено, окно без карточек до {until}").format(
-            until=format_burst_local(burst_activated_until))
-    elif decision_for_hook == "allow":
+    if decision == "allow":
         line = _("✅ одобрено")
     else:
         line = _("❌ отклонено")
@@ -5102,8 +5113,6 @@ def build_app(cfg: Config) -> Application:
     # Реакции Ивана до следующего хода лички и вопросы под кнопкой проверки Кодексом.
     app.bot_data["reaction_notes"] = PersistentDict(cfg.state_dir / "reaction_notes.json")
     app.bot_data["codex_checks"] = PersistentDict(cfg.state_dir / "codex_checks.json")
-    app.bot_data["burst_until_by_target"] = {}
-    app.bot_data["burst_expiry_tasks"] = {}
     # ~EDITED: правка отправленного сообщения не должна ни ронять обработчики
     # (update.message=None → AttributeError), ни ПОВТОРНО выполнять команды —
     # правка старого «/reset force» убивала бы живую сессию. Правку обычного
@@ -5117,7 +5126,6 @@ def build_app(cfg: Config) -> Application:
     app.add_handler(CommandHandler("reset", on_reset, filters=own_command))
     app.add_handler(CommandHandler("cancel", on_cancel, filters=own_command))
     app.add_handler(CommandHandler("status", on_status, filters=own_command))
-    app.add_handler(CommandHandler("auto", on_auto, filters=own_command))
     app.add_handler(CommandHandler("effort", on_effort, filters=own_command))
     app.add_handler(CommandHandler("model", on_model, filters=own_command))
     app.add_handler(CommandHandler("scope", on_scope, filters=own_command))

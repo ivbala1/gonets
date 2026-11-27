@@ -2,9 +2,9 @@
 
 Gonets is a Telegram bridge to [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
 that runs on your own machine as an always-on service. Every message you send
-starts `claude -p --resume` in your workspace, and every risky tool call comes
-back to your phone as an approval card with a risk estimate. You approve or
-reject it with one tap.
+starts `claude -p --resume` in your workspace, and sending to people on your
+behalf through MCP servers or the bundled SMTP sender comes back to your phone
+as an approval card with the recipients and the full text. You approve or reject it with one tap.
 
 *Gonets* (гонец) is Russian for "messenger". It was written for one person who
 runs a coding agent all day and wanted to keep working from a phone without
@@ -42,13 +42,13 @@ has to ask before it sends anything to people on your behalf.
 - **Approval cards only for sending to people.** A `PreToolUse` hook posts
   every `Bash`, `Monitor`, `Write`, `Edit`, `WebFetch` and MCP call to the bot
   over loopback HTTP. Everything passes without a card except sending to
-  people on your behalf: messages and files, GitHub comments and pull
-  requests, mail from the shell, invitations and sharing. The model protects
+  people on your behalf through MCP servers and the bundled SMTP sender, and
+  sharing or invitations. Shell commands are not parsed for sending. The model protects
   against honest agent mistakes, not against a hijacked agent; there is no
   read-only stage and no risk estimate of shell commands.
 - **Outbound messages always ask.** Sending as you (Telegram, Gmail and Slack
   MCP servers, or the bundled SMTP sender) always shows a card with recipients,
-  full text and attachments, even inside auto-approve windows. The SMTP sender
+  full text and attachments, even in auto-approve chats. The SMTP sender
   only sends the exact bytes that were on the approved card.
 - **Every decision goes to an append-only audit log.** Writes inside
   whitelisted directories and memory writes get a short note in the chat.
@@ -122,7 +122,7 @@ sequenceDiagram
     Bot->>CC: prompt via stdin, session per chat/topic
     CC->>Hook: tool call (Bash, Edit, MCP...)
     Hook->>Bot: POST 127.0.0.1/approve
-    Bot->>You: card: risk, agent's note, full input
+    Bot->>You: card (sending, sharing): agent's note, full input
     You->>Bot: ✅ or ❌
     Bot->>Hook: allow / deny
     Hook->>CC: decision
@@ -192,12 +192,14 @@ run it.
 - **Who can talk to it.** Only user ids from `TELEGRAM_ALLOWED_USER_IDS`.
   Without `TELEGRAM_ALLOWED_CHAT_IDS` it answers in private chats only, so
   adding it to a group by mistake does nothing.
-- **What the card protects.** Sending to people on your behalf waits for your
-  tap. Everything else passes: the bot protects against agent mistakes in
+- **What the card protects.** Sending to people on your behalf through MCP
+  servers and the bundled SMTP sender, and sharing or invitations through MCP,
+  wait for your tap. Everything else passes: the bot protects against agent mistakes in
   what it sends, not against a hijacked agent.
-- **What bypasses the card.** The auto-approve settings above, the `/auto`
-  window you open yourself, and background runs (`/at`, `/event` with `wake`),
-  which cannot wait for a tap. Outbound messages still ask. Codex has no hooks
+- **What bypasses the card.** The auto-approve settings above and background
+  runs (`/at`, `/event` with `wake`), which cannot wait for a tap. Sending through MCP servers and the bundled
+  SMTP sender still asks (and is refused in background runs); sending from
+  shell commands (`gh`, `curl`, `msmtp`) is not checked at all. Codex has no hooks
   at all and is limited only by its own sandbox; with
   `CODEX_NETWORK_ACCESS=true` it can make network requests without asking.
 - **Prompt injection.** Anything the agent reads (web pages, mail, chat

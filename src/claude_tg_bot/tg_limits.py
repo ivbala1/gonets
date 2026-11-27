@@ -6,7 +6,6 @@ import dataclasses
 import json
 import logging
 import time
-import uuid
 from typing import Any, Callable, Collection
 
 from telegram.ext import ContextTypes
@@ -52,22 +51,17 @@ def _limit_defer(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str, chat_id: int, th
     if expires_at is not None and float(expires_at) <= fire_at:
         # Событие со сроком (поиск в своём окне) после сброса уже не нужно.
         return False
-    jid = uuid.uuid4().hex[:6]
     payload = {"chat_key": chat_key, "chat_id": chat_id, "thread_id": thread_id,
                "fire_at": fire_at, "prompt": prompt, "limit_retry": retry}
     # Событие с диска передаёт заданию id, срок и тишину: после рестарта оно не
     # будится второй раз, а задание само проверит срок (ревью Codex 22.10.2026).
     payload.update({k: v for k, v in (event_ref or {}).items() if v is not None})
-    popped = {old: store.data.pop(old) for old in replaces if old in store.data}
     try:
-        store.set(jid, json.dumps(payload, ensure_ascii=False))
-        _b._schedule_at_job(ctx.application, jid, payload)
+        jid = _b.at_put(ctx.application, payload, replaces)
     except Exception:
         # Готовый ответ важнее отложенного задания: он уходит с пометкой.
+        # Исходное at_put вернул, его снимет владелец, как без переноса.
         log.exception("limit: deferral failed chat=%s", chat_key)
-        store.data.update(popped)  # исходное снимет его владелец, как без переноса
-        with contextlib.suppress(Exception):
-            store.remove(jid)
         return False
     log.info("limit: deferred chat=%s jid=%s until=%s retry=%d", chat_key, jid, limits.clock(fire_at), retry)
     return True

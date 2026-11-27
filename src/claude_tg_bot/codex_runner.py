@@ -25,6 +25,7 @@ argv: иначе промпт, начинающийся с `--`, разобра�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -62,10 +63,11 @@ class CodexResult:
 def _read_and_unlink(path: Path) -> str:
     """Прочитать last-message файл и удалить его. Пусто, если файла/контента нет."""
     try:
-        text = path.read_text().strip()
+        # Ответ, оборванный по сроку, может кончаться неполным знаком UTF-8.
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         text = ""
-    finally:
+    with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
     return text
 
@@ -189,8 +191,10 @@ async def run_codex(
             errors.append(str(error.get("message", "") if isinstance(error, dict) else error))
     diagnostic = "\n".join(errors) + "\n" + (stderr.decode(errors="replace") if stderr else "")
     # Чистый финальный ответ из файла; на таймауте codex мог успеть записать
-    # частичный ответ — читаем его прежде чем сдаться. Fallback — хвост stdout.
+    # частичный ответ, читаем его прежде чем сдаться. Нет ответа: хвост
+    # ошибок из событий и stderr, и это ошибка рана даже при коде 0.
     answer = _read_and_unlink(last_msg)
+    empty = not answer
 
     if timed_out:
         if answer:
@@ -204,9 +208,12 @@ async def run_codex(
     if not answer:
         answer = diagnostic.strip()[-3000:] or _("[codex: пустой ответ]")
 
-    if proc.returncode != 0 or turn_failed:
-        auth_error = is_auth_error(diagnostic)
-        log.error("codex rc=%s auth_error=%s", proc.returncode, auth_error)
+    if proc.returncode != 0 or turn_failed or empty:
+        # Пустой ответ при коде 0 без turn.failed: ход кончился, временная
+        # ошибка входа в событиях (повтор удался) не значит «войди заново».
+        auth_error = (proc.returncode != 0 or turn_failed) and is_auth_error(diagnostic)
+        log.error("codex rc=%s turn_failed=%s empty=%s auth_error=%s",
+                  proc.returncode, turn_failed, empty, auth_error)
         if auth_error:
             answer = _("Codex потерял авторизацию. Восстанови вход через /login codex в личном чате с ботом.")
         return CodexResult(text=answer, is_error=True, auth_error=auth_error)

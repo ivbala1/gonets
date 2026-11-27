@@ -53,7 +53,7 @@ def _esc_truncate(s: str, limit: int) -> str:
 
 # Отправка наружу от имени Ивана (Telegram его аккаунтом, письмо из его
 # Gmail): всегда карточка, раньше любых автоаппрувов (чат Домового,
-# фоновый ран, окно /auto). Тап ✅ по карточке с адресатом, текстом и файлом и
+# фоновый ран). Тап ✅ по карточке с адресатом, текстом и файлом и
 # есть «ок» на точный текст: правило держит бот, а не дисциплина агента.
 # Совет GPT Sol и решение Ивана 12.10.2026. Ловим по серверу и глаголу, а
 # не списком имён: у серверов есть send_voice, send_album, edit_message,
@@ -116,18 +116,16 @@ def _refusal(tool_name: str, tool_input: dict[str, Any]) -> str | None:
 MAILSEND_CARD_KEY = "_mailsend"
 
 
-# Признак исполнения mailsend, а не упоминания: запуск модулем, файл модуля
-# скриптом интерпретатора, импорт в коде (python -c, heredoc). Ищется в
-# executed_text, где слово с `'` shlex пишет как `'"'"'`.
-_MAILSEND_RUN_RE = re.compile(
-    r"-m\s*['\"]?claude_tg_bot\.mailsend\b"
-    r"|\bpython[\d.]*['\"]?\s+(?:-\S+\s+)*(?:-m\s*['\"]?mailsend\b|['\"]?(?:\S*/)?mailsend\.py\b)"
-    r"|\bimport\s+claude_tg_bot\.mailsend\b"
-    r"|\bfrom\s+claude_tg_bot(?:\.mailsend\s+import\b|\s+import\b[^;\n]*\bmailsend\b)"
-    r"|\b(?:import_module|run_module)\(\s*(?:'\"'\"'|['\"])claude_tg_bot\.mailsend\b"
-)
-# Команды, которые текст аргументов только читают или пишут: упоминание
-# mailsend в них письма не отправит.
+# Запуск mailsend в начале команды (`[cd DIR && или ;] PY -m
+# claude_tg_bot.mailsend`, перенос строки через `\` склеен): так его пишут
+# скилл и справка. Прочие формы (bash -c, heredoc, импорт, имя модуля в
+# кавычках) не узнаются: письмо без билета карточки mailsend не отправит
+# (take_ticket в mailsend.send). Прежнее узнавание по исполняемому тексту
+# снято 27.11.2026 (этап 3 защит).
+_MAILSEND_START_RE = re.compile(
+    r"\s*(?:cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*(?:&&|;)\s*)?(?:[^\s$`'\"()<>;&|#]*/)?python3?(?:\.\d+)?\s+-m\s+claude_tg_bot\.mailsend(?![\w.-])")
+# Команды, которые текст аргументов только читают или пишут: их аргументы
+# не исполняются (executed_text, необратимое у заказчика в serious).
 _TEXT_TOOLS = frozenset({"git", "grep", "egrep", "fgrep", "rg", "echo", "printf", "cat",
                          "sed", "head", "tail", "less", "wc", "diff", "ls"})
 # Обёртки перед настоящей командой: `timeout 60 git ...` это git.
@@ -789,16 +787,6 @@ def _substitutions(cmd: str, heredoc: bool = False) -> list[str]:
     return out
 
 
-def _mailsend_runs(cmd: str) -> bool:
-    """Команда исполняет mailsend (_MAILSEND_RUN_RE), в том числе через bash -c,
-    $(...), heredoc и обёртки: признак в исполняемой части (executed_text).
-    Упоминание в аргументах _TEXT_TOOLS (сообщение коммита, в том числе за
-    `rtk`, шаблон grep, текст echo) не в счёт. Что не разобралось, считается
-    исполнением: лишняя карточка дешевле."""
-    return bool(_MAILSEND_RUN_RE.search(cmd.replace("\\\n", ""))) and bool(
-        _MAILSEND_RUN_RE.search(executed_text(cmd)))
-
-
 def executed_text(cmd: str, depth: int = 0) -> str:
     """Части команды, которые исполняются: без аргументов _TEXT_TOOLS (шаблон
     grep, сообщение коммита, текст echo), с телами heredoc для интерпретатора
@@ -865,7 +853,7 @@ def executed_text(cmd: str, depth: int = 0) -> str:
     part: list[str] = []
     for t in tokens + [";"]:
         if t and set(t) <= _SHELL_OPS:
-            if part and _text_head(part) not in _TEXT_TOOLS:
+            if part and (_text_head(part) not in _TEXT_TOOLS or git_reset_hard(part)):
                 out.append(shlex.join(part))
             part = []
         else:
@@ -873,6 +861,15 @@ def executed_text(cmd: str, depth: int = 0) -> str:
             # (тело heredoc в строке для ssh, SQL): из слова её убрать (перепроверка 13.11.2026).
             part.append(t.replace("\n;", "\n"))
     return "\n".join(out)
+
+
+def git_reset_hard(words: list[str]) -> bool:
+    """`git … reset … --hard`: у git аргументы обычно текст (сообщение коммита), а
+    эта форма стирает несохранённое и исполняется (список Ивана 27.11.2026)."""
+    if _text_head(words) != "git" or "reset" not in words or {"--help", "-h"} & set(words):
+        return False
+    at = words.index("reset")
+    return "--hard" in words[at:] and "help" not in words[:at]
 
 
 def _text_head(tokens: list[str]) -> str:
@@ -885,9 +882,11 @@ def _text_head(tokens: list[str]) -> str:
 def mailsend_check(cmd: str, cwd: str | None) -> tuple[str, Any]:
     """Что делать с Bash-командой про mailsend: ("", None) не про него;
     ("dry", None) сухой прогон или справка, обычный путь; ("card", снимок)
-    карточка письма; ("mention", None) запуск не простой формой, карточка
-    команды мимо автоаппрувов; ("deny", причина) письмо всё равно не уйдёт."""
-    if not _mailsend_runs(cmd):
+    карточка письма; ("mention", None) запуск в начале команды, но не простой
+    формой, карточка команды мимо автоаппрувов; ("deny", причина) письмо всё
+    равно не уйдёт. Запуск не в начале команды не про него: без билета письмо
+    не уходит."""
+    if not _MAILSEND_START_RE.match(_join_lines(cmd)):
         return "", None
     parsed = _mailsend_argv(cmd, cwd)
     if parsed is None:
@@ -1157,7 +1156,7 @@ _SELF_CHATS = frozenset({"me", "self"})
 def _to_self(tool_name: str, tool_input: dict[str, Any], cfg: Any) -> bool:
     """Отправка Telegram самому Ивану: «Избранное» (`me`) или его номер.
     Личка бота не «себе»: бот принял бы сообщение с аккаунта Ивана как его
-    команду (`/auto 60`, «ок»), агент выдал бы разрешения сам себе (ревью
+    команду (`/reset`, «ок»), агент выдал бы разрешения сам себе (ревью
     03.11.2026). Почта и Slack себе этим не считаются."""
     if tool_name.split("__", 2)[1:2] != ["telegram"]:
         return False

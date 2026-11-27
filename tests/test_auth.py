@@ -120,13 +120,22 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         for flag in ("--strict-mcp-config", "--no-session-persistence"):
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
+        # Без ядра и хука памяти из настроек пользователя (замер 27.11.2026).
+        self.assertEqual(args[args.index("--setting-sources") + 1], "")
         self.assertEqual(args[-1], "ok")
 
-    async def codex_result(self, events, *, rc=1, stderr=b""):
+    async def codex_result(self, events, *, rc=1, stderr=b"", answer=""):
         raw = "\n".join(json.dumps(e) for e in events).encode()
         proc = MagicMock(returncode=rc)
         proc.communicate = AsyncMock(return_value=(raw, stderr))
-        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)) as spawn:
+
+        async def spawn_codex(*args, **_kw):
+            # Как настоящий codex: итоговый ответ в файл после `-o`.
+            if answer:
+                Path(args[args.index("-o") + 1]).write_text(answer)
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=spawn_codex)) as spawn:
             result = await run_codex("codex", "prompt", cwd=Path("/tmp"))
         self.assertIn("--json", spawn.call_args.args)
         return result
@@ -142,9 +151,26 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         for item_type in ("agent_message", "command_execution"):
             result = await self.codex_result([{"type": "item.completed", "item": {"type": item_type, "text": ERROR}}])
             self.assertFalse(result.auth_error)
-        result = await self.codex_result([{"type": "error", "message": ERROR}, {"type": "turn.completed"}], rc=0)
+        result = await self.codex_result([{"type": "error", "message": ERROR}, {"type": "turn.completed"}],
+                                         rc=0, answer="готово")
         self.assertFalse(result.auth_error)
         self.assertFalse(result.is_error)
+        self.assertEqual(result.text, "готово")
+        # Тот же удачный повтор без итогового ответа: ошибка рана, но не входа.
+        result = await self.codex_result([{"type": "error", "message": ERROR}, {"type": "turn.completed"}], rc=0)
+        self.assertTrue(result.is_error)
+        self.assertFalse(result.auth_error)
+
+    async def test_codex_empty_answer_with_rc0_is_error(self):
+        """Код 0 без итогового ответа: ошибка рана, а не обычный ответ
+        «[codex: пустой ответ]» (отбор 27.11.2026)."""
+        result = await self.codex_result([{"type": "turn.completed"}], rc=0)
+        self.assertTrue(result.is_error)
+        self.assertFalse(result.auth_error)
+        self.assertEqual(result.text, _("[codex: пустой ответ]"))
+        result = await self.codex_result([], rc=0, stderr=b"stream closed")
+        self.assertTrue(result.is_error)
+        self.assertIn("stream closed", result.text)
 
 
 class LoginFlowTests(unittest.IsolatedAsyncioTestCase):

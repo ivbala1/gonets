@@ -193,7 +193,7 @@ async def _deal_swipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: s
 
 
 async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: str, *,
-                     from_callback: bool) -> None:
+                     from_callback: bool, live: bool = True) -> None:
     """Ход дела по принятому ответу (accepted). Первый ход идёт в ответвление
     сессии вопроса с точки его ответа, следующие в сессию дела. Исход хода
     всегда видим: ответ, отказ с причиной или «уйдёт после рестарта»."""
@@ -226,7 +226,7 @@ async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: st
     try:
         refused = await _b._dispatch_to_claude(
             update, ctx, prompt, send_voice_reply=False, from_callback=from_callback, deal=ref,
-            on_run_start=started, allow_codex_fallback=False, deferred=True)
+            on_run_start=started, allow_codex_fallback=False, deferred=True, live=live)
         crashed = False
     finally:
         # Исход и при исключении или отмене посреди обработки: дело не
@@ -247,7 +247,7 @@ async def _deal_turn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deal_id: st
                         question=deal.get("question", ""), answer=answer),
                     # Запреты дела остаются: без GPT и переноса в /at (ревью 26.10).
                     send_voice_reply=False, from_callback=True, allow_codex_fallback=False,
-                    expect_epoch=deal.get("qepoch"), ask_ref=ask_ref)
+                    expect_epoch=deal.get("qepoch"), ask_ref=ask_ref, live=live)
         else:
             with contextlib.suppress(Exception):
                 await update.message.reply_text(ref["head"] + "\n" + _(
@@ -365,7 +365,10 @@ async def _deals_resume(app: Application) -> None:
     for d in wake:
         ctx = ContextTypes.DEFAULT_TYPE(application=app)
         task = asyncio.create_task(_deal_turn(_b._synthetic_update(app.bot, d["chat_id"], d.get("thread_id")),
-                                              ctx, d["id"], from_callback=True))
+                                              ctx, d["id"], from_callback=True,
+                                              # Ответ, пролежавший перезапуск: как отложенное
+                                              # сообщение Ивана, не живой (этап 1 защит).
+                                              live=False))
         tasks_set.add(task)
         task.add_done_callback(tasks_set.discard)
 

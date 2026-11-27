@@ -72,7 +72,6 @@ async def _call_status(ctx: SimpleNamespace, limit: str = "") -> str:
             patch.object(bot, "_scope_note", return_value=""), \
             patch.object(bot, "_model_label", return_value="sonnet"), \
             patch.object(bot, "_effort_for", return_value="high"), \
-            patch.object(bot, "burst_until_ts", return_value=0.0), \
             patch.object(bot, "_workshop_status", return_value=""), \
             patch.object(bot, "_cost_day_line", return_value=""), \
             patch.object(bot.limits, "summary", return_value=limit):
@@ -147,7 +146,7 @@ class _CardBot:
 
 def _approve_request(cfg: SimpleNamespace, tg: _CardBot, tool_name: str, tool_input: dict,
                      bot_data: dict | None = None):
-    data = {"unattended_sids": set(), "untrusted_sids": set(), "burst_until_by_target": {}}
+    data = {"unattended_sids": set(), "untrusted_sids": set()}
     data.update(bot_data or {})
     return SimpleNamespace(
         app={"cfg": cfg, "application": SimpleNamespace(bot_data=data, bot=tg),

@@ -15,7 +15,7 @@ from aiohttp import web
 from telegram import BotCommand, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 
-from . import bigfile, buttons, login_expiry, otklik, restart, tg_api
+from . import bigfile, buttons, login_expiry, otklik, replies, restart, tg_api
 from . import procs as procs_mod
 from .approval import ApprovalRegistry, warn_if_no_shared_secret
 from .claude_runner import SessionStore
@@ -69,6 +69,9 @@ async def _on_post_init(app: Application) -> None:
         # Остальное перерисует синхронизация: восстановленные в pending и
         # отставшие с прошлых сбоев.
         await _b._otklik_sync(app.bot, otklik_base)
+        # Одобренное по ✅, которое перезапуск оборвал до отправки: строка Ивану,
+        # одна на всех (слова Ивана 27.11.2026).
+        await _b._otklik_restart_loud(app.bot, recovered)
     app.bot_data["otklik_sync"] = asyncio.get_running_loop().create_task(_otklik_after_restart())
     registry: ApprovalRegistry = app.bot_data["registry"]
     session_targets: dict[str, tuple[int, int | None]] = app.bot_data["session_targets"]
@@ -115,7 +118,6 @@ async def _on_post_init(app: Application) -> None:
             BotCommand("keys", _("кнопки под полем ввода (off = убрать)")),
             BotCommand("plan", _("сначала план с кнопками, выполнение после ✅")),
             BotCommand("task", _("завести тему задачи: /task что сделать")),
-            BotCommand("auto", _("окно auto-approve: 15m|1h|off")),
             BotCommand("compose", _("копить сообщения, /go отправит одним промптом")),
             BotCommand("go", _("отправить compose-буфер")),
             BotCommand("at", _("отложенный промпт: 45m|14:30 <текст>")),
@@ -312,7 +314,8 @@ async def _restart_wait_workshop(app: Application, req: dict, drain: Any) -> Non
         # Новые ✅ в это время тоже идут и тоже дожидаются: «Перезапустить сейчас» не ждёт.
         lines.append(_("♻️ Перезапуск ждёт конца отправки откликов; личка работает как обычно."))
     if lines:  # фоновая тема могла освободиться до этой строки: пустое Telegram не примет
-        await _restart_notify(app, req, "\n".join(lines), True)
+        # С кнопками: выбор Ивана, в личку и при теме перезапуска.
+        await _restart_notify(app, req, "\n".join(lines), True, alarm=True)
     while _background_busy(app) and not drain.cancelled and not drain.now_event.is_set():
         await asyncio.sleep(5)
 
@@ -332,15 +335,26 @@ def _restart_keyboard(rid: str) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _restart_notify(app: Application, req: dict, text: str, ask: bool = False) -> None:
-    try:
-        chat_id, thread_id = _parse_chat_key(req["chat_key"])
-        await app.bot.send_message(
-            chat_id=chat_id, message_thread_id=thread_id, text=text,
-            reply_markup=_restart_keyboard(req["id"]) if ask else None,
-        )
-    except Exception:
-        log.exception("restart notice failed (ignored)")
+async def _restart_notify(app: Application, req: dict, text: str, ask: bool = False,
+                          alarm: bool = False) -> None:
+    """Сообщение о ходе заявки в её тему. alarm (сбой, затянувшееся ожидание):
+    в личку, если заявку увели из лички в тему перезапуска (`alarm_chat_key`);
+    тема не приняла сообщение: тоже в личку."""
+    alarm_key = req.get("alarm_chat_key") or ""
+    keys = [alarm_key] if alarm and alarm_key else [req.get("chat_key") or "", alarm_key]
+    keys = [k for k in keys if k]
+    for key in keys:
+        try:
+            chat_id, thread_id = _parse_chat_key(key)
+            await app.bot.send_message(
+                chat_id=chat_id, message_thread_id=thread_id, text=text,
+                reply_markup=_restart_keyboard(req["id"]) if ask else None,
+            )
+            return
+        except Exception as e:
+            log.exception("restart notice failed chat=%s (ignored)", key)
+            if replies.is_unconfirmed(e):
+                return  # могло дойти: второй копии в личке не нужно
 
 
 def _restart_reschedule_at(app: Application) -> None:
@@ -357,7 +371,7 @@ def _restart_reschedule_at(app: Application) -> None:
             log.exception("at-job %s не восстановлен после отмены перезапуска", jid)
 
 
-async def _restart_abort(app: Application, req: dict, text: str) -> None:
+async def _restart_abort(app: Application, req: dict, text: str, alarm: bool = True) -> None:
     cfg: Config = app.bot_data["cfg"]
     drain = app.bot_data.get("restart_drain")
     if drain is not None:
@@ -368,7 +382,9 @@ async def _restart_abort(app: Application, req: dict, text: str) -> None:
     restart.clear_request(cfg.state_dir)
     _restart_reschedule_at(app)
     log.warning("restart request %s aborted: %s", req.get("id"), text.splitlines()[0])
-    await _restart_notify(app, req, text)
+    await _restart_notify(app, req, text, alarm=alarm)
+    # Очередь «Делай», которую насос пропустил на время ожидания, двигается.
+    _b._task_pump(ContextTypes.DEFAULT_TYPE(application=app))
 
 
 async def _restart_exit(app: Application, req: dict) -> None:
@@ -408,7 +424,13 @@ async def _restart_begin_locked(app: Application, chat_key: str, reason: str,
     if _b._is_background(cfg, chat_key):
         # Заявка из фоновой темы: ход перезапуска и кнопки в личке, тема заглушена.
         chat_key = str(cfg.primary_chat_id)
+    alarm_key = ""
+    if getattr(cfg, "restart_chat_key", "") and chat_key == str(cfg.primary_chat_id):
+        # Ход перезапуска в служебную тему, в личку только сбой (решение Ивана 27.11.2026).
+        chat_key, alarm_key = cfg.restart_chat_key, chat_key
     req = restart.new_request(chat_key, reason, commit)
+    if alarm_key:
+        req["alarm_chat_key"] = alarm_key
     restart.save_request(cfg.state_dir, req)
     # Ожидание в два шага (проект Домового 22.10.2026): пока идёт наряд
     # мастерской, новую работу не берёт только она, личка работает; общее
@@ -422,7 +444,9 @@ async def _restart_begin_locked(app: Application, chat_key: str, reason: str,
         app.bot_data["draining"] = True
 
     async def notify(text: str, ask: bool) -> None:
-        await _restart_notify(app, req, text, ask)
+        # С кнопками Drain спрашивает только о затянувшемся ожидании: это в личку,
+        # как и ожидание конца работы мастерской (_restart_wait_workshop).
+        await _restart_notify(app, req, text, ask, alarm=ask)
 
     async def do_restart() -> None:
         await _restart_exit(app, req)
@@ -477,7 +501,8 @@ async def on_restart_pick(update: _b.Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         drain.now_event.set()
     elif action == "cancel":
         await _b._answer_quietly(query, _("Заявка отменена"))
-        await _restart_abort(ctx.application, drain.req, _("Заявка на перезапуск отменена, бот берёт работу как обычно."))
+        await _restart_abort(ctx.application, drain.req, _("Заявка на перезапуск отменена, бот берёт работу как обычно."),
+                             alarm=False)
     else:
         await _b._answer_quietly(query, _("Жду дальше"))
 
@@ -495,7 +520,7 @@ async def _restart_announce(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     restart.clear_request(cfg.state_dir)
     if req.get("phase") != restart.PHASE_RESTARTING:
         await _restart_notify(app, req, _("⚠️ Бот остановился раньше, чем дошло до перезапуска по заявке. "
-                                        "Если правка ещё нужна, подай заявку снова."))
+                                        "Если правка ещё нужна, подай заявку снова."), alarm=True)
         return
     head, _unused = await asyncio.to_thread(restart.git_state)
     version = head[:7] or _("неизвестна")
@@ -571,12 +596,6 @@ async def _on_post_shutdown(app: Application) -> None:
         task.cancel()
     if exit_waits:
         await asyncio.gather(*list(exit_waits), return_exceptions=True)
-    burst_tasks: dict[str, asyncio.Task] = app.bot_data.get("burst_expiry_tasks") or {}
-    for task in list(burst_tasks.values()):
-        if not task.done():
-            task.cancel()
-    if burst_tasks:
-        await asyncio.gather(*list(burst_tasks.values()), return_exceptions=True)
     procs: dict[str, asyncio.subprocess.Process] = app.bot_data.get("procs") or {}
     # Гасим и раны, где claude уже вышел, а внук держит вывод (procs.running);
     # весть о перезапуске, как и раньше, только темам с живым claude.

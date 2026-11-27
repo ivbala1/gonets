@@ -102,7 +102,9 @@ class RecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             args = argparse.Namespace(reason="капча", site="hh.ru", quiet=False, image="", region="")
-            env = {"SCREEN_PUBLIC_BASE": "http://h:8765", "CLAUDE_TG_CHAT_KEY": "5"}
+            env = {"SCREEN_PUBLIC_BASE": "http://h:8765", "CLAUDE_TG_CHAT_KEY": "5",
+                   # Ран мастерской задаёт ключ лички, он старше CLAUDE_TG_CHAT_KEY.
+                   handoff.SHOW_CHAT_KEY_ENV: ""}
             err = io.StringIO()
             with patch.dict("os.environ", env), contextlib.redirect_stderr(err):
                 with patch.dict("os.environ", {"AGENT_BROWSER_SESSION": ""}):
@@ -126,7 +128,7 @@ class RecordTests(unittest.TestCase):
                         patch.object(handoff, "_bot_api") as api:
                     self.assertEqual(handoff._cmd_ask(args, base, 1), 1)
                     api.assert_not_called()
-            self.assertIn(_("handoff: за час уже {n} передачи в этот чат, больше нельзя: остановись и скажи Ивану").format(
+            self.assertIn(_("handoff: исчерпан предел передач в этот чат ({n} в час), больше нельзя: остановись и скажи Ивану").format(
                 n=15), err.getvalue())
 
     def test_image_read_capped_and_unknown_type_not_opened(self) -> None:

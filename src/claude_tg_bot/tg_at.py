@@ -8,10 +8,10 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
+from typing import Collection
 
 from telegram.ext import Application, ContextTypes
 
-from .burst import parse_duration
 from .claude_runner import SessionStore
 from .config import Config, local_zone, now_local
 from .i18n import _
@@ -19,6 +19,20 @@ from .replies import split_for_telegram
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
+
+
+def parse_duration(spec: str) -> int | None:
+    """`15m` / `1h` / `45m` / `15` (минуты по дефолту). None если не парсится.
+    Перенесено из burst.py 27.11.2026, когда окно ⏩ сняли."""
+    m = _DURATION_RE.match(spec.strip())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower() or "m"
+    return n * {"s": 1, "m": 60, "h": 3600}[unit]
 
 
 def _parse_at_when(spec: str) -> float | None:
@@ -211,7 +225,7 @@ async def _at_fire_dispatch(ctx: ContextTypes.DEFAULT_TYPE, data: dict, store: S
                if data.get(k) is not None} or None
         rejected = bool(await _b._dispatch_to_claude(
             # Отложенное на перезапуск это сообщение Ивана: идёт с его правами
-            # (окно ⏩, «gpt:»), а не как фоновый /at.
+            # («gpt:»), а не как фоновый /at.
             update, ctx, prompt, send_voice_reply=drained and bool(data.get("voice")),
             unattended=not drained,
             on_run_start=lambda: store.remove(data["jid"]), deferred=True,
@@ -255,16 +269,29 @@ def _schedule_at_job(application: Application, jid: str, payload: dict) -> None:
     )
 
 
-def at_put(app: Application, payload: dict) -> str:
-    """Задание /at на диск и в очередь; сбой снимает запись и поднимается дальше."""
+def at_put(app: Application, payload: dict, replaces: Collection[str] = ()) -> str:
+    """Задание /at на диск и в очередь; сбой снимает запись и поднимается дальше.
+    replaces: записи /at, которые снимаются той же записью файла (перенос лимитом:
+    иначе авария до их снятия дала бы после рестарта два рана); при сбое они
+    возвращаются, снимет их владелец."""
     store = app.bot_data["at_jobs"]
     jid = uuid.uuid4().hex[:6]
+    # Сбой: память к снимку в прежнем порядке (_drained_find берёт первую
+    # запись темы), как в bot._drain_defer; файл переписывает remove(jid).
+    snapshot = dict(store.data)
+    for old in replaces:
+        store.data.pop(old, None)
     try:
         store.set(jid, json.dumps(payload, ensure_ascii=False))
         _b._schedule_at_job(app, jid, payload)
     except Exception:
-        with contextlib.suppress(Exception):
-            store.remove(jid)
+        entry = store.data.get(jid)
+        store.data.clear()
+        store.data.update(snapshot)
+        if entry is not None:
+            store.data[jid] = entry
+            with contextlib.suppress(Exception):
+                store.remove(jid)
         raise
     return jid
 

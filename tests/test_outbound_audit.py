@@ -54,7 +54,7 @@ class _MailEnv(unittest.TestCase):
         kind, info = outbound.mailsend_check(cmd, None)
         self.assertEqual(kind, "card", info)
         tool_input = {"command": cmd, "description": "Отклик на вакансию", outbound.MAILSEND_CARD_KEY: info}
-        return approval._format_tool_call("Bash", tool_input, "sid", None)
+        return approval._format_tool_call("Bash", tool_input, "sid")
 
 
 class LongMailCardTests(_MailEnv):
@@ -91,7 +91,7 @@ class LongOutboundCardTests(unittest.TestCase):
     def test_long_gmail_send_keeps_outbound_view(self) -> None:
         tool_input = {"body": "Текст. " * 450, "htmlBody": "<p>Текст.</p> " * 250,
                       "subject": "Senior DevOps", "to": ["attacker@evil-example.com"]}
-        text = approval._format_tool_call("mcp__claude_ai_Gmail__send_message", tool_input, "sid", None)
+        text = approval._format_tool_call("mcp__claude_ai_Gmail__send_message", tool_input, "sid")
         self.assertLessEqual(len(text), approval.CARD_TEXT_CAP + 150)
         self.assertIn(_("📤 <b>отправка от твоего имени</b>"), text)
         self.assertIn("attacker@evil-example.com", text)

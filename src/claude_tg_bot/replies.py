@@ -126,8 +126,8 @@ async def send_text_to(cfg: Config, msg, text: str, head: str = "", *, reply_mar
     # (allow_sending_without_reply), отказ цитаты: повтор без неё. У пробуждений
     # без сообщения (номер 0) цитаты нет.
     quote = _quote_of(msg)
-    # +2: перевод строки и второе слово UTF-16 у 🧵 (Telegram считает так).
-    limit = cfg.telegram_text_limit - (len(head) + 2 if head else 0)
+    # Заголовок и перевод строки в единицах UTF-16, как считает Telegram (эмодзи по две).
+    limit = cfg.telegram_text_limit - (utf16_len(head) + 1 if head else 0)
     chunks = list(split_for_telegram(text, limit))
     for i, chunk in enumerate(chunks):
         if head:

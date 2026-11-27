@@ -28,6 +28,7 @@ os.environ.setdefault("TELEGRAM_ALLOWED_USER_IDS", "1")
 from claude_tg_bot import approval  # noqa: E402
 from claude_tg_bot import bot as botmod  # noqa: E402
 from claude_tg_bot import claude_runner  # noqa: E402
+from claude_tg_bot import lifecycle  # noqa: E402
 from claude_tg_bot import tasks  # noqa: E402
 from claude_tg_bot.i18n import _  # noqa: E402
 from claude_tg_bot.claude_runner import ClaudeResult, SessionStore  # noqa: E402
@@ -272,9 +273,9 @@ def _buttons(markup) -> list[str]:
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
-def _busy_note(name: str) -> str:
-    """Ответ «занято», пока выполняется задача name."""
-    return _("⏳ Сейчас выполняется {who}. Когда закончится, нажми «Делай» ещё раз или напиши «делай».").format(
+def _queued_note(name: str) -> str:
+    """Ответ на «Делай», пока выполняется задача name: встала в очередь."""
+    return _("⏳ Поставил в очередь: начну сам, когда дойдёт черёд. Сейчас выполняется {who}.").format(
         who=_("«{name}»").format(name=name))
 
 
@@ -586,36 +587,148 @@ class SkillMarkerTests(_TaskBase):
 
 
 class QueueTests(_TaskBase):
-    """Одно выполнение на весь бот, очереди нет: «Делай» другой задачи
-    отвечает «занято», проект ждёт, кнопка рабочая (разбор 19.10.2026)."""
+    """Одно выполнение на весь бот; «Делай» другой задачи, пока оно идёт,
+    ставит её в очередь, и она стартует сама после него (решение Ивана
+    27.11.2026)."""
 
-    async def test_second_is_busy_and_button_works_after(self) -> None:
+    async def test_second_waits_and_starts_itself(self) -> None:
         self.put_command("t7-5", thread=THREAD, status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
         self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich")
         self.gate = asyncio.Event()
         first = asyncio.ensure_future(self.press(f"nt:t7-5:do:{SHA}"))
         while not self.runs:
             await asyncio.sleep(0)
-        query = await self.press(f"nt:t7-6:do:{SHA}", press_id="q-busy")
-        self.assertIn(_busy_note("1 README"), query.answer.call_args.args[0])
+        query = await self.press(f"nt:t7-6:do:{SHA}", press_id="q-wait")
+        self.assertEqual(_queued_note("1 README"), query.answer.call_args.args[0])
         self.assertEqual(self.task("t7-6")["status"], "proposed")
-        query.edit_message_reply_markup.assert_not_awaited()  # кнопка остаётся
+        self.assertTrue(self.task("t7-6")["queued_at"])
+        self.assertTrue(any(_(tasks.QUEUED_LINE) in t for t in self.card_texts()))
+        query.edit_message_reply_markup.assert_awaited()  # кнопка снята: задача ждёт сама
+        self.assertIn(_("в очереди"), tasks.open_list([self.task("t7-6")]))
+        # то же нажатие заново (Telegram после аварии): уже принято
+        again = await self.press(f"nt:t7-6:do:{SHA}", press_id="q-wait")
+        self.assertEqual(_("Это нажатие уже принято"), again.answer.call_args.args[0])
+        self.assertEqual(len(self.runs), 1)
         self.gate.set()
         await first
         await self.settle()
-        self.assertEqual(len(self.runs), 1)  # само ничего не стартует
-        # то же нажатие теперь выполняет
-        await self.press(f"nt:t7-6:do:{SHA}", press_id="q-busy")
+        # вторая стартовала сама, без нового нажатия
         self.assertEqual([r["chat_key"] for r in self.runs], [f"{GROUP}:{THREAD}", f"{GROUP}:79"])
         self.assertEqual((self.task("t7-5")["status"], self.task("t7-6")["status"]), ("done", "done"))
+        self.assertIsNone(self.task("t7-6")["queued_at"])
 
-    async def test_word_do_while_busy_answers_in_topic(self) -> None:
+    async def test_queue_goes_in_press_order(self) -> None:
+        self.put_command("t7-5", thread=THREAD, status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich")
+        self.put_command("t7-7", thread=80, status="proposed", plan=PLAN, plan_sha=SHA, name="3 Почта")
+        self.gate = asyncio.Event()
+        first = asyncio.ensure_future(self.press(f"nt:t7-5:do:{SHA}"))
+        while not self.runs:
+            await asyncio.sleep(0)
+        await self.press(f"nt:t7-7:do:{SHA}")
+        await self.press(f"nt:t7-6:do:{SHA}")
+        self.gate.set()
+        await first
+        await self.settle()
+        self.assertEqual([r["chat_key"] for r in self.runs],
+                         [f"{GROUP}:{THREAD}", f"{GROUP}:80", f"{GROUP}:79"])
+        self.assertEqual([self.task(t)["status"] for t in ("t7-5", "t7-6", "t7-7")], ["done"] * 3)
+
+    async def test_correction_takes_task_out_of_queue(self) -> None:
+        self.put_command("t7-5", thread=THREAD, status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich")
+        self.gate = asyncio.Event()
+        first = asyncio.ensure_future(self.press(f"nt:t7-5:do:{SHA}"))
+        while not self.runs:
+            await asyncio.sleep(0)
+        await self.press(f"nt:t7-6:do:{SHA}")
+        msg = self.topics.setdefault(79, _msg(79))
+        msg.text = "погоди, сначала покажи план"
+        later = asyncio.ensure_future(botmod.on_text(_update(msg), self.ctx))
+        await asyncio.sleep(0.05)
+        task = self.task("t7-6")
+        self.assertEqual((task["status"], task.get("queued_at")), ("thinking", None))
+        self.gate.set()
+        await first
+        await later
+        await self.settle()
+        # после первого выполнения из очереди не стартовало ничего: только обдумывание поправки
+        self.assertEqual(len(self.runs), 2)
+        self.assertEqual(self.runs[1]["chat_key"], f"{GROUP}:79")
+        self.assertIn("сначала покажи план", self.runs[1]["prompt"])
+        self.assertEqual(self.task("t7-6")["status"], "thinking")
+
+    async def test_queue_survives_restart(self) -> None:
+        # Бот перезапустился, пока задача ждала: старт берёт её из реестра.
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA,
+                         queued_at="2026-11-27T10:00:00.000001+04:00", accepted_press="q-old")
+        await botmod._tasks_recover(self.ctx)
+        self.assertEqual(self.runs, [])
+        await botmod._tasks_startup(self.ctx)
+        await self.settle()
+        self.assertEqual([r["chat_key"] for r in self.runs], [f"{GROUP}:79"])
+        self.assertEqual(self.task("t7-6")["status"], "done")
+
+    async def test_queue_waits_out_restart_drain_and_moves_on_abort(self) -> None:
+        # Заявка на перезапуск: очередь стоит; заявку отменили: двигается.
+        self.put_command("t7-5", thread=THREAD, status="proposed", plan=PLAN, plan_sha=SHA, name="1 README")
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich")
+        self.gate = asyncio.Event()
+        first = asyncio.ensure_future(self.press(f"nt:t7-5:do:{SHA}"))
+        while not self.runs:
+            await asyncio.sleep(0)
+        await self.press(f"nt:t7-6:do:{SHA}")
+        self.bot_data["draining"] = True
+        self.gate.set()
+        await first
+        await self.settle()
+        self.assertEqual(len(self.runs), 1)
+        self.assertTrue(self.task("t7-6")["queued_at"])
+        self.ctx.application.bot = self.bot  # контекст насоса строится от приложения
+        with patch.object(lifecycle.restart, "clear_request"), \
+                patch.object(lifecycle, "_restart_reschedule_at"), \
+                patch.object(lifecycle, "_restart_notify", AsyncMock()):
+            await lifecycle._restart_abort(self.ctx.application, {"id": "r1"}, "отменено")
+        await self.settle()
+        self.assertEqual([r["chat_key"] for r in self.runs], [f"{GROUP}:{THREAD}", f"{GROUP}:79"])
+        self.assertEqual(self.task("t7-6")["status"], "done")
+
+    async def test_stalled_queue_goes_before_new_press(self) -> None:
+        # Насос пропустил ход (реестр не читался, первые секунды после старта):
+        # новое «Делай» сначала двигает очередь, само встаёт за ней.
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich",
+                         queued_at="2026-11-27T10:00:00.000001+04:00")
+        self.put_command("t7-7", thread=80, status="proposed", plan=PLAN, plan_sha=SHA, name="3 Почта")
+        query = await self.press(f"nt:t7-7:do:{SHA}")
+        self.assertEqual(_queued_note("2 Immich"), query.answer.call_args.args[0])
+        await self.settle()
+        self.assertEqual([r["chat_key"] for r in self.runs], [f"{GROUP}:79", f"{GROUP}:80"])
+
+    async def test_press_on_stalled_head_runs_it(self) -> None:
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA, name="2 Immich",
+                         queued_at="2026-11-27T10:00:00.000001+04:00")
+        query = await self.press(f"nt:t7-6:do:{SHA}")
+        self.assertEqual(_("▶️ Выполняю"), query.answer.call_args.args[0])
+        query.edit_message_reply_markup.assert_awaited()
+        self.assertEqual([r["chat_key"] for r in self.runs], [f"{GROUP}:79"])
+
+    async def test_recover_sends_no_restart_offer_to_queued(self) -> None:
+        # Кнопка «не запустилось» не ушла, потом задача встала в очередь:
+        # после рестарта она ждёт очереди, а не нового «делай».
+        self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA,
+                         offer_due=True, queued_at="2026-11-27T10:00:00.000001+04:00")
+        await botmod._tasks_recover(self.ctx)
+        self.assertFalse(any(_("Выполнение не запустилось. Делать по проекту выше?") in c.args[1]
+                             for c in self.bot.send_message.await_args_list))
+
+    async def test_word_do_while_busy_queues(self) -> None:
         self.put_command("t7-5", thread=THREAD, status="running", plan=PLAN, plan_sha=SHA, exec_gen=1,
                          exec_started="2026-10-19T10:00:00+04:00", name="1 README")
         self.put_command("t7-6", thread=79, status="proposed", plan=PLAN, plan_sha=SHA)
         msg = await self.say("делай", thread=79)
-        self.assertTrue(any(_busy_note("1 README") in t for t in self.topic_texts(msg)))
+        self.assertTrue(any(_queued_note("1 README") in t for t in self.topic_texts(msg)))
         self.assertEqual(self.task("t7-6")["status"], "proposed")
+        self.assertTrue(self.task("t7-6")["queued_at"])
         self.assertEqual(self.runs, [])
 
     async def test_message_during_exec_waits(self) -> None:
@@ -1183,9 +1296,9 @@ class ExecRightsTests(unittest.TestCase):
             cfg = SimpleNamespace(
                 approve_shared_secret="", primary_chat_id=1, state_dir=Path(d),
                 approve_auto_chat_keys=frozenset(), approve_whitelist_paths=(),
-                mcp_auto_allow_re=re.compile(r"get[A-Za-z_]*"), bash_auto_allow_re=re.compile(r"ls"),
+                mcp_auto_allow_re=re.compile(r"get[A-Za-z_]*"),
             )
-            bot_data = {"unattended_sids": set(), "untrusted_sids": set(), "burst_until_by_target": {},
+            bot_data = {"unattended_sids": set(), "untrusted_sids": set(),
                         "task_exec_sids": set(exec_sids)}
             request = SimpleNamespace(
                 app={"cfg": cfg, "application": SimpleNamespace(bot_data=bot_data),
@@ -1210,7 +1323,7 @@ class ExecRightsTests(unittest.TestCase):
             card.assert_not_called()
 
     def test_danger_and_send_still_card(self) -> None:
-        for tool, inp in (("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"}),
+        for tool, inp in (("mcp__plugin_engineering_github__add_issue_comment", {"body": "x"}),
                           ("mcp__telegram__send_message", {"chat_id": "@x", "message": "hi"})):
             out, card = self.decide(tool, inp)
             self.assertEqual(out["decision"], "deny", tool)
@@ -1231,7 +1344,7 @@ class ExecRightsTests(unittest.TestCase):
         card.assert_not_called()
 
     def test_same_session_outside_exec_cards(self) -> None:
-        out, card = self.decide("Bash", {"command": "curl -s http://127.0.0.1:8770/mcp -d '{}'"},
+        out, card = self.decide("mcp__plugin_engineering_github__add_issue_comment", {"body": "x"},
                                 exec_sids=frozenset())
         self.assertEqual(out["decision"], "deny")
         card.assert_called()
@@ -1821,8 +1934,9 @@ class QuoteTests(_TaskBase):
             if "поправь второй шаг" in line or "отвечает на сообщение" in line:
                 self.assertFalse(mask[i], line)
         probe = _resolve_pin(plan, "")
-        if probe is None or probe[0] == "personal":
-            self.skipTest("Свода нет или алиас заказчика не распознаётся")
+        if probe is None:
+            self.skipTest("Свода нет на этой машине")
+        self.assertNotEqual(probe[0], "personal", "Свод не узнал условного заказчика")
         self.assertEqual(_resolve_pin(prompt, "")[0], "personal")
 
 

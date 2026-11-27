@@ -105,8 +105,11 @@ def git_state(repo: Path = REPO) -> tuple[str, list[str]]:
             capture_output=True, text=True, timeout=30, check=True, env=agent_env(),
         ).stdout.strip()
         # Байты: имя постороннего файла не в UTF-8 не должно ронять проверку.
+        # --no-optional-locks: status не берёт .git/index.lock для фонового
+        # обновления индекса; убитый по сроку, он оставлял бы замок в клоне
+        # бота (копия ошибки «SIGKILL сразу у git», 27.11.2026).
         status = subprocess.run(
-            ["git", "-C", str(repo), "status", "--porcelain", "-z", "--no-renames",
+            ["git", "--no-optional-locks", "-C", str(repo), "status", "--porcelain", "-z", "--no-renames",
              "--untracked-files=normal"],
             capture_output=True, timeout=30, check=True, env=agent_env(),
         ).stdout.decode("utf-8", "surrogateescape")
