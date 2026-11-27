@@ -102,10 +102,10 @@ AT_MAX_SEC = 14 * 86400
 QUIET_UNTIL = (8, 30)
 # Запас на строку статуса: сообщение потом правится, а лимит Telegram 4096.
 NEW_TEXT_CAP = tg_api.TEXT_LIMIT - 300
-# ✏️ на карточке в теме откликов: правку пишет личка (там Домовой со всем
-# контекстом), бот кладёт туда строку для ответа (tg_otklik, 27.11.2026).
-EDIT_IN_PRIMARY = N_("✏️ напиши в личке, что поправить, ответом на строку бота там")
 EDIT_ASK = N_("✏️ напиши, что поправить, ответом на это сообщение")
+# Ответ Ивана на карточку в теме откликов переводит её в правку, как ✏️
+# (mark_reply_edit, решение Ивана 27.11.2026 вечером).
+EDIT_BY_REPLY = N_("✏️ правлю по твоему ответу, новая карточка придёт сюда; ↩️ вернёт кнопки")
 STATUS_LINES = {
     "pending": "",
     "approved": N_("✅ одобрено, отправляю…"),
@@ -511,8 +511,8 @@ def render(rec: dict[str, Any]) -> str:
         line = _("⚠️ не ушло, нажми ✅ ещё раз")
     elif rec.get("status") == "approved" and rec.get("at"):
         line = _("✅ одобрено, уйдёт {when}; ✋ отменит до срока").format(when=at_label(rec))
-    elif rec.get("status") == "edit" and rec.get("thread_id"):
-        line = _(EDIT_IN_PRIMARY)
+    elif rec.get("status") == "edit" and rec.get("edit_reply"):
+        line = _(EDIT_BY_REPLY)
     else:
         line = _(STATUS_LINES.get(rec.get("status", ""), ""))
     if line:
@@ -641,8 +641,43 @@ def pick(base: Path, oid: str, sha: str, gen: int, action: str,
             rec.setdefault("attempt", None)
         # Пометка прошлого возврата («бот перезапускался») к новому решению не относится.
         rec.update(note="", updated=_now())
+        rec.pop("edit_reply", None)
         save(base, rec)
         return rec
+
+
+def mark_reply_edit(base: Path, chat_id: int, thread_id: int | None,
+                    message_id: int) -> tuple[dict[str, Any], bool] | None:
+    """Иван ответил в теме откликов на ждущую карточку: она в правке, как по ✏️
+    (решение Ивана 27.11.2026 вечером). Только этот переход разрешает теме
+    заменить запись (_cmd_new): правка из темы касается лишь карточки, которую
+    Иван тронул сам. Возвращает (запись, изменена ли): уже в правке (✏️,
+    второй ответ) это (запись, False); не ждущая и не в правке: None."""
+    with locked(base):
+        for rec in _records(base):
+            if (rec.get("message_id") == message_id and rec.get("chat_id") == chat_id
+                    and rec.get("thread_id") == thread_id):
+                if rec.get("status") == "edit":
+                    return rec, False
+                if rec.get("status") != "pending":
+                    return None
+                rec.update(status="edit", edit_reply=True, note="", updated=_now())
+                save(base, rec)
+                return rec, True
+    return None
+
+
+def _successors(base: Path) -> dict[str, str]:
+    """Кто кого заменил: id заменённой записи -> id заменившей. Под locked()."""
+    return {str((r.get("replaces") or {}).get("id")): r["id"] for r in _records(base) if r.get("replaces")}
+
+
+def _chain_head(succ: dict[str, str], oid: str) -> str:
+    seen = {oid}
+    while oid in succ and succ[oid] not in seen:
+        oid = succ[oid]
+        seen.add(oid)
+    return oid
 
 
 def _batch_path(base: Path, bid: str) -> Path:
@@ -975,25 +1010,84 @@ def card_place(primary_chat_id: int, otklik_chat_key: str) -> dict[str, int]:
     return {"chat_id": primary_chat_id}
 
 
+_TO_KEYS = ("tg", "mail", "subject", "reply_to")
+
+
+def _replaceable(base: Path, old: dict[str, Any] | None) -> bool:
+    """Замена возможна по статусу и без преемника. Нет: поля и срок не
+    наследуются, отказ (преемник с номером, ✋ для одобренного в срок) дают
+    проверки под замком в _cmd_new, а не строка о файле или адресате."""
+    return (old is not None and old["id"] not in _successors(base)
+            and (old.get("status") in REPLACE_FROM or at_expired(old)))
+
+
+def _inherit_send(args: argparse.Namespace, old: dict[str, Any] | None, base: Path) -> argparse.Namespace:
+    """Правка берёт у заменяемой записи то, чего не задала сама, двумя
+    группами: адресат (с темой и ответом на письмо) и файл. Иначе правка
+    текста или одного файла теряла бы адресата и уходила второй карточкой
+    (ревью 27.11.2026). ValueError: унаследованного файла больше нет или он
+    изменился."""
+    if not _replaceable(base, old):
+        return args   # замены не будет: отказ скажут проверки под замком, а не файл
+    args = argparse.Namespace(**vars(args))
+    if not any((getattr(args, k, "") or "").strip() for k in _TO_KEYS):
+        if old.get("via") == "telegram":
+            args.tg = str(old.get("to") or "")
+        elif old.get("via") == "mail":
+            args.mail, args.subject = str(old.get("to") or ""), str(old.get("subject") or "")
+            args.reply_to = str(old.get("reply_to") or "")
+    if (getattr(args, "attach", "") or "").strip() or getattr(args, "no_attach", False):
+        return args
+    args.attach = str((old.get("attach") or {}).get("path") or "")
+    if args.attach and not Path(args.attach).expanduser().is_file():
+        raise ValueError(_("файла заменяемого отклика {path} больше нет: задай --attach").format(path=args.attach))
+    if args.attach and file_sha(Path(args.attach).expanduser()) != (old.get("attach") or {}).get("sha256"):
+        # Иван одобрял тот файл, а не новое содержимое по тому же пути.
+        raise ValueError(_("файл {path} изменился после прошлой карточки: задай --attach явно").format(
+            path=args.attach))
+    return args
+
+
 def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
-             chat_key: str, sources: frozenset[str], place: dict[str, int] | None = None) -> int:
+             chat_key: str, sources: frozenset[str], place: dict[str, int] | None = None,
+             topic: str = "", asked: bool = False) -> int:
+    """topic: тема откликов. Из неё только правка (решение Ивана 27.11.2026
+    вечером): --replaces карточки этой темы, которую Иван сам перевёл в правку
+    (✏️ или ответ, mark_reply_edit), в ходе по его сообщению (asked: у рана есть
+    CLAUDE_TG_ASK_ID; у рана по ✅, /at, событий его нет). Новую карточку тема
+    не кладёт: её раны отправки читают чужие страницы."""
     place = place or {"chat_id": primary_chat_id}
+    from_topic = bool(topic) and chat_key == topic
+    if from_topic:
+        refusal = (_("otklik: тема откликов не кладёт новых карточек, только правку ждущей "
+                     "(--replaces); новую готовит личка") if not args.replaces
+                   else _("otklik: ответа на --person из темы откликов нет, его карточка в личке")
+                   if getattr(args, "person", False)
+                   else _("otklik: правка из темы откликов идёт только в ходе по сообщению Ивана; попроси его "
+                          "ответить на карточку ещё раз") if not asked else None)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
     text = Path(args.file).read_text(encoding="utf-8").strip()
     if not text:
         print(_("otklik: пустой текст"), file=sys.stderr)
         return 1
     try:
+        if args.replaces:
+            args = _inherit_send(args, load(base, args.replaces), base)
         send = _send_args(args, text)
         prev = load(base, args.replaces) if args.replaces and not send.get("at") else None
         if prev is not None and prev.get("at"):
             # Правка по ✏️ без своего времени: срок заменённой, а не немедленная отправка.
-            if not send.get("via"):
+            # Замены не будет (одобрена, заменена): отказ скажет замок, а не «нужен адресат».
+            if not send.get("via") and _replaceable(base, prev):
                 raise ValueError(_("заменяемый отклик уходит в срок ({when}): нужен адресат --tg или --mail "
                                    "(и --at, если время другое)").format(when=at_label(prev)))
             if at_refusal(prev) is not None and (at_ts(prev) or 0) <= time.time():
                 raise ValueError(_("срок заменяемого отклика ({when}) прошёл: задай новое время --at").format(
                     when=at_label(prev)))
-            send["at"] = prev["at"]
+            if send.get("via"):
+                send["at"] = prev["at"]   # срок только с адресатом, как у --at
     except (OSError, ValueError) as e:
         print(f"otklik: {e}", file=sys.stderr)
         return 1
@@ -1001,7 +1095,7 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
     rec["source"] = chat_key or str(primary_chat_id)
     if getattr(args, "person", False):
         rec["person"] = True
-    if rec["source"] not in sources:
+    if not from_topic and rec["source"] not in sources:
         print(_("otklik: отклики готовят только чаты Домового, а не {key}").format(key=rec["source"]),
               file=sys.stderr)
         return 1
@@ -1018,6 +1112,21 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
     with locked(base):
         if args.replaces:
             old = load(base, args.replaces)
+            succ = _successors(base) if old is not None else {}
+            if old is not None and old["id"] in succ:
+                # Второй преемник у одной записи: две живые карточки или повтор
+                # уже ушедшей правки (ревью 27.11.2026).
+                head = _chain_head(succ, old["id"])
+                if from_topic:
+                    # Из темы правится только тронутая Иваном карточка: --replaces head без его ответа откажет.
+                    print(_("otklik: отклик {id} уже заменён карточкой {head}; попроси Ивана ответить на неё").format(
+                        id=old["id"], head=head), file=sys.stderr)
+                    return 1
+                print(_("otklik: отклик {id} уже заменён, его нынешняя карточка {head} (статус {status}): "
+                        "правь её (--replaces {head})").format(
+                            id=old["id"], head=head, status=(load(base, head) or {}).get("status", "?")),
+                      file=sys.stderr)
+                return 1
             if old is None or (old.get("status") not in REPLACE_FROM and not at_expired(old)):
                 if old is not None and old.get("status") == "approved" and old.get("at"):
                     # Одобренный в срок стоит в очереди /at: новая карточка без ✋ его не снимет
@@ -1030,11 +1139,20 @@ def _cmd_new(args: argparse.Namespace, base: Path, primary_chat_id: int,
                 print(_("otklik: заменить можно только неодобренный и неотправленный отклик"),
                       file=sys.stderr)
                 return 1
+            topic_at = card_place(0, topic) if from_topic else {}
+            if from_topic and (old is None or old.get("status") != "edit"
+                               or (old.get("chat_id"), old.get("thread_id"))
+                               != (topic_at["chat_id"], topic_at.get("message_thread_id"))):
+                print(_("otklik: из темы откликов правится только карточка этой темы, на которую Иван "
+                        "ответил или нажал ✏️"), file=sys.stderr)
+                return 1
             # Правка по ✏️ уходит туда же, где отклик готовили. Прежнее
             # состояние старой в новой записи: обрыв до отправки откатит замену.
             rec["source"] = source_of(old)
             if old.get("person"):
                 rec["person"] = True   # правка ответа человеку тоже в личку
+            if from_topic or old.get("topic_edit"):
+                rec["topic_edit"] = True   # своя ✅, в пачку «✅ Все N» не идёт
             rec["replaces"] = {"id": old["id"], "status": old.get("status"), "note": old.get("note") or ""}
             # Новая с данными отката раньше старой: обрыв между записями не
             # оставит заменённую без пути назад (ревью Codex 22.10.2026).
@@ -1126,7 +1244,8 @@ def _cmd_all(base: Path, primary_chat_id: int, chat_key: str, place: dict[str, i
     fresh_from = datetime.now(timezone.utc) - timedelta(hours=BATCH_FRESH_HOURS)
     with locked(base):
         recs = [r for r in _records(base) if r.get("status") == "pending" and r.get("message_id")
-                and not r.get("at") and not r.get("person") and r.get("chat_id") is not None
+                and not r.get("at") and not r.get("person") and not r.get("topic_edit")
+                and r.get("chat_id") is not None
                 and source_of(r) == source
                 and (t := _created_at(r)) is not None and t > fresh_from][-BATCH_MAX:]
     if len(recs) < 2:
@@ -1224,13 +1343,15 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--title", required=True)
     p_new.add_argument("--channel", required=True, help="куда уйдёт и что приложено")
     p_new.add_argument("--file", required=True, help="файл с точным текстом отклика")
-    p_new.add_argument("--replaces", default="", help="отклик, который этот заменяет (правка по ✏️; одобренный в срок сначала снимает ✋ Ивана)")
+    p_new.add_argument("--replaces", default="", help="отклик, который этот заменяет (правка по ✏️ или ответу Ивана на карточку; одобренный в срок сначала снимает ✋ Ивана); без своего адресата (--tg/--mail) берёт адресат заменяемого, без --attach его файл; заменённый второй раз не заменяется; из темы откликов только карточка этой темы в правке")
     to = p_new.add_mutually_exclusive_group()
     to.add_argument("--tg", default="", help="одно касание: адресат Telegram (@имя или номер чата)")
     to.add_argument("--mail", default="", help="одно касание: адрес письма (mailsend)")
     p_new.add_argument("--subject", default="", help="тема письма (с --mail)")
     p_new.add_argument("--reply-to", default="", help="Message-ID письма, на которое ответ (с --mail)")
-    p_new.add_argument("--attach", default="", help="файл к отправке: имя и sha256 на карточке")
+    attach = p_new.add_mutually_exclusive_group()
+    attach.add_argument("--attach", default="", help="файл к отправке: имя и sha256 на карточке")
+    attach.add_argument("--no-attach", action="store_true", help="правка (--replaces) без файла заменяемого")
     p_new.add_argument("--at", default="",
                        help="отправить в срок: \"ГГГГ-ММ-ДД ЧЧ:ММ\" по времени бота, только с --tg или --mail")
     p_new.add_argument("--person", action="store_true",
@@ -1262,7 +1383,9 @@ def main(argv: list[str] | None = None) -> int:
             # Личка, мастерская (её поиски готовят отклики) и чаты с автоаппрувом.
             sources = (frozenset({str(cfg.primary_chat_id), getattr(cfg, "workshop_chat_key", "")} - {""})
                        | cfg.approve_auto_chat_keys)
-            return _cmd_new(args, base, cfg.primary_chat_id, chat_key, sources, place)
+            return _cmd_new(args, base, cfg.primary_chat_id, chat_key, sources, place,
+                            topic=getattr(cfg, "otklik_chat_key", ""),
+                            asked=bool(os.environ.get("CLAUDE_TG_ASK_ID", "").strip()))
         if args.cmd == "all":
             return _cmd_all(base, cfg.primary_chat_id, chat_key, place)
         if args.cmd == "take":

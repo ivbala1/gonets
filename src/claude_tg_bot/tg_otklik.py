@@ -21,8 +21,6 @@ from .i18n import _
 
 # Тот же журнал, что у bot.py: имена в журнале не меняются.
 log = logging.getLogger("claude_tg_bot.bot")
-# Сколько текста отклика повторять в строке ✏️ в личке (как цитата карточки, bot.py).
-EDIT_QUOTE_CAP = 1000
 
 
 def _otklik_markup(rec: dict) -> InlineKeyboardMarkup | None:
@@ -138,24 +136,35 @@ async def _otklik_report_to_primary(cfg: Any, chat_key: str, since: datetime) ->
         return True   # не знаем: итог в личку, как до 27.11.2026
 
 
-async def _otklik_edit_ask(bot: Any, cfg: Config, rec: dict) -> None:
-    """✏️ на карточке в теме откликов: строка в личке, ответом на которую Иван
-    пишет правку. Начало как у карточки (номер отклика): ответ цитирует его, и
-    личка правит так же, как по ответу на саму карточку (решение Ивана 27.11.2026)."""
-    body = str(rec.get("text") or "")
-    if len(body) > EDIT_QUOTE_CAP:
-        body = body[:EDIT_QUOTE_CAP].rstrip() + "…"
-    # Текст отклика в самой строке: раньше его давала цитата карточки в ответе.
-    text = (_("📨 {title} (отклик {id})").format(title=rec.get("title"), id=rec["id"]) + "\n\n" + body
-            + "\n\n" + _(otklik.EDIT_ASK))
+def otklik_reply_edit(ctx: ContextTypes.DEFAULT_TYPE, cfg: Config, update: Update) -> str:
+    """Ответ Ивана в теме откликов на ждущую карточку: карточка в правке, как по
+    ✏️ (otklik.mark_reply_edit), а текст идёт рану темы обычным ходом. Без этой
+    отметки тема правку не сделает: так правка касается только тронутой Иваном
+    карточки (решение Ивана 27.11.2026 вечером). Синхронно, без ожидания: иначе
+    следующее сообщение Ивана обогнало бы это в очереди темы; перерисовка фоном.
+    Возвращает строку с номером карточки для начала запроса (голос, фото, «!»
+    цитаты карточки не несут), иначе пусто."""
+    key = getattr(cfg, "otklik_chat_key", "")
+    msg = update.message
+    reply = _b._real_reply(msg) if msg is not None else None
+    if not key or reply is None:
+        return ""
+    chat_key, chat_id, thread_id = _b._chat_key(update)
+    if chat_key != key:
+        return ""
+    base = otklik.otklik_dir(cfg.state_dir)
     try:
-        await bot.send_message(cfg.primary_chat_id, text, disable_notification=True,
-                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+        found = otklik.mark_reply_edit(base, chat_id, thread_id, reply.message_id)
     except Exception:
-        log.exception("otklik %s: edit ask in primary failed", rec.get("id"))
-        # Карточка обещает строку в личке: сказать там, где Иван нажал ✏️.
-        await _otklik_loud(bot, {k: v for k, v in rec.items() if k != "alarm_chat_id"}, _(
-            "✏️ Строка в личку не ушла: напиши в личке «правка отклика {id}: …»").format(id=rec["id"]), quiet=True)
+        log.exception("otklik: reply edit mark failed")
+        return ""
+    if found is None:
+        return ""
+    rec, changed = found
+    if changed:
+        log.info("otklik %s: edit by reply", rec["id"])
+        ctx.application.create_task(_otklik_show(ctx.bot, rec, base))
+    return _("[Ответ на карточку отклика {id}, она в правке: otklik new --replaces {id}]\n").format(id=rec["id"])
 
 
 def _otklik_target(ctx: ContextTypes.DEFAULT_TYPE, rec: dict, update: Update) -> Update:
@@ -239,8 +248,6 @@ async def on_otklik_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             # ✋ снял одобрение в срок: его задание из очереди /at тоже.
             _drop_otklik_jobs(ctx.application, rec["id"])
         await _otklik_show(ctx.bot, rec, base)
-        if action == "e" and rec.get("thread_id"):
-            await _otklik_edit_ask(ctx.bot, cfg, rec)
         return
     ts = otklik.at_ts(rec)
     if ts is not None and ts > time.time():

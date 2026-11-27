@@ -99,6 +99,7 @@ from .tg_otklik import (  # noqa: F401  перенесено из bot.py
     _otklik_back_loud, _otklik_close_attempts, _otklik_report_to_primary, _otklik_loud, _otklik_restart_loud,
     _otklik_show, _otklik_sync,
     _otklik_unknown_notice, on_otklik_all_pick, on_otklik_pick, otklik_at_cancelled, otklik_at_fire,
+    otklik_reply_edit,
 )
 from .tg_deals import (  # noqa: F401  перенесено из bot.py
     DEAL_FIRST_NOTE, _deal_finish, _deal_open, _deal_reply_target, _deal_swipe, _deal_turn,
@@ -589,8 +590,8 @@ def _scope_note(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> str | None:
         note = getattr(cfg, "workshop_scope", "") or None
         if note and _is_otklik_topic(cfg, chat_key):
             # Задание кнопки то же, что в мастерской: тема называет себя сама
-            # (журнал «Отклики …», только отправка; ревью 11.11.2026).
-            note += "\n" + _("Эта тема: «📨 Отклики», не мастерская; работа здесь только отправка по ✅.")
+            # (журнал «Отклики …», ревью 11.11.2026; правка ответом на карточку с 27.11.2026).
+            note += "\n" + _("Эта тема: «📨 Отклики», не мастерская; работа здесь: отправка по ✅ и правка по ответу Ивана на карточку.")
     return note
 
 
@@ -4018,6 +4019,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if await _task_touch(ctx, update, msg.text):
         # «Делай» под проектом в теме задачи: одобрение, в Claude не идёт.
         return
+    # Ответ на карточку в теме откликов: карточка в правке до хода, текст идёт дальше.
+    card_ref = otklik_reply_edit(ctx, cfg, update)
     # Пометка до проверки «!»: пересланный чужой текст с «!» в начале это
     # данные, а не поправка пользователя, прерывать ран он не должен.
     note = _forward_note(msg)
@@ -4032,7 +4035,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # иначе свайп-ответ (цитата приклеивается ниже) и compose-режим глушили бы
     # фичу, а «!» уезжал бы литералом в промпт.
     if text.startswith("!") and text[1:].strip():
-        text = text[1:].strip()
+        # Номер карточки отклика при самой поправке: и в ждущей пачке, и сразу.
+        text = card_ref + text[1:].strip()
         # Ещё не отправленное (ждёт склейки) уходит вместе с поправкой, иначе
         # поправка обогнала бы исходный запрос и тот пришёл бы после неё.
         pending = _gather_take(ctx, chat_key)
@@ -4093,7 +4097,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                   **({"gathered": _gather_ready(pending, first=True)} if pending is not None else {}))
         return
 
-    text = _text_in_context(cfg, msg, text)
+    text = card_ref + _text_in_context(cfg, msg, text)
 
     # Compose-буфер: копим вместо отправки.
     n = _compose_add(ctx, chat_key, text)
@@ -4263,6 +4267,8 @@ async def _deliver_piece(
     work: кусок держит единицу active_work за докачанный большой файл; она
     уходит пачке склейки или возвращается после передачи в Claude."""
     msg = update.message
+    # Фото или файл ответом на карточку отклика в теме: правка, как текстом.
+    prompt = otklik_reply_edit(ctx, ctx.application.bot_data["cfg"], update) + prompt
     try:
         if slot is not None:
             n = _compose_fill(ctx, chat_key, slot, prompt)
@@ -4639,8 +4645,11 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _compose_release(ctx, chat_key, slot)
         _gather_release(gslot)
         return
+    # Голосом на карточку отклика в теме, как текстом; отменённое /cancel не правит.
+    dropped = (gslot is not None and gslot[0].cancelled) or _compose_cancelled(ctx, chat_key, slot)
+    card_ref = "" if dropped else otklik_reply_edit(ctx, cfg, update)
     note = _forward_note(msg)
-    heard = note + heard
+    heard = card_ref + note + heard
     # Голосовой ответ на пункт подборки («поставь это») тоже несёт его источник и правило.
     heard = _news_context(cfg, msg, heard)
     if slot is not None:
