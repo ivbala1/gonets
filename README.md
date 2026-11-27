@@ -106,8 +106,7 @@ has to ask before it sends anything to people on your behalf.
 - **Login recovery from the phone.** `/login` re-authenticates Claude Code or
   Codex without a terminal.
 - **Skills.** A morning news digest with "add to backlog" and "start a task"
-  buttons, a digest of unread Telegram chats (Telethon), YouTube subtitles for
-  summaries, transcription of long audio and video files (OpenAI, ffmpeg).
+  buttons, YouTube subtitles for summaries, transcription of long audio and video files (OpenAI, ffmpeg).
   All optional.
 
 ## How it works
@@ -224,7 +223,7 @@ src/claude_tg_bot/
   codex_runner.py   Codex fallback
   tasks.py          task topics
   i18n.py, locales/ message language
-  skills/           news_digest, chat_digest, yt_subs, task_new, transcribe
+  skills/           news_digest, yt_subs, task_new, transcribe
 tests/              unit tests (pytest)
 ```
 

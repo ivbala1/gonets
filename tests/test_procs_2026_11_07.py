@@ -439,11 +439,7 @@ class RunClaudeJsonTests(unittest.TestCase):
 
     def test_digests_share_it(self) -> None:
         from unittest.mock import patch
-        from claude_tg_bot.skills.chat_digest import __main__ as chat
         from claude_tg_bot.skills.news_digest import __main__ as news
-        with patch.object(chat, "run_claude_json", return_value="a") as one:
-            self.assertEqual(chat.run_digest_claude("p", 7), "a")
-        one.assert_called_once_with("p", timeout=7, model="opus")
         with patch.object(news, "run_claude_json", return_value="b") as two:
             self.assertEqual(news.run_claude("p", 7, "m"), "b")
         two.assert_called_once_with("p", timeout=7, model="m")

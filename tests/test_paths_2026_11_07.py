@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from claude_tg_bot import config, notify, paths, restart_request, tasks  # noqa: E402
-from claude_tg_bot.skills.chat_digest import __main__ as chat_digest  # noqa: E402
 from claude_tg_bot.skills.news_digest import __main__ as news_digest  # noqa: E402
 from claude_tg_bot.skills.task_new import __main__ as task_new  # noqa: E402
 
@@ -77,19 +76,13 @@ def test_skills_follow_env_at_call_time(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(tasks, "two_mind_ask", lambda: ask)
     assert news_digest.state_root() == tmp_path / "news_digest"
     assert f"{tmp_path / '2mind'}/" in tasks.think_rules()
-    lock = chat_digest._lock()
-    try:
-        assert lock is not None and Path(lock.name) == tmp_path / "chat_digest.lock"
-    finally:
-        lock.close()
     seen = {}
 
     def fake_run(args, **kw):
         seen["args"] = args
         raise OSError("stop")
     from claude_tg_bot.skills import _oneshot
-    for call in (lambda: chat_digest.run_digest_claude("p", 5),
-                 lambda: news_digest.run_claude("p", 5, "sonnet")):
+    for call in (lambda: news_digest.run_claude("p", 5, "sonnet"),):
         with patch.object(_oneshot, "run_claude_oneshot", fake_run), \
                 patch.object(_oneshot, "resolve_claude_bin", return_value="claude"), pytest.raises(RuntimeError):
             call()
@@ -135,8 +128,7 @@ def test_bool_env_garbage_is_default_with_warning(default, monkeypatch, capsys) 
 
 def test_digest_garbage_number_is_rc_not_traceback() -> None:
     """Мусор в номере темы сводки: код 1 с причиной, а не трейсбек."""
-    for mod, env in ((chat_digest, {"CHAT_DIGEST_TG_CHAT_ID": "-100", "CHAT_DIGEST_TG_THREAD_ID": "x7"}),
-                     (news_digest, {"NEWS_TG_CHAT_ID": "-100", "NEWS_TG_THREAD_ID": "x7"})):
+    for mod, env in ((news_digest, {"NEWS_TG_CHAT_ID": "-100", "NEWS_TG_THREAD_ID": "x7"}),):
         with patch.object(mod, "load_dotenv"), patch.dict("os.environ", env), \
                 patch("sys.stderr", io.StringIO()) as err:
             assert mod.main([]) == 1
