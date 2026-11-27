@@ -355,11 +355,12 @@ async def _gather_flush(chat_key: str, batch: GatherBatch) -> None:
 async def _gather_stop_defer(chat_key: str, batch: GatherBatch) -> None:
     """Остановка застала пачку в склейке: готовые куски ложатся в отложенные и
     уйдут после старта, а куски, ещё не докачанные и не распознанные, просят
-    повторить. Отложить нельзя (нечего, диск): отказ, как раньше."""
+    повторить. Отложить нельзя (нечего, диск): отказ под каждым сообщением
+    пачки. Пустое место ("") не трогается: его обработчик ответил сам."""
     refusal = _("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта")
     first = batch.update.message
     messages = [first, *batch.messages]
-    replies = [(first, refusal)]
+    replies = [(m, refusal) for m, piece in zip(messages, batch.items) if piece != ""]
     if batch.pieces and batch.ctx.application.bot_data.get("at_jobs") is not None:
         try:
             text = _b._drain_defer(batch.ctx, batch.update, _b._DRAIN_JOINER.join(batch.pieces),
@@ -371,7 +372,7 @@ async def _gather_stop_defer(chat_key: str, batch: GatherBatch) -> None:
             replies = [(ready, text), *((m, refusal) for m, piece in zip(messages, batch.items)
                                         if piece is None)]
     log.warning("gathered request stopped by shutdown chat=%s deferred=%s", chat_key,
-                replies[0][1] is not refusal)
+                bool(replies) and replies[0][1] is not refusal)
     for target, line in replies:
         with contextlib.suppress(Exception):
             await target.reply_text(line)
@@ -438,8 +439,16 @@ async def _gather_flush_impl(chat_key: str, batch: GatherBatch) -> None:
     waiting.get(chat_key, set()).discard(batch)
     await _b._dispatch_to_claude(
         batch.update, ctx, "\n\n---\n\n".join(pieces), send_voice_reply=batch.voice,
-        **({"admitted": True} if batch.admitted else {}),
+        gathered=_gather_ready(batch), **({"admitted": True} if batch.admitted else {}),
     )
+
+
+def _gather_ready(batch: GatherBatch, *, first: bool = False) -> tuple:
+    """Сообщения пачки с куском в запросе: им отказ при остановке, как
+    сообщению запроса (_b._refuse_all). Первое сообщение пачки и есть
+    сообщение запроса, кроме «!»-поправки, забравшей пачку (first=True)."""
+    pairs = zip([batch.update.message, *batch.messages], batch.items)
+    return tuple(m for i, (m, piece) in enumerate(pairs) if piece and (first or i))
 
 
 def _gather_send_now(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> None:
@@ -454,7 +463,7 @@ def _gather_send_now(ctx: ContextTypes.DEFAULT_TYPE, chat_key: str) -> None:
     app.create_task(
         _b._dispatch_to_claude(
             batch.update, batch.ctx, "\n\n---\n\n".join(batch.pieces),
-            send_voice_reply=batch.voice,
+            send_voice_reply=batch.voice, gathered=_gather_ready(batch),
         ),
         update=batch.update,
     )

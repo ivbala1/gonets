@@ -778,6 +778,43 @@ class ShutdownTests(_Base):
         self.assertRegex(msg.reply_text.await_args.args[0],
                          msg_re("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
 
+    async def test_stopping_refuses_every_gathered_message(self) -> None:
+        # Круг Codex 27.11.2026 (копия в запуске): склеенная пачка ждала замка,
+        # отказ получало только первое сообщение.
+        self.bot_data["stopping"] = True
+        second, third = _msg("второе"), _msg("третье")
+        msg = await self.dispatch("ждал замка", gathered=(second, third))
+        self.assertEqual(self.runs, [])
+        for m in (msg, second, third):
+            self.assertRegex(m.reply_text.await_args.args[0],
+                             msg_re("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
+
+    async def test_draining_without_at_jobs_refuses_every_gathered_message(self) -> None:
+        self.bot_data["draining"] = True
+        self.bot_data["at_jobs"] = None
+        second = _msg("второе")
+        msg = await self.dispatch("x", gathered=(second,))
+        self.assertEqual(self.runs, [])
+        for m in (msg, second):
+            self.assertRegex(m.reply_text.await_args.args[0],
+                             msg_re("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
+                                    "повтори через пару минут"))
+
+    async def test_gather_flush_passes_ready_messages(self) -> None:
+        seen: list = []
+
+        async def spy(update, ctx, prompt, **kw):
+            seen.append((update.message, prompt, kw.get("gathered")))
+
+        first, second, late, gone = _msg("а"), _msg("б"), _msg("в"), _msg("г")
+        batch = botmod.GatherBatch(update=_update(first), ctx=self.ctx, items=["а", "б", "в", ""],
+                                   messages=[second, late, gone])
+        self.ctx.application.running = True
+        with patch.object(botmod, "_dispatch_to_claude", spy):
+            await botmod._gather_flush_impl("k", batch)
+        self.assertEqual(seen, [(first, "а\n\n---\n\nб\n\n---\n\nв", (second, late))])
+        self.assertEqual(botmod._gather_ready(batch, first=True), (first, second, late))
+
 
 # ---- b1.4: /at переживает рестарт, пока ждёт занятую тему ----
 

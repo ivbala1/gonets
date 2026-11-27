@@ -201,6 +201,23 @@ class GatherOnStopTests(_CrashBase):
             await self.flush(self.batch(["первое"]))
         self.assertIn(self.REFUSED, str(self.first.reply_text.await_args.args[0]))
 
+    async def test_disk_failure_refuses_every_message(self) -> None:
+        # Круг Codex 27.11.2026: отказ получало только первое сообщение пачки.
+        second, late, gone = _msg("второе"), _msg("голосовое"), _msg("файл")
+        with patch.object(self.bot_data["at_jobs"], "set", side_effect=OSError("диск")):
+            await self.flush(self.batch(["первое", "второе", None, ""], second, late, gone))
+        for msg in (self.first, second, late):
+            self.assertEqual([c.args[0] for c in msg.reply_text.await_args_list], [self.REFUSED])
+        # Пустое место: обработчик куска уже ответил сам (сбой скачивания).
+        gone.reply_text.assert_not_awaited()
+
+    async def test_nothing_ready_refuses_every_message(self) -> None:
+        second = _msg("голосовое")
+        await self.flush(self.batch([None, None], second))
+        self.assertEqual(_drained(self.bot_data["at_jobs"]), [])
+        for msg in (self.first, second):
+            self.assertEqual([c.args[0] for c in msg.reply_text.await_args_list], [self.REFUSED])
+
 
 class DeferCrashTests(_CrashBase):
     """Авария между сохранением отложенного и снятием записи inflight: одно

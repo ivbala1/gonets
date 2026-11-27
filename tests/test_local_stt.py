@@ -337,6 +337,46 @@ class VoiceLocalCancelTests(_VoiceBase):
         self.assertNotIn(_("⚠️ не удалось распознать голос"), said)
         self.assertIn(_("🗑 распознавание голосового отменено"), "\n".join(self.said(cancel_msg)))
 
+    REFUSED = "⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"
+
+    async def _stop_mid_local(self, before_stop=None) -> SimpleNamespace:
+        """Остановка бота гасит локальное распознавание (lifecycle._terminate_runs)."""
+        started = asyncio.Event()
+
+        async def local(_cfg, _path, _dur):
+            started.set()
+            await asyncio.sleep(30)
+
+        self.bot_data["openai"] = None
+        self.ctx.application.running = True  # склейка включена
+        msg = self.voice()
+        with patch.object(botmod, "local_stt_ready", lambda _c: True), \
+                patch.object(botmod, "transcribe_local", local):
+            task = asyncio.create_task(botmod.on_voice(_update(msg), self.ctx))
+            await asyncio.wait_for(started.wait(), 5)
+            if before_stop is not None:
+                before_stop()
+            self.bot_data["stopping"] = True
+            botmod._local_stt_cancel(self.ctx.application)
+            await asyncio.wait_for(task, 5)
+        self.assertEqual(self.runs, [])
+        return msg
+
+    async def test_stop_mid_local_says_resend(self) -> None:
+        # Ревью 27.11.2026: место пачки становилось пустым, а отказ пачки
+        # пустое место не трогает; голосовое пропадало молча.
+        msg = await self._stop_mid_local()
+        self.assertEqual(self.said(msg).count(_(self.REFUSED)), 1)
+
+    async def test_stop_after_batch_refused_says_nothing_more(self) -> None:
+        def seal() -> None:
+            # Остановка уже закрыла пачку и отказала неготовому куску.
+            batch = next(iter(self.bot_data["gather_batches"].values()))
+            batch.sealed = batch.cancelled = True
+
+        msg = await self._stop_mid_local(seal)
+        self.assertNotIn(_(self.REFUSED), self.said(msg))
+
     async def test_cancel_after_model_done_before_handler_resumes(self) -> None:
         """Гонка: модель уже вернула текст, обработчик ещё не продолжился, и
         тут /cancel. Отменённое не должно уйти в Claude (Sol, третий круг)."""

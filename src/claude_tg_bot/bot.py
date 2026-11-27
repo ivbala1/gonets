@@ -143,7 +143,7 @@ from .lifecycle import (  # noqa: F401  перенесено из bot.py
 from .tg_queue import (  # noqa: F401  перенесено из bot.py
     _busy_notice, _drop_busy_notice, _gather_cancel, _gather_fill, _gather_flush,
     _gather_flush_impl, GATHER_MAX_WAIT_SEC, _gather_pending, _gather_react, _gather_release,
-    _gather_reserve, _gather_send_now, _gather_take, GATHER_WINDOW_SEC, GatherBatch, GatherSlot,
+    _gather_ready, _gather_reserve, _gather_send_now, _gather_take, GATHER_WINDOW_SEC, GatherBatch, GatherSlot,
     _pack_cancel, PACK_NOTE, _pack_prompt, PackItem, _prestart_cancel, RunPrestart, _turn_packs,
     TurnPack,
 )
@@ -2217,8 +2217,19 @@ _INFLIGHT_TRIES = 5
 
 
 def _plain_ask(kwargs: dict) -> bool:
-    """Обычное сообщение Ивана: без кнопок, задач, событий и своих сверок."""
-    return set(kwargs) <= {"send_voice_reply"}
+    """Обычное сообщение Ивана: без кнопок, задач, событий и своих сверок.
+    gathered: прочие сообщения склеенной пачки (их ответы на отказ)."""
+    return set(kwargs) <= {"send_voice_reply", "gathered"}
+
+
+async def _refuse_all(msg: Any, gathered: Any, text: str) -> None:
+    """Отказ под сообщением и под каждым прочим сообщением склеенной пачки:
+    иначе они молчат, хотя тоже не ушли (круг Codex 27.11.2026)."""
+    for target in (msg, *gathered):
+        try:
+            await target.reply_text(text)
+        except Exception:
+            log.debug("refusal notice failed (ignored)", exc_info=True)
 
 
 def _drained_find(store: SessionStore, chat_key: str, skip: Any = ()) -> tuple[str, dict] | None:
@@ -2471,17 +2482,14 @@ async def _dispatch_to_claude(
             with contextlib.suppress(Exception):
                 await msg.reply_text(text)
             return True
-        try:
-            # Явный флаг, а не наличие on_run_start: выполнение задачи тоже
-            # его передаёт, а после рестарта само не уходит (проект шага 3, 1.5).
-            await msg.reply_text(
-                _("♻️ бот готовится к перезапуску: отложенный промпт уйдёт после рестарта")
-                if kwargs.get("deferred") else
-                _("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
-                  "повтори через пару минут")
-            )
-        except Exception:
-            log.debug("draining notice failed (ignored)", exc_info=True)
+        # Явный флаг, а не наличие on_run_start: выполнение задачи тоже
+        # его передаёт, а после рестарта само не уходит (проект шага 3, 1.5).
+        await _refuse_all(
+            msg, kwargs.get("gathered", ()),
+            _("♻️ бот готовится к перезапуску: отложенный промпт уйдёт после рестарта")
+            if kwargs.get("deferred") else
+            _("♻️ бот готовится к перезапуску, сообщение не ушло в Claude: "
+              "повтори через пару минут"))
         return True
     if _plain_ask(kwargs) and app.bot_data.get("at_jobs") is not None and not app.bot_data.get("stopping"):
         # Отложенное во время перезапуска уходит раньше нового (порядок темы).
@@ -2711,6 +2719,7 @@ async def _dispatch_to_claude_impl(
     warm_after: list,
     admitted: bool = False,
     deferred: bool = False,
+    gathered: tuple = (),
     allow_codex_fallback: bool = True,
     exec_task: dict | None = None,
     unexited: list | None = None,
@@ -2940,14 +2949,11 @@ async def _dispatch_to_claude_impl(
             # ран, стартовавший сейчас, оборвал бы рестарт,
             # а stop() ждал бы его (ревью 12.10.2026). Запись /at (deferred)
             # остаётся на диске и после рестарта уйдёт сама.
-            try:
-                await msg.reply_text(
-                    _("⚠️ бот перезапускается: отложенный промпт уйдёт после рестарта")
-                    if deferred else
-                    _("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта")
-                )
-            except Exception:
-                log.debug("shutdown notice failed (ignored)", exc_info=True)
+            await _refuse_all(
+                msg, gathered,
+                _("⚠️ бот перезапускается: отложенный промпт уйдёт после рестарта")
+                if deferred else
+                _("⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
             return True
         if still_wanted is not None and not still_wanted():
             # Запрос ждал замка, а дело уже сделано другим раном (одобренный
@@ -4083,7 +4089,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await into_pack.done.wait()
             return
         text = _news_context(cfg, msg, text)
-        await _dispatch_to_claude(update, ctx, text, send_voice_reply=voice_trigger)
+        await _dispatch_to_claude(update, ctx, text, send_voice_reply=voice_trigger,
+                                  **({"gathered": _gather_ready(pending, first=True)} if pending is not None else {}))
         return
 
     text = _text_in_context(cfg, msg, text)
@@ -4545,10 +4552,18 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 heard = await _transcribe_local_held(ctx, cfg, chat_key, gslot, slot, tmp, msg.voice.duration)
             except _LocalSttCancelled:
-                # /cancel уже ответил сам; голосовое не идёт никуда.
+                # /cancel уже ответил сам; голосовое не идёт никуда. Остановка
+                # бота: просить повторить, если не ответили уже отказ пачки
+                # склейки (закрыла её с неготовым куском, _gather_stop_defer) или
+                # потеря буфера /compose. Пустое место пачка не трогает (27.11.2026).
                 log.info("local STT cancelled user=%s", user.id)
+                told = slot is not None or (gslot is not None and gslot[0].cancelled)
                 _compose_release(ctx, chat_key, slot)
                 _gather_release(gslot)
+                if ctx.application.bot_data.get("stopping") and not told:
+                    with contextlib.suppress(Exception):
+                        await msg.reply_text(_(
+                            "⚠️ бот перезапускается, сообщение не ушло в Claude: повтори после рестарта"))
                 return
             except Exception:
                 log.exception("local STT failed")
